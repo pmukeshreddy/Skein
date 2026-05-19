@@ -1,0 +1,33 @@
+[package]
+name         = "skein_runtime"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[features]
+default = []
+# CUDA-gated paths: NCCL between graph runs, CUDA Graphs capture/dispatch,
+# RDMA for P/D KV transfer.
+cuda = []
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+skein_ir   = { workspace = true }
+skein_cost = { workspace = true }
+skein_emit = { workspace = true }
+skein_compile = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+axum       = { workspace = true }
+tower      = { workspace = true }
+tokio      = { workspace = true }
+futures-util = { workspace = true }
+tracing    = { workspace = true }
+prometheus = { workspace = true }
+
+[dev-dependencies]
+safetensors = { workspace = true }

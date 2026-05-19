@@ -1,0 +1,29 @@
+[package]
+name         = "skein_calibrate"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[features]
+default = []
+# Phase B paths (real Luminal kernel sampling + Python HF reference drift
+# sampling) are gated behind this feature so Mac builds never instantiate
+# them.
+cuda = []
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+skein_ir      = { workspace = true }
+skein_cost    = { workspace = true }
+skein_extract = { workspace = true }
+skein_compile = { workspace = true }
+skein_parity  = { workspace = true }
+luminal       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+toml          = { workspace = true }
+thiserror     = { workspace = true }
+blake3        = { workspace = true }

@@ -1,0 +1,36 @@
+[package]
+name         = "skein_compile"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[features]
+default = []
+# Phase B CUDA build. Pulls in `luminal_cuda_lite` so `CudaComputeRuntime`
+# becomes available; without this feature the type doesn't exist and the
+# Mac/CPU `NativeComputeRuntime` is the only `ComputeRuntime` impl.
+cuda = ["dep:luminal_cuda_lite"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+luminal    = { workspace = true }
+skein_ir   = { workspace = true }
+skein_cost = { workspace = true }
+skein_emit = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+bincode    = { workspace = true }
+safetensors = { workspace = true }
+thiserror  = { workspace = true }
+
+# `luminal_cuda_lite` is a sibling crate inside the Luminal repo (at
+# `crates/luminal_cuda_lite`). Cargo resolves it from the same git rev as
+# `luminal` so the two stay in lockstep. Only pulled in when the `cuda`
+# feature is enabled — its `cudarc` dep requires an NVIDIA toolchain.
+[dependencies.luminal_cuda_lite]
+git      = "https://github.com/luminal-ai/luminal"
+rev      = "e558ce68498df842107ccb32e316efff4801ccc1"
+optional = true

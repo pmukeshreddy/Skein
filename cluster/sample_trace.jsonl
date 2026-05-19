@@ -1,0 +1,6 @@
+{"slo": {"ttft_p95_ms": 500, "tpot_p95_ms": 50, "max_accuracy_drift": 0.01, "recompile_drift_threshold_kl": 0.05}}
+{"prompt_tokens": 47, "output_tokens": 132, "arrival_ms": 0}
+{"prompt_tokens": 312, "output_tokens": 89, "arrival_ms": 234}
+{"prompt_tokens": 178, "output_tokens": 256, "arrival_ms": 412}
+{"prompt_tokens": 1024, "output_tokens": 48, "arrival_ms": 690}
+{"prompt_tokens": 92, "output_tokens": 401, "arrival_ms": 1015}

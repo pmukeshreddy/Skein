@@ -1,0 +1,10 @@
+{"prompt": "alpha short"}
+{"prompt": "beta a bit longer"}
+{"prompt": "charlie even more text here for length variation"}
+{"prompt": "delta"}
+{"prompt": "epsilon something something something"}
+{"prompt": "zeta longer prompt with multiple words to vary"}
+{"prompt": "eta"}
+{"prompt": "theta"}
+{"prompt": "iota mid-length text here"}
+{"prompt": "kappa a really really really long prompt that has many words and should land in the top length bucket of the sampler"}

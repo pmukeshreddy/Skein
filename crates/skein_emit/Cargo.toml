@@ -1,0 +1,20 @@
+[package]
+name         = "skein_emit"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+skein_ir    = { workspace = true }
+skein_cost  = { workspace = true }
+luminal     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
+thiserror   = { workspace = true }
+safetensors = { workspace = true }
+tracing     = { workspace = true }

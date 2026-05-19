@@ -1,0 +1,136 @@
+# Calibration corpus for Mixtral 8x7B on H100. Phase A ships this file; the
+# Phase B `skein calibrate --hardware h100_sxm5 --model configs/mixtral_8x7b_config.json`
+# command reads it, samples drift prompts from `workload_trace_path` via the
+# configured strategy, turns each `[[kernel_samples]]` row into a Luminal-
+# compiled kernel run, and writes the calibrated cost-constants + drift
+# tables.
+#
+# Drift prompts are NEVER enumerated in this file. Hardcoded prompts here
+# would be synthetic data — drift predictions would not reflect the real
+# production input distribution. Skein's calibration is strictly:
+#
+#     workload trace → prompt sampler → drift measurements → drift table
+#
+# `traces/sharegpt_2000.jsonl` is user-provided at calibration time on the
+# GPU box (the file does not ship in the Skein repo). Each line is a JSON
+# object with at least a `prompt` field; tokenization happens inside the
+# Phase B drift sampler via the model's actual tokenizer.
+#
+# TOML scoping note: top-level keys *must* appear before any `[table]` or
+# `[[array.of.table]]` header. The drift-source fields are therefore
+# declared first; the `[[kernel_samples]]` arrays follow.
+
+workload_trace_path = "traces/sharegpt_2000.jsonl"
+n_drift_prompts     = 50
+sampling_strategy   = "stratified_by_length"   # uniform_random | first_n | stratified_by_length
+sampling_seed       = 0                          # reproducibility — same seed reproduces the same sample
+
+# ─── Kernel samples ────────────────────────────────────────────────────────
+# Architecture facts: Mixtral 8x7B's matmul shapes are independent of the
+# workload. These stay enumerated in TOML — they're not synthetic data,
+# they're the model's structure.
+#
+# GEMM at Mixtral attention shapes. Shape = [out_features, in_features];
+# attention q_proj is [4096, 4096], k/v_proj are [1024, 4096].
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "bf16"
+shape = [4096, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "fp16"
+shape = [4096, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "fp8_e4m3"
+shape = [4096, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "fp8_e5m2"
+shape = [4096, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "int8"
+shape = [4096, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "int4"
+shape = [4096, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "bf16"
+shape = [1024, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "fp8_e4m3"
+shape = [1024, 4096]
+repeats = 100
+
+# GEMM at Mixtral MLP shapes. w1, w3: [intermediate=14336, hidden=4096].
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "bf16"
+shape = [14336, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "fp8_e4m3"
+shape = [14336, 4096]
+repeats = 100
+
+[[kernel_samples]]
+op_kind = "gemm"
+dtype = "int8"
+shape = [14336, 4096]
+repeats = 100
+
+# Attention path. Shape = [batch, num_heads, seq_len, head_dim].
+
+[[kernel_samples]]
+op_kind = "attention"
+dtype = "bf16"
+shape = [1, 32, 2048, 128]
+repeats = 50
+
+[[kernel_samples]]
+op_kind = "attention"
+dtype = "bf16"
+shape = [8, 32, 2048, 128]
+repeats = 50
+
+[[kernel_samples]]
+op_kind = "attention"
+dtype = "fp8_e4m3"
+shape = [8, 32, 2048, 128]
+repeats = 50
+
+# Elementwise (RMSNorm) at the hidden state shape.
+
+[[kernel_samples]]
+op_kind = "elementwise"
+dtype = "bf16"
+shape = [8, 1, 4096]
+repeats = 50
+
+[[kernel_samples]]
+op_kind = "elementwise"
+dtype = "fp16"
+shape = [8, 1, 4096]
+repeats = 50

@@ -1,0 +1,74 @@
+[workspace]
+# edition = "2024" implies resolver "3" as the default; pinned explicitly so
+# the choice is not silently revised by a future toolchain bump.
+resolver = "3"
+members = [
+    "crates/skein_ir",
+    "crates/skein_cost",
+    "crates/skein_extract",
+    "crates/skein_emit",
+    "crates/skein_compile",
+    "crates/skein_parity",
+    "crates/skein_runtime",
+    "crates/skein_cli",
+    "crates/skein_calibrate",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# --- core ---
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+toml        = "0.8"
+thiserror   = "1.0"
+anyhow      = "1.0"
+clap        = { version = "4.5", features = ["derive"] }
+axum        = "0.7"
+tower       = "0.5"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prometheus  = "0.13"
+futures-util = "0.3"
+opentelemetry = "0.22"
+blake3      = "1.5"
+safetensors = "0.4"
+bincode     = "1.3"
+
+# --- testing ---
+proptest    = "1.4"
+
+# --- intra-workspace ---
+skein_ir        = { path = "crates/skein_ir" }
+skein_cost      = { path = "crates/skein_cost" }
+skein_extract   = { path = "crates/skein_extract" }
+skein_emit      = { path = "crates/skein_emit" }
+skein_compile   = { path = "crates/skein_compile" }
+skein_parity    = { path = "crates/skein_parity" }
+skein_runtime   = { path = "crates/skein_runtime" }
+skein_calibrate = { path = "crates/skein_calibrate" }
+
+# --- Luminal ---
+# Search-based API: `cx.tensor(shape_tuple)` where each shape entry is
+# `Into<Expression>` (usize for static dims, char for dynamic). Pinned to a
+# verified main-branch rev that builds clean on Mac (no CUDA toolkit needed
+# for the graph-construction path Phase A uses). Phase B will enable CUDA via
+# a separate `luminal_cuda_lite` crate dep (verify the exact name when wiring
+# `skein_compile`).
+luminal = { git = "https://github.com/luminal-ai/luminal", rev = "e558ce68498df842107ccb32e316efff4801ccc1" }
+
+# cudarc — verified against `cargo search` at project bootstrap; pinned exactly.
+# Only pulled in by crates that opt into the `cuda` feature.
+cudarc = { version = "=0.16.6", default-features = false, features = [
+    "nvrtc", "driver", "cublas", "cublaslt", "cuda-12080", "dynamic-loading", "std",
+] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1

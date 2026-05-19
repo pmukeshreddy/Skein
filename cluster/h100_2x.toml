@@ -1,0 +1,20 @@
+# Two-H100-SXM5 single-node cluster connected by NVLink Gen4.
+# Bandwidth/latency taken from NVIDIA HGX H100 datasheet:
+#   - NVLink Gen4 bidirectional bandwidth: 900 GB/s aggregate per GPU
+#     (18 links * 50 GB/s effective bidirectional)
+#   - NVLink Gen4 hop latency: ~1 microsecond
+# Memory: 80 GB HBM3 per H100 SXM5.
+
+num_devices = 2
+
+[[node]]
+id               = "node0"
+devices          = ["d0", "d1"]
+device_kind      = "h100_sxm5"
+device_memory_gb = 80
+
+[[link]]
+endpoints      = ["d0", "d1"]
+kind           = "nvlink_gen4"
+bandwidth_gbps = 900.0
+latency_us     = 1.0

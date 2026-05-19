@@ -1,0 +1,469 @@
+//! Shared topology executor for parity and serving.
+//!
+//! The executor owns no HTTP or batching policy. It receives already-built
+//! runtime segments, feeds logical handoff tensors by name, walks the
+//! serialized [`SequenceStep`] schedule, and returns logits / activation
+//! captures to its caller.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+use safetensors::{Dtype as SafeDtype, SafeTensors};
+use skein_cost::collectives::CollectiveKind;
+use skein_emit::segment::{Segment, SequenceStep};
+
+use crate::{
+    CompileError, DynRuntime, DynRuntimeError, DynRuntimeWrapper, NativeComputeRuntime,
+    SkeinArtifact, compile_with_luminal,
+};
+
+pub const DEFAULT_SEARCH_BUDGET: usize = 1;
+
+pub trait CollectiveExecutor {
+    fn execute(
+        &self,
+        kind: CollectiveKind,
+        participants: &[usize],
+        tensor_name: &str,
+        runtimes: &mut [&mut dyn DynRuntime],
+    ) -> Result<(), CompileError>;
+}
+
+pub struct RuntimeSegment {
+    pub runtime: Box<dyn DynRuntime>,
+    pub input_names: Vec<String>,
+    pub output_names: Vec<String>,
+    pub capture_names: Vec<String>,
+    pub weight_names: Vec<(String, Vec<usize>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopologyStepBatch {
+    pub request_tokens: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepOutput {
+    pub per_request_logits: Vec<Vec<f32>>,
+    pub next_tokens: Vec<u32>,
+}
+
+pub struct TopologyExecutor<'a> {
+    runtimes: &'a mut [Vec<RuntimeSegment>],
+    collectives: &'a dyn CollectiveExecutor,
+    sequencing: &'a [SequenceStep],
+}
+
+impl<'a> TopologyExecutor<'a> {
+    pub fn new(
+        runtimes: &'a mut [Vec<RuntimeSegment>],
+        collectives: &'a dyn CollectiveExecutor,
+        sequencing: &'a [SequenceStep],
+    ) -> Self {
+        Self {
+            runtimes,
+            collectives,
+            sequencing,
+        }
+    }
+
+    pub fn execute_for_parity(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<crate::executor::StepOutput, CompileError> {
+        let logits = self.execute_one(tokens)?;
+        let next = argmax(&logits);
+        Ok(StepOutput {
+            per_request_logits: vec![logits],
+            next_tokens: vec![next],
+        })
+    }
+
+    pub fn execute_for_step(
+        &mut self,
+        batch: &TopologyStepBatch,
+    ) -> Result<StepOutput, CompileError> {
+        let mut per_request_logits = Vec::with_capacity(batch.request_tokens.len());
+        let mut next_tokens = Vec::with_capacity(batch.request_tokens.len());
+        for tokens in &batch.request_tokens {
+            let logits = self.execute_one(tokens)?;
+            next_tokens.push(argmax(&logits));
+            per_request_logits.push(logits);
+        }
+        Ok(StepOutput {
+            per_request_logits,
+            next_tokens,
+        })
+    }
+
+    pub fn execute_with_hooks(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), CompileError> {
+        let mut captures = BTreeMap::new();
+        let logits = self.walk(tokens, Some(&mut captures))?;
+        Ok((captures.into_values().collect(), logits))
+    }
+
+    fn execute_one(&mut self, tokens: &[u32]) -> Result<Vec<f32>, CompileError> {
+        self.walk(tokens, None)
+    }
+
+    fn walk(
+        &mut self,
+        tokens: &[u32],
+        mut captures: Option<&mut BTreeMap<usize, Vec<f32>>>,
+    ) -> Result<Vec<f32>, CompileError> {
+        let mut handoffs: HashMap<(usize, String), Vec<f32>> = HashMap::new();
+        let mut handoff_i32: HashMap<(usize, String), Vec<i32>> = HashMap::new();
+        let token_i32: Vec<i32> = vec![tokens.last().copied().unwrap_or(0) as i32];
+        handoff_i32.insert((0, "input_tokens".to_string()), token_i32);
+
+        let mut last_segment_for_device: HashMap<usize, usize> = HashMap::new();
+        let mut final_logits = Vec::new();
+
+        for step in self.sequencing {
+            match step {
+                SequenceStep::ExecuteSegment {
+                    device_idx,
+                    segment_idx,
+                } => {
+                    let device_idx = *device_idx as usize;
+                    let segment_idx = *segment_idx;
+                    let segment = self
+                        .runtimes
+                        .get_mut(device_idx)
+                        .and_then(|d| d.get_mut(segment_idx))
+                        .ok_or(CompileError::MissingSegment {
+                            device_idx,
+                            segment_idx,
+                        })?;
+
+                    for name in &segment.input_names {
+                        let key = (device_idx, name.clone());
+                        if let Some(data) = handoff_i32.get(&key) {
+                            segment.runtime.set_tensor_i32_by_name(name, data.clone())?;
+                        } else if let Some(data) = handoffs.get(&key) {
+                            segment.runtime.set_tensor_by_name(name, data.clone())?;
+                        }
+                    }
+
+                    segment.runtime.execute_segment()?;
+                    last_segment_for_device.insert(device_idx, segment_idx);
+
+                    for name in &segment.output_names {
+                        let data = segment.runtime.get_tensor_by_name(name)?;
+                        if name == "logits" {
+                            final_logits = data.clone();
+                        }
+                        handoffs.insert((device_idx, name.clone()), data);
+                    }
+
+                    if let Some(captures) = captures.as_deref_mut() {
+                        for name in &segment.capture_names {
+                            if let Some(layer_idx) = parse_hidden_after_block(name) {
+                                let data = segment.runtime.get_tensor_by_name(name)?;
+                                captures.insert(layer_idx, data);
+                            }
+                        }
+                    }
+                }
+                SequenceStep::Collective {
+                    collective,
+                    participants,
+                    tensor,
+                    ..
+                } => {
+                    let participants: Vec<usize> =
+                        participants.iter().map(|p| *p as usize).collect();
+                    let mut adapters = Vec::with_capacity(participants.len());
+                    for &p in &participants {
+                        let data = handoffs
+                            .get(&(p, tensor.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        let _ = last_segment_for_device.get(&p);
+                        adapters.push(HandoffRuntime::new(tensor, data));
+                    }
+                    let mut refs: Vec<&mut dyn DynRuntime> = adapters
+                        .iter_mut()
+                        .map(|r| r as &mut dyn DynRuntime)
+                        .collect();
+                    let local_participants: Vec<usize> = (0..participants.len()).collect();
+                    self.collectives.execute(
+                        *collective,
+                        &local_participants,
+                        tensor,
+                        refs.as_mut_slice(),
+                    )?;
+                    for (rank, &device) in participants.iter().enumerate() {
+                        let data = refs[rank].get_tensor_by_name(tensor)?;
+                        handoffs.insert((device, tensor.clone()), data);
+                    }
+                }
+            }
+        }
+
+        Ok(final_logits)
+    }
+}
+
+pub fn load_native_runtime_segments(
+    artifact: &SkeinArtifact,
+) -> Result<Vec<Vec<RuntimeSegment>>, CompileError> {
+    load_runtime_segments::<NativeComputeRuntime>(artifact, DEFAULT_SEARCH_BUDGET)
+}
+
+pub fn load_runtime_segments<R: crate::ComputeRuntime + 'static>(
+    artifact: &SkeinArtifact,
+    search_budget: usize,
+) -> Result<Vec<Vec<RuntimeSegment>>, CompileError> {
+    let mut all_devices = Vec::with_capacity(artifact.devices.len());
+    for device in &artifact.devices {
+        let lowered = device.rebuild_graphs()?;
+        let mut runtime_segments = Vec::with_capacity(lowered.len());
+        for segment in lowered {
+            runtime_segments.push(compile_segment::<R>(segment, search_budget)?);
+        }
+        load_weights_into_segments(&device.weights_path, runtime_segments.as_mut_slice())?;
+        all_devices.push(runtime_segments);
+    }
+    Ok(all_devices)
+}
+
+fn compile_segment<R: crate::ComputeRuntime + 'static>(
+    mut segment: Segment,
+    search_budget: usize,
+) -> Result<RuntimeSegment, CompileError> {
+    let input_names = segment
+        .input_handoff
+        .iter()
+        .map(|h| h.logical_name.clone())
+        .collect();
+    let output_names = segment
+        .output_handoff
+        .iter()
+        .map(|h| h.logical_name.clone())
+        .collect();
+    let capture_names = segment
+        .op_nodes
+        .keys()
+        .filter(|name| name.starts_with("hidden_after_block_"))
+        .cloned()
+        .collect();
+    let weight_names = segment
+        .declared
+        .iter()
+        .map(|(name, tensor)| (name.clone(), tensor.shape.clone()))
+        .collect();
+
+    let mut name_to_node = HashMap::new();
+    name_to_node.extend(segment.op_nodes.iter().map(|(k, v)| (k.clone(), *v)));
+    name_to_node.extend(
+        segment
+            .declared
+            .iter()
+            .map(|(name, declared)| (name.clone(), declared.id)),
+    );
+    name_to_node.extend(
+        segment
+            .input_handoff
+            .iter()
+            .map(|h| (h.logical_name.clone(), h.luminal_id)),
+    );
+    name_to_node.extend(
+        segment
+            .output_handoff
+            .iter()
+            .map(|h| (h.logical_name.clone(), h.luminal_id)),
+    );
+
+    let mut runtimes =
+        compile_with_luminal::<R>(std::slice::from_mut(&mut segment.graph), search_budget)?;
+    let runtime = runtimes.pop().ok_or(CompileError::MissingSegment {
+        device_idx: 0,
+        segment_idx: segment.idx,
+    })?;
+    let wrapped = DynRuntimeWrapper::new(runtime, segment.graph, name_to_node);
+    Ok(RuntimeSegment {
+        runtime: Box::new(wrapped),
+        input_names,
+        output_names,
+        capture_names,
+        weight_names,
+    })
+}
+
+fn load_weights_into_segments(
+    path: &Path,
+    segments: &mut [RuntimeSegment],
+) -> Result<(), CompileError> {
+    let bytes = std::fs::read(path).map_err(|source| CompileError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let tensors = SafeTensors::deserialize(&bytes).map_err(|source| CompileError::Safetensors {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    for segment in segments {
+        for (name, shape) in &segment.weight_names {
+            let tensor = tensors
+                .tensor(name)
+                .map_err(|_| CompileError::MissingWeight {
+                    path: path.to_path_buf(),
+                    tensor: name.clone(),
+                })?;
+            let expected = shape.iter().product::<usize>();
+            let data = tensor_to_f32(name, tensor.dtype(), tensor.data())?;
+            if data.len() != expected {
+                return Err(CompileError::TensorSizeMismatch {
+                    tensor: name.clone(),
+                    expected,
+                    got: data.len(),
+                });
+            }
+            segment.runtime.set_tensor_by_name(name, data)?;
+        }
+    }
+    Ok(())
+}
+
+fn tensor_to_f32(tensor: &str, dtype: SafeDtype, bytes: &[u8]) -> Result<Vec<f32>, CompileError> {
+    match dtype {
+        SafeDtype::F32 => {
+            if bytes.len() % 4 != 0 {
+                return Err(CompileError::TensorSizeMismatch {
+                    tensor: tensor.to_string(),
+                    expected: bytes.len() / 4,
+                    got: bytes.len(),
+                });
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect())
+        }
+        SafeDtype::BF16 => {
+            if bytes.len() % 2 != 0 {
+                return Err(CompileError::TensorSizeMismatch {
+                    tensor: tensor.to_string(),
+                    expected: bytes.len() / 2,
+                    got: bytes.len(),
+                });
+            }
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+                    f32::from_bits(bits << 16)
+                })
+                .collect())
+        }
+        SafeDtype::F16 => {
+            if bytes.len() % 2 != 0 {
+                return Err(CompileError::TensorSizeMismatch {
+                    tensor: tensor.to_string(),
+                    expected: bytes.len() / 2,
+                    got: bytes.len(),
+                });
+            }
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .collect())
+        }
+        dtype => Err(CompileError::UnsupportedWeightDtype {
+            tensor: tensor.to_string(),
+            dtype,
+        }),
+    }
+}
+
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = (bits & 0x7c00) >> 10;
+    let frac = (bits & 0x03ff) as u32;
+    let out = match exp {
+        0 => {
+            if frac == 0 {
+                sign
+            } else {
+                let mut frac_norm = frac;
+                let mut exp_shift = 0;
+                while (frac_norm & 0x0400) == 0 {
+                    frac_norm <<= 1;
+                    exp_shift += 1;
+                }
+                frac_norm &= 0x03ff;
+                let exp32 = 127 - 15 - exp_shift;
+                sign | ((exp32 as u32) << 23) | (frac_norm << 13)
+            }
+        }
+        0x1f => sign | 0x7f80_0000 | (frac << 13),
+        _ => {
+            let exp32 = (exp as u32) + (127 - 15);
+            sign | (exp32 << 23) | (frac << 13)
+        }
+    };
+    f32::from_bits(out)
+}
+
+fn parse_hidden_after_block(name: &str) -> Option<usize> {
+    name.strip_prefix("hidden_after_block_")?.parse().ok()
+}
+
+fn argmax(values: &[f32]) -> u32 {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx as u32)
+        .unwrap_or(0)
+}
+
+struct HandoffRuntime {
+    tensor: String,
+    data: Vec<f32>,
+}
+
+impl HandoffRuntime {
+    fn new(tensor: &str, data: Vec<f32>) -> Self {
+        Self {
+            tensor: tensor.to_string(),
+            data,
+        }
+    }
+}
+
+impl DynRuntime for HandoffRuntime {
+    fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
+        Ok(())
+    }
+
+    fn get_tensor_by_name(&self, name: &str) -> Result<Vec<f32>, DynRuntimeError> {
+        if name == self.tensor {
+            Ok(self.data.clone())
+        } else {
+            Err(DynRuntimeError::UnknownTensor(name.to_string()))
+        }
+    }
+
+    fn set_tensor_by_name(&mut self, name: &str, data: Vec<f32>) -> Result<(), DynRuntimeError> {
+        if name == self.tensor {
+            self.data = data;
+            Ok(())
+        } else {
+            Err(DynRuntimeError::UnknownTensor(name.to_string()))
+        }
+    }
+
+    fn set_tensor_i32_by_name(
+        &mut self,
+        name: &str,
+        data: Vec<i32>,
+    ) -> Result<(), DynRuntimeError> {
+        self.set_tensor_by_name(name, data.into_iter().map(|v| v as f32).collect())
+    }
+}

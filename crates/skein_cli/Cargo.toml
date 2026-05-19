@@ -1,0 +1,44 @@
+[package]
+name         = "skein_cli"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[features]
+default = []
+# Phase B (`skein compile`, `serve`, `verify`, `calibrate`, `bench`) requires
+# CUDA. On Phase A every Phase B subcommand returns `CliError::RequiresCuda`
+# with an actionable suggestion to rebuild with this feature on an H100 host.
+cuda = ["skein_compile/cuda"]
+
+# Hybrid layout: integration tests need to call into the command runners
+# directly. Both the library and the binary live in this crate.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "skein"
+path = "src/main.rs"
+
+[dependencies]
+skein_ir        = { workspace = true }
+skein_cost      = { workspace = true }
+skein_extract   = { workspace = true }
+skein_emit      = { workspace = true }
+skein_compile   = { workspace = true }
+skein_parity    = { workspace = true }
+skein_runtime   = { workspace = true }
+skein_calibrate = { workspace = true }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+safetensors = { workspace = true }

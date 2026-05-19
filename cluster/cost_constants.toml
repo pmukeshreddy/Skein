@@ -1,0 +1,164 @@
+# Skein cost-model constants. Every magic number that influences a Plan's
+# score lives in this file; nothing in Rust outside `skein_cost` may invent
+# a constant. To recalibrate against a real cluster, run:
+#
+#     skein calibrate --hardware <name> --model <config.json> \
+#         --out-cost cluster/cost_constants.toml
+#
+# The values below are starting points sourced from NVIDIA datasheets and
+# published profiling. They are *not* sustained measurements — they exist so
+# Phase A's search loop produces sensibly-ranked Plans without an H100 in
+# hand. Replace before trusting `total_cost` numerically.
+
+# -----------------------------------------------------------------------------
+# Scalar top-level constants. TOML scope: anything written before the first
+# `[table]` header belongs to the root document, so keep these here. (Adding
+# scalars *after* a table header silently nests them inside that table.)
+# -----------------------------------------------------------------------------
+
+# Per-kernel CUDA launch overhead. Roughly constant for a given driver.
+# Captured CUDA Graphs amortize this to ~0 µs; the launch term applies
+# (1 - coverage) × this constant.
+launch_us_per_kernel = 7.0
+
+# Memory overshoot penalty. Intentionally enormous: any Plan whose per-device
+# peak exceeds the device cap is strictly worse than any fitting Plan. This
+# makes memory fit a hard constraint while keeping `total_cost` additive
+# (no separate filtering pass needed).
+overshoot_us_per_gb = 1000000.0
+
+# -----------------------------------------------------------------------------
+# Peak compute throughput, in TFLOPS, per device kind × dtype.
+# H100 SXM5 numbers from the NVIDIA H100 datasheet (April 2023, rev 1.1):
+#   - BF16 / FP16 tensor core peak: 989 TFLOPS dense
+#   - FP8 (E4M3 / E5M2) dense peak: 1979 TFLOPS (2× BF16)
+#   - INT8 dense peak: 1979 TOPS
+#   - INT4 dense peak: 3958 TOPS (2× INT8)
+# These are *peak* numbers; sustained efficiency is below this floor — see
+# the [efficiency.*] tables.
+# -----------------------------------------------------------------------------
+[peak_tflops.h100_sxm5]
+bf16     = 989.0
+fp16     = 989.0
+fp8_e4m3 = 1979.0
+fp8_e5m2 = 1979.0
+int8     = 1979.0
+int4     = 3958.0
+
+# -----------------------------------------------------------------------------
+# Sustained efficiency: fraction of peak achievable by a well-tuned kernel.
+# Three op kinds:
+#
+#   - gemm        large dense matmuls (Q/K/V/O projections, MLP, MoE expert
+#                 FFNs, LM head). Compute-bound, near-peak efficiency.
+#   - attention   the score / softmax / Attn·V pipeline. Memory-bandwidth
+#                 bound and irregular access patterns, so noticeably below
+#                 peak.
+#   - elementwise RmsNorm and token embedding. Trivial; throughput-bound by
+#                 memory access, ~peak on H100 HBM3.
+#
+# Values are educated guesses — see docs/cost_model.md for the references
+# and the recalibration procedure.
+# -----------------------------------------------------------------------------
+[efficiency.gemm]
+bf16     = 0.78
+fp16     = 0.78
+fp8_e4m3 = 0.72
+fp8_e5m2 = 0.72
+int8     = 0.68
+int4     = 0.55
+
+[efficiency.attention]
+bf16     = 0.64
+fp16     = 0.64
+fp8_e4m3 = 0.58
+fp8_e5m2 = 0.58
+int8     = 0.52
+int4     = 0.40
+
+[efficiency.elementwise]
+bf16     = 0.95
+fp16     = 0.95
+fp8_e4m3 = 0.92
+fp8_e5m2 = 0.92
+int8     = 0.90
+int4     = 0.85
+
+# -----------------------------------------------------------------------------
+# Sustained bandwidth efficiency for collective ops, relative to the slowest
+# link in the path. NCCL all-reduce typically achieves ~85% of peak; sliding
+# window dispatch (alltoall) is the loosest case.
+# -----------------------------------------------------------------------------
+[collective_efficiency]
+ring_allreduce = 0.85
+allgather      = 0.90
+reducescatter  = 0.88
+alltoall       = 0.75
+broadcast      = 0.95
+send_recv      = 0.92
+
+# Representative `(prompt_tokens, decode_kv_tokens)` pair the cost model
+# evaluates one forward step at. Sourced from typical chat-completion loads;
+# replace with a workload-specific median once `skein calibrate` has captured
+# real distributions.
+[representative_workload]
+prefill_tokens   = 1024
+decode_kv_tokens = 2048
+
+# Per-dtype activation-MSE tolerance for the parity gate (`skein_parity`).
+# A layer's tolerance is the *max* of its (weight, activation, kv) per-dtype
+# tolerances — the layer can drift at least as much as its loosest component
+# allows. Starting values; recalibrate via `skein calibrate` in Phase B.
+[parity_tolerance_mse]
+bf16     = 1.0e-3
+fp16     = 1.0e-3
+fp8_e4m3 = 5.0e-3
+fp8_e5m2 = 5.0e-3
+int8     = 1.0e-2
+int4     = 2.0e-2
+
+# Runtime knobs consumed by `skein_runtime`. Buffer sizes, timeouts, and
+# the SLO-aware admission estimator's constants. Every value here is a
+# tunable — production values come from `skein calibrate` in Phase B.
+[runtime]
+# Step + request metrics ring-buffer capacity. Older entries drop when full.
+# Sized to hold ~30 min of metrics at a typical request rate.
+metrics_buffer_capacity = 100000
+
+# Hot-swap drain timeout, in seconds. Requests still in-flight past this are
+# reported as DrainTimeout — the caller decides whether to force-kill or
+# extend.
+drain_timeout_seconds = 60
+
+# Default Prometheus exporter port. `Server::new` callers can override.
+prometheus_port = 9090
+
+# Radix prefix tree maximum depth (token positions). Beyond this depth the
+# tree stops growing; the diminishing reuse rate doesn't justify the memory.
+radix_max_depth = 4096
+
+[runtime_estimator]
+# Per-token decode-step latency at batch size 1, in microseconds. The SLO
+# admission gate scales this by `batch^batch_scaling_exponent` to predict
+# the load-aware per-token latency. Recalibrate via `skein calibrate`.
+per_token_decode_us_at_b1 = 8000.0
+
+# Per-token decode latency scales sub-linearly with batch:
+#     latency(b) = latency(1) * b^batch_scaling_exponent
+# 0.7 is a starting point — drives "more batching is cheaper per token"
+# without making it free.
+batch_scaling_exponent = 0.7
+
+# Prefill cost per prompt token, microseconds. Roughly compute-bound on
+# H100 at bf16; recalibrated per-(model, hardware) in Phase B.
+prefill_per_token_us = 25.0
+
+# State-space discretization for `skein_extract`'s inner DP. The DP keys on
+# `(layer_idx, memory_bucket, drift_bucket)`. Larger numbers find tighter
+# Plans at the cost of search time; the defaults below have been picked to
+# keep the outer loop's wall time under one second per evaluation on a
+# typical 32-block Mixtral configuration. Re-tune after measuring on the
+# real workload.
+[dp]
+memory_buckets = 100
+drift_buckets  = 50
