@@ -59,6 +59,12 @@ pub const INPUT_TOKENS: &str = "input_tokens";
 /// Final output — the last segment's `output_handoff` exposes this.
 pub const LOGITS: &str = "logits";
 
+/// Vocab-parallel embedding partial-sum tensor. Each TP rank produces the
+/// embedding for the tokens whose ids land in its vocab slice (zeros
+/// elsewhere); a RingAllReduce over the TP group reconstructs the full
+/// embedding before block 0.
+pub const EMBED_OUT: &str = "embed_out";
+
 /// One collective the device participates in. Ordered execution order:
 /// outer iteration is decoder block, inner iteration is within-block
 /// ordering matching `topology::emit_topology` so the cluster-wide
@@ -93,7 +99,29 @@ pub fn device_collective_points(plan: &Plan, ir: &Graph, device_idx: u32) -> Vec
     let placement = skein_cost::cluster::Placement::from_plan(plan);
     let hidden = ir.meta.hidden;
     let batch = plan.batching.max_batch() as usize;
+    let vocab = ir.meta.vocab;
     let mut points = Vec::new();
+
+    let embed_dtype = plan
+        .dtype_map
+        .per_layer
+        .first()
+        .map(|p| p.activation)
+        .unwrap_or(Dtype::Bf16);
+
+    // Vocab-parallel embedding AllReduce: reconstructs the full embedding from
+    // the per-rank vocab-slice partial sums before block 0. Only the first
+    // pipeline stage runs the embedding.
+    if placement.tp > 1 && device_on_first_stage(device_idx, &placement) {
+        points.push(CollectivePoint {
+            block: 0,
+            kind: CollectiveKind::RingAllReduce,
+            tensor: EMBED_OUT.to_string(),
+            shape: vec![batch, 1, hidden],
+            dtype: embed_dtype,
+            participants: tp_group_for_device(device_idx, &placement),
+        });
+    }
 
     for block in 0..ir.meta.num_layers {
         let activation_dtype = plan
@@ -172,7 +200,37 @@ pub fn device_collective_points(plan: &Plan, ir: &Graph, device_idx: u32) -> Vec
         }
     }
 
+    // Vocab-parallel logits AllGather: concatenates each rank's vocab-slice
+    // logit shard into the full `[batch, 1, vocab]` logits. Only the last
+    // pipeline stage runs the LM head.
+    if placement.tp > 1 && device_on_last_stage(device_idx, ir.meta.num_layers, &placement) {
+        points.push(CollectivePoint {
+            block: ir.meta.num_layers.saturating_sub(1),
+            kind: CollectiveKind::AllGather,
+            tensor: LOGITS.to_string(),
+            shape: vec![batch, 1, vocab],
+            dtype: embed_dtype,
+            participants: tp_group_for_device(device_idx, &placement),
+        });
+    }
+
     points
+}
+
+/// Whether `device_idx` sits on pipeline stage 0 (which runs the embedding).
+fn device_on_first_stage(device_idx: u32, placement: &skein_cost::cluster::Placement) -> bool {
+    device_idx / (placement.tp * placement.ep) == 0
+}
+
+/// Whether `device_idx` sits on the last pipeline stage (which runs the LM
+/// head). With `pp == 1` every device is on the single (last) stage.
+fn device_on_last_stage(
+    device_idx: u32,
+    _num_layers: usize,
+    placement: &skein_cost::cluster::Placement,
+) -> bool {
+    let stage = device_idx / (placement.tp * placement.ep);
+    stage == placement.pp - 1
 }
 
 /// TP group this device belongs to. With the lexicographic placement

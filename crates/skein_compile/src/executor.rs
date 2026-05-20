@@ -12,6 +12,7 @@ use safetensors::{Dtype as SafeDtype, SafeTensors};
 use skein_cost::collectives::CollectiveKind;
 use skein_emit::segment::{Segment, SequenceStep};
 
+use crate::dyn_runtime::WeightDtype;
 use crate::{
     CompileError, DynRuntime, DynRuntimeError, DynRuntimeWrapper, NativeComputeRuntime,
     SkeinArtifact, compile_with_luminal,
@@ -315,99 +316,37 @@ fn load_weights_into_segments(
                     path: path.to_path_buf(),
                     tensor: name.clone(),
                 })?;
+            let dtype = weight_dtype(name, tensor.dtype())?;
+            // Validate the byte count against the declared shape before
+            // handing the raw bytes to the byte-level loader.
             let expected = shape.iter().product::<usize>();
-            let data = tensor_to_f32(name, tensor.dtype(), tensor.data())?;
-            if data.len() != expected {
+            let got = tensor.data().len() / dtype.byte_width();
+            if got != expected {
                 return Err(CompileError::TensorSizeMismatch {
                     tensor: name.clone(),
                     expected,
-                    got: data.len(),
+                    got,
                 });
             }
-            segment.runtime.set_tensor_by_name(name, data)?;
+            segment
+                .runtime
+                .set_tensor_bytes_by_name(name, tensor.data(), dtype)?;
         }
     }
     Ok(())
 }
 
-fn tensor_to_f32(tensor: &str, dtype: SafeDtype, bytes: &[u8]) -> Result<Vec<f32>, CompileError> {
+/// Map a safetensors checkpoint dtype to the runtime's [`WeightDtype`].
+fn weight_dtype(tensor: &str, dtype: SafeDtype) -> Result<WeightDtype, CompileError> {
     match dtype {
-        SafeDtype::F32 => {
-            if bytes.len() % 4 != 0 {
-                return Err(CompileError::TensorSizeMismatch {
-                    tensor: tensor.to_string(),
-                    expected: bytes.len() / 4,
-                    got: bytes.len(),
-                });
-            }
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect())
-        }
-        SafeDtype::BF16 => {
-            if bytes.len() % 2 != 0 {
-                return Err(CompileError::TensorSizeMismatch {
-                    tensor: tensor.to_string(),
-                    expected: bytes.len() / 2,
-                    got: bytes.len(),
-                });
-            }
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|chunk| {
-                    let bits = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
-                    f32::from_bits(bits << 16)
-                })
-                .collect())
-        }
-        SafeDtype::F16 => {
-            if bytes.len() % 2 != 0 {
-                return Err(CompileError::TensorSizeMismatch {
-                    tensor: tensor.to_string(),
-                    expected: bytes.len() / 2,
-                    got: bytes.len(),
-                });
-            }
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|chunk| f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
-                .collect())
-        }
+        SafeDtype::F32 => Ok(WeightDtype::F32),
+        SafeDtype::BF16 => Ok(WeightDtype::Bf16),
+        SafeDtype::F16 => Ok(WeightDtype::F16),
         dtype => Err(CompileError::UnsupportedWeightDtype {
             tensor: tensor.to_string(),
             dtype,
         }),
     }
-}
-
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exp = (bits & 0x7c00) >> 10;
-    let frac = (bits & 0x03ff) as u32;
-    let out = match exp {
-        0 => {
-            if frac == 0 {
-                sign
-            } else {
-                let mut frac_norm = frac;
-                let mut exp_shift = 0;
-                while (frac_norm & 0x0400) == 0 {
-                    frac_norm <<= 1;
-                    exp_shift += 1;
-                }
-                frac_norm &= 0x03ff;
-                let exp32 = 127 - 15 - exp_shift;
-                sign | ((exp32 as u32) << 23) | (frac_norm << 13)
-            }
-        }
-        0x1f => sign | 0x7f80_0000 | (frac << 13),
-        _ => {
-            let exp32 = (exp as u32) + (127 - 15);
-            sign | (exp32 << 23) | (frac << 13)
-        }
-    };
-    f32::from_bits(out)
 }
 
 fn parse_hidden_after_block(name: &str) -> Option<usize> {

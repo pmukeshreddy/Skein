@@ -117,9 +117,63 @@ fn write_weight_shard_end_to_end() {
     let view1 = st1.tensor("test.weight").unwrap();
     assert_eq!(view1.shape(), &[2, 4]);
     assert_eq!(view1.data(), &[8u8, 9, 10, 11, 12, 13, 14, 15]);
+}
 
-    // Two devices' bytes concatenate to the full source.
-    let _ = HashMap::<String, ()>::new(); // silence unused import
+#[test]
+fn write_weight_shard_reads_multi_shard_checkpoint() {
+    // Build a two-file checkpoint indexed by model.safetensors.index.json,
+    // the layout real HF Mixtral checkpoints ship in.
+    let source_dir = tempfile_dir("skein_emit_multishard_test");
+
+    let write_st = |name: &str, data: &[u8], file: &str| {
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::I8, vec![2, 2], data).unwrap();
+        let bytes =
+            safetensors::serialize(std::iter::once((name.to_string(), view)), &None).unwrap();
+        std::fs::write(source_dir.join(file), &bytes).unwrap();
+    };
+    write_st(
+        "a.weight",
+        &[0u8, 1, 2, 3],
+        "model-00001-of-00002.safetensors",
+    );
+    write_st(
+        "b.weight",
+        &[10u8, 11, 12, 13],
+        "model-00002-of-00002.safetensors",
+    );
+
+    let mut weight_map = HashMap::new();
+    weight_map.insert("a.weight", "model-00001-of-00002.safetensors");
+    weight_map.insert("b.weight", "model-00002-of-00002.safetensors");
+    let index = serde_json::json!({ "metadata": {}, "weight_map": weight_map });
+    std::fs::write(
+        source_dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+
+    // One device pulls whole tensors from both shard files.
+    let whole = |key: &str| weights::WeightSlice {
+        source_key: key.into(),
+        source_shape: vec![2, 2],
+        source_dtype: Dtype::Int8,
+        dest_shape: vec![2, 2],
+        strategy: ShardStrategy::Whole,
+    };
+    let shard = weights::WeightShard {
+        device_idx: 0,
+        slices: vec![whole("a.weight"), whole("b.weight")],
+        total_bytes: 8,
+    };
+
+    let dest = source_dir.join("device_0.safetensors");
+    weights::write_weight_shard(&shard, &source_dir, &dest).expect("write multi-shard");
+
+    let written = std::fs::read(&dest).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&written).unwrap();
+    assert_eq!(st.tensor("a.weight").unwrap().data(), &[0u8, 1, 2, 3]);
+    assert_eq!(st.tensor("b.weight").unwrap().data(), &[10u8, 11, 12, 13]);
 }
 
 fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

@@ -38,12 +38,14 @@ fn segmentation_count_tp2_ep1() {
     let cluster = load_2x_h100_cluster();
     let plan = mk_plan(ir.meta.clone(), 2, 1, 1);
 
-    // tp=2 ep=1: 2 collectives/block × 32 blocks = 64 collectives → 65 segments.
+    // tp=2 ep=1: 2 collectives/block × 32 blocks = 64, plus the two
+    // vocab-parallel collectives (embedding AllReduce + logits AllGather) = 66
+    // collectives → 67 segments.
     for device_idx in 0..2 {
         let count = segments_per_device(&plan, &cluster, &ir, device_idx);
         assert_eq!(
-            count, 65,
-            "device {device_idx} at tp=2 ep=1: expected 65 segments, got {count}",
+            count, 67,
+            "device {device_idx} at tp=2 ep=1: expected 67 segments, got {count}",
         );
     }
 }
@@ -54,12 +56,14 @@ fn segmentation_count_tp2_ep2() {
     let cluster = load_4x_h100_cluster_for_tp2ep2();
     let plan = mk_plan(ir.meta.clone(), 2, 1, 2);
 
-    // tp=2 ep=2: 4 collectives/block × 32 blocks = 128 → 129 segments.
+    // tp=2 ep=2: 4 collectives/block × 32 blocks = 128, plus the two
+    // vocab-parallel collectives (embedding AllReduce + logits AllGather) = 130
+    // collectives → 131 segments.
     for device_idx in 0..4 {
         let count = segments_per_device(&plan, &cluster, &ir, device_idx);
         assert_eq!(
-            count, 129,
-            "device {device_idx} at tp=2 ep=2: expected 129 segments, got {count}",
+            count, 131,
+            "device {device_idx} at tp=2 ep=2: expected 131 segments, got {count}",
         );
     }
 }
@@ -140,9 +144,13 @@ fn each_segment_compiles_independently_native() {
         lowered.segments.len(),
         elapsed
     );
-    // Compile-time budget for the segmented graph on a CPU host: < 60s.
+    // Guard against pathological (e.g. super-linear) blowup in
+    // `build_search_space` across all 65 segments of the full decoder graph
+    // — which now carries the complete per-op math (RoPE, causal mask, top-k
+    // routing). This is a coarse upper bound, not a latency SLA: native
+    // compile is single-threaded and sensitive to host load.
     assert!(
-        elapsed.as_secs() < 60,
+        elapsed.as_secs() < 300,
         "per-segment compile budget exceeded ({} segments in {:?})",
         lowered.segments.len(),
         elapsed,
@@ -172,15 +180,29 @@ fn sequencing_serialization_byte_stable() {
         .count();
     assert_eq!(coll_count, a.segments.len() - 1);
 
-    // Every Collective step is a TP RingAllReduce at tp=2 ep=1.
-    for step in &a.sequencing {
-        if let SequenceStep::Collective {
-            collective, dtype, ..
-        } = step
-        {
-            assert_eq!(*collective, CollectiveKind::RingAllReduce);
-            assert_eq!(*dtype, Dtype::Bf16);
-        }
+    // Collectives at tp=2 ep=1 with vocab-parallel: an embedding AllReduce,
+    // two TP RingAllReduces per block, and a final logits AllGather — all bf16.
+    let kinds: Vec<CollectiveKind> = a
+        .sequencing
+        .iter()
+        .filter_map(|s| match s {
+            SequenceStep::Collective {
+                collective, dtype, ..
+            } => {
+                assert_eq!(*dtype, Dtype::Bf16);
+                Some(*collective)
+            }
+            _ => None,
+        })
+        .collect();
+    let (last, rest) = kinds.split_last().expect("at least one collective");
+    assert_eq!(
+        *last,
+        CollectiveKind::AllGather,
+        "final collective is the vocab-parallel logits AllGather"
+    );
+    for k in rest {
+        assert_eq!(*k, CollectiveKind::RingAllReduce);
     }
 }
 

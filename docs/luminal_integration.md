@@ -94,20 +94,31 @@ each verified by reading `luminal/src/frontend/` at the pinned rev:
 - **`luminal_nn::MoE`** is a plain dense-matmul MoE with top-k routing;
   Mixtral SwiGLU MoE needs a hand-built block (`wire_moe`).
 
-## Deferred op lowering (TODO)
+## Implemented op semantics
 
-The current op wiring is intentionally a *subset* of full Mixtral
-semantics. Each gap is tracked by a `TODO(...)` tag in
-`skein_emit::op_wiring` (and the others noted below); a grep for `TODO(`
-across `skein_emit`/`skein_runtime` finds every deferred piece.
+The op graph implements the core Mixtral decoder math, each covered by a
+hand-computed unit test under `skein_emit/tests/`:
 
-| Gap                  | Effect on output                                                   | Tag                  |
-|----------------------|-------------------------------------------------------------------|----------------------|
-| RoPE on Q/K          | No positional encoding — attention is position-blind.             | `TODO(rope)`         |
-| Causal mask          | Softmax sees future positions during prefill (`seq > 1`).         | `TODO(causal-mask)`  |
-| Top-k routing in MoE | Dense mixture over all experts; Mixtral picks top-2 only. Hook `topk_indexes` + `gather`. | `TODO(moe-topk)`     |
-| EP token routing     | Dispatch/combine are wired structurally but tokens aren't routed. | `TODO(ep-routing)`   |
-| Real KV cache        | The parity forward pass is stateless — no KV reuse.               | runtime KV work      |
+| Feature              | How                                                               | Test                |
+|----------------------|------------------------------------------------------------------|---------------------|
+| RoPE on Q/K          | `rope_tables` + `apply_rope` (rotate-half / NeoX, `sin`/`cos`), with an absolute `position_offset`. | `tests/rope.rs` |
+| Causal mask          | `causal_bias` (via `tril`) added to scores before the softmax.   | `tests/attention_hand_computed.rs` |
+| Top-k routing in MoE | `top_k_route`: softmax restricted to the top-k logits, renormalized. | `tests/moe_routing.rs` |
+| Vocab parallelism    | `vocab_parallel_embed` (masked lookup + AllReduce) + lm-head shard + AllGather. | `tests/vocab_parallel.rs` |
+| KV cache             | `attention_with_kv_cache`: cache concat, shifted causal mask, RoPE offset. | `tests/kv_cache.rs` |
+| EP capacity routing  | `moe_dispatch_combine`: GShard scatter/gather (`cumsum` slots + matmul). | `tests/ep_routing.rs` |
+| Byte-level weights   | `decode_weight_bytes` (bf16/f16/f32) + multi-shard index resolution. | `skein_compile/tests/weight_bytes.rs`, `tests/weight_slicing.rs` |
+
+## Deferred integration (TODO)
+
+The per-op math above is implemented and unit-tested on `NativeRuntime`. The
+remaining work is runtime *integration*, tracked by `TODO(...)` tags (grep
+`TODO(` across `skein_emit`/`skein_runtime`):
+
+| Gap              | What's left                                                        | Tag                  |
+|------------------|-------------------------------------------------------------------|----------------------|
+| EP token routing | Wire `moe_dispatch_combine` into the multi-segment AllToAll schedule (lay out `[ep, …]`, run local expert shard, gather back). | `TODO(ep-routing)` |
+| KV runtime loop  | Drive `attention_with_kv_cache` from the serving loop: paged page I/O + per-step `past` offset. | `TODO(kv-runtime)` |
 
 ## How to add a new backend
 

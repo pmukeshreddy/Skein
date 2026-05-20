@@ -20,8 +20,9 @@
 //!      → `TpInputShard` (split columns).
 //!    - All others (norms, MoE router gate) → `Replicated`.
 //!
-//!    `embed_tokens` and `lm_head` are left `Replicated`.
-//!    TODO(vocab-parallel): shard the embedding / LM head across TP ranks.
+//!    `embed_tokens` and `lm_head` are vocab-parallel (column-parallel on
+//!    their `[vocab, hidden]` row axis); the runtime reconstructs the full
+//!    embedding with an AllReduce and the full logits with an AllGather.
 //! 4. **Otherwise** → `Replicated`.
 //!
 //! The function is pure: no I/O, no global state, deterministic.
@@ -205,10 +206,12 @@ pub fn param_kind_for(name: &str) -> ParamKind {
         return ParamKind::TpDirectional(TpDirection::RowParallel);
     }
 
-    // Embedding and LM head are kept replicated.
-    // TODO(vocab-parallel): shard these across TP ranks.
+    // Embedding and LM head are vocab-parallel: their vocab axis is the row
+    // (output) axis of `[vocab, hidden]`, so column-parallel splits the vocab.
+    // The embedding lookup masks out-of-range tokens and the runtime issues an
+    // AllReduce; the LM head produces a logit shard that the runtime gathers.
     if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
-        return ParamKind::Replicated;
+        return ParamKind::TpDirectional(TpDirection::ColumnParallel);
     }
 
     // RmsNorm / final norm — replicated.

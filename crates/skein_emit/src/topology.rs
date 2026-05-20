@@ -60,6 +60,27 @@ pub fn emit_topology(plan: &Plan, _cluster: &Cluster, ir: &Graph) -> Topology {
     let mut collectives: Vec<TopologyEntry> = Vec::new();
     let mut seq: u64 = 0;
 
+    let io_dtype = plan
+        .dtype_map
+        .per_layer
+        .first()
+        .map(|p| p.activation)
+        .unwrap_or(Dtype::Bf16);
+
+    // Vocab-parallel embedding AllReduce on the first stage's TP group.
+    if placement.tp > 1 {
+        collectives.push(TopologyEntry {
+            sequence_idx: seq,
+            kind: CollectiveKind::RingAllReduce,
+            participants: tp_group_leaders(0, &placement),
+            tensor_name: "embed_out".to_string(),
+            shape: vec![batch, 1, hidden],
+            dtype: io_dtype,
+            after_node: "embed_tokens".to_string(),
+        });
+        seq += 1;
+    }
+
     // Iterate decoder blocks in execution order. Each block:
     //   (1) optional EP AllToAll dispatch before MoE
     //   (2) TP AllReduce after attention
@@ -184,6 +205,20 @@ pub fn emit_topology(plan: &Plan, _cluster: &Cluster, ir: &Graph) -> Topology {
                 seq += 1;
             }
         }
+    }
+
+    // Vocab-parallel logits AllGather on the last stage's TP group.
+    if placement.tp > 1 {
+        let last_stage = placement.pp - 1;
+        collectives.push(TopologyEntry {
+            sequence_idx: seq,
+            kind: CollectiveKind::AllGather,
+            participants: tp_group_leaders(last_stage, &placement),
+            tensor_name: "logits".to_string(),
+            shape: vec![batch, 1, ir.meta.vocab],
+            dtype: io_dtype,
+            after_node: "lm_head".to_string(),
+        });
     }
 
     Topology {

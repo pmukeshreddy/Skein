@@ -62,7 +62,14 @@ fn graph_shapes_match_plan() {
         .expect("d0 declared input_layernorm");
     assert_eq!(n0.shape, vec![4096]);
 
-    // Embedding replicated → unchanged [32000, 4096].
+    // Embedding is vocab-parallel (column-parallel on its [vocab, hidden] row
+    // axis): tp=2 ⇒ each rank holds [16000, 4096].
     let e0 = find_declared(&lowered_d0, "model.embed_tokens.weight").expect("d0 declared embed");
-    assert_eq!(e0.shape, vec![32000, 4096]);
+    assert_eq!(e0.shape, vec![16000, 4096]);
+    let e1 = find_declared(&lowered_d1, "model.embed_tokens.weight").expect("d1 declared embed");
+    assert_eq!(e1.shape, vec![16000, 4096]);
+
+    // LM head is likewise vocab-parallel → [16000, 4096] per rank.
+    let lm0 = find_declared(&lowered_d0, "lm_head.weight").expect("d0 declared lm_head");
+    assert_eq!(lm0.shape, vec![16000, 4096]);
 }

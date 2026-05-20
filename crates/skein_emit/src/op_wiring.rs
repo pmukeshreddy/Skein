@@ -37,28 +37,43 @@
 //! - `carry_post_attn_block_N` — the post-attn residual sum, needed for
 //!   the residual after `block_N_ffn_out`.
 //!
+//! ## Per-op semantics
+//!
+//! The op graph implements the core Mixtral decoder math:
+//!
+//! - **RoPE** on Q/K ([`wire_attention_math`] via [`rope_tables`] /
+//!   [`apply_rope`]), rotate-half / NeoX layout, with a `position_offset` so
+//!   decode tokens are rotated by their absolute KV position.
+//! - **Causal mask** added to the attention scores before the softmax
+//!   ([`causal_bias`]).
+//! - **Top-k expert routing** ([`top_k_route`]): the router softmax is
+//!   restricted to the `meta.top_k` highest-logit experts and renormalized,
+//!   so each expert is weighted by its true top-k gate probability.
+//! - **KV cache** ([`attention_with_kv_cache`]): variable-length prefill and
+//!   incremental decode against a stored K/V cache, with the shifted causal
+//!   mask and absolute RoPE positions. Tested: decoding token-by-token while
+//!   accumulating the cache reproduces the full-prefill output exactly.
+//! - **EP routing** ([`moe_dispatch_combine`]): GShard capacity-based
+//!   scatter/gather — `dispatch^T @ hidden` scatters tokens into per-expert
+//!   capacity slots; `combine @ expert_out` gathers them back weighted by the
+//!   renormalized top-k gates. Tested via the dispatch∘combine round-trip.
+//!
 //! ## Deferred lowering (TODO)
 //!
 //! The structural lowering — segment boundaries, collective ordering,
-//! handoff naming, weight sharding — is complete and tested. The following
-//! per-op semantics are intentionally not yet lowered; each needs work that
-//! is best validated against a GPU reference (see `docs/lowering.md`):
+//! handoff naming, weight sharding — is complete and tested. The per-op math
+//! above is implemented and unit-tested on `NativeRuntime`; the remaining work
+//! is runtime *integration*, best validated against a GPU reference:
 //!
-//! - **TODO(rope):** rotary position embeddings on Q/K. Requires plumbing a
-//!   position-id input through segment 0 and the IO manifest, then applying
-//!   the rotation in [`wire_attention_math`].
-//! - **TODO(causal-mask):** additive causal mask before the attention
-//!   softmax. A no-op for the current static `seq = 1` decode-mode lowering
-//!   (a single query attends to all cached keys); required once prefill
-//!   (`seq > 1`) graphs are emitted.
-//! - **TODO(moe-topk):** top-k expert sparsification. [`DeviceWiring::wire_block_moe`]
-//!   currently computes a *dense* mixture (every owned expert weighted by its
-//!   full-softmax gate probability). Mixtral routes to the top-k experts and
-//!   renormalizes their gate weights.
-//! - **TODO(ep-routing):** expert-parallel token routing. At `ep > 1` the
-//!   dispatch/combine collectives are wired with the correct shapes and
-//!   handoff names via [`DeviceWiring::reshape_for_handoff`], but the actual
-//!   per-token scatter to / gather from remote experts is not yet emitted.
+//! - **TODO(ep-routing):** wire [`moe_dispatch_combine`] into the multi-segment
+//!   schedule — lay the dispatched buffer out as `[ep, …]` for the AllToAll,
+//!   run each rank's expert shard on its received tokens, and AllToAll the
+//!   results back. The collective schedule + handoffs already reserve the
+//!   dispatch/combine boundaries.
+//! - **TODO(kv-runtime):** drive [`attention_with_kv_cache`] from the serving
+//!   loop — allocate paged K/V via `PagedKVAllocator`, feed the per-step
+//!   `past` offset and cache pages as graph inputs, and write `k_full`/`v_full`
+//!   back after each step.
 
 use std::collections::HashMap;
 
@@ -74,8 +89,9 @@ use skein_ir::plan::Plan;
 use crate::error::EmitError;
 use crate::graph_builder::{DeclaredTensor, shard_param_dims, to_luminal_dtype};
 use crate::handoff::{
-    CollectivePoint, INPUT_TOKENS, LOGITS, carry_post_attn, carry_pre_block, collective_attn_out,
-    collective_ffn_out, collective_moe_combine, collective_moe_dispatch, device_collective_points,
+    CollectivePoint, EMBED_OUT, INPUT_TOKENS, LOGITS, carry_post_attn, carry_pre_block,
+    collective_attn_out, collective_ffn_out, collective_moe_combine, collective_moe_dispatch,
+    device_collective_points,
 };
 use crate::segment::{HandoffTensor, Segment, SequenceStep};
 use crate::shard_role::{ShardRole, shard_role_for_param};
@@ -99,17 +115,19 @@ pub fn wire_segments(
 ) -> Result<(Vec<Segment>, Vec<SequenceStep>), EmitError> {
     let points = device_collective_points(plan, ir, device_idx);
     let mut wiring = DeviceWiring::new(plan, cluster, ir, device_idx)?;
-    wiring.wire_initial()?;
 
     let mut point_iter = points.iter();
+    // `wire_initial` consumes the vocab-parallel embedding AllReduce (if any),
+    // each block consumes its TP/EP collectives, and `wire_final` consumes the
+    // logits AllGather (if any).
+    wiring.wire_initial(&mut point_iter)?;
     for block in 0..ir.meta.num_layers {
         wiring.wire_block(block, &mut point_iter)?;
     }
+    wiring.wire_final(&mut point_iter)?;
 
-    // No more collectives expected after the last block.
+    // Every collective point must have been consumed.
     assert!(point_iter.next().is_none(), "collective points exhausted");
-
-    wiring.wire_final()?;
     Ok((wiring.segments, wiring.sequencing))
 }
 
@@ -326,7 +344,10 @@ impl<'a> DeviceWiring<'a> {
     // Initial / final segments
     // -----------------------------------------------------------------------
 
-    fn wire_initial(&mut self) -> Result<(), EmitError> {
+    fn wire_initial<'b>(
+        &mut self,
+        point_iter: &mut impl Iterator<Item = &'b CollectivePoint>,
+    ) -> Result<(), EmitError> {
         // Segment 0 declares `input_tokens` as its sole input handoff.
         let input_shape = vec![self.batch, self.seq];
         let tokens = self
@@ -343,26 +364,82 @@ impl<'a> DeviceWiring<'a> {
         self.cur_op_nodes
             .insert(INPUT_TOKENS.to_string(), tokens.id);
 
-        // Embedding lookup → [batch, seq, hidden].
-        let embed_w = self.weight("model.embed_tokens.weight")?;
-        let hidden = embedding_lookup(tokens, embed_w, self.batch, self.seq, self.hidden);
-        self.cur_op_nodes
-            .insert("hidden_after_embed".to_string(), hidden.id);
+        let placement = skein_cost::cluster::Placement::from_plan(self.plan);
+        let hidden_shape = vec![self.batch, self.seq, self.hidden];
 
-        // Push into live as the input to block 0.
-        let carry0 = carry_pre_block(0);
-        self.live.insert(
-            carry0,
-            LiveTensor {
-                tensor: hidden,
-                shape: vec![self.batch, self.seq, self.hidden],
-                dtype: self.activation_dtype,
-            },
-        );
+        if placement.tp > 1 {
+            // Vocab-parallel: this rank holds vocab rows
+            // `[vocab_start, vocab_start + vocab_local)`. The masked lookup
+            // zeros tokens outside the slice; the embedding AllReduce sums the
+            // per-rank partials into the full embedding.
+            let embed_w = self.weight("model.embed_tokens.weight")?;
+            let vocab_local = self
+                .cur_declared
+                .get("model.embed_tokens.weight")
+                .expect("embed table just declared")
+                .shape[0];
+            let tp_idx = (self.device_idx % (placement.tp * placement.ep)) / placement.ep;
+            let vocab_start = tp_idx as usize * vocab_local;
+            let local = vocab_parallel_embed(
+                tokens,
+                embed_w,
+                vocab_start,
+                vocab_local,
+                self.batch,
+                self.seq,
+                self.hidden,
+            );
+            self.cur_op_nodes
+                .insert("hidden_after_embed".to_string(), local.id);
+            self.live.insert(
+                EMBED_OUT.to_string(),
+                LiveTensor {
+                    tensor: local,
+                    shape: hidden_shape.clone(),
+                    dtype: self.activation_dtype,
+                },
+            );
+            let point = point_iter
+                .next()
+                .expect("vocab-parallel embedding AllReduce point present");
+            assert_eq!(point.tensor, EMBED_OUT);
+            self.cut_segment_at_collective(point, EMBED_OUT, &[]);
+            // After the AllReduce the full embedding feeds block 0.
+            let reduced = self
+                .live
+                .get(EMBED_OUT)
+                .expect("embed_out re-introduced after AllReduce")
+                .tensor;
+            self.live.insert(
+                carry_pre_block(0),
+                LiveTensor {
+                    tensor: reduced,
+                    shape: hidden_shape,
+                    dtype: self.activation_dtype,
+                },
+            );
+        } else {
+            // Replicated embedding table → plain lookup, no collective.
+            let embed_w = self.weight("model.embed_tokens.weight")?;
+            let hidden = embedding_lookup(tokens, embed_w, self.batch, self.seq, self.hidden);
+            self.cur_op_nodes
+                .insert("hidden_after_embed".to_string(), hidden.id);
+            self.live.insert(
+                carry_pre_block(0),
+                LiveTensor {
+                    tensor: hidden,
+                    shape: hidden_shape,
+                    dtype: self.activation_dtype,
+                },
+            );
+        }
         Ok(())
     }
 
-    fn wire_final(&mut self) -> Result<(), EmitError> {
+    fn wire_final<'b>(
+        &mut self,
+        point_iter: &mut impl Iterator<Item = &'b CollectivePoint>,
+    ) -> Result<(), EmitError> {
         let last_carry_name = carry_pre_block(self.ir.meta.num_layers);
         let final_hidden_live = self
             .live
@@ -373,18 +450,57 @@ impl<'a> DeviceWiring<'a> {
         let final_norm_w = self.weight("model.norm.weight")?;
         let normed = rms_norm(final_hidden, final_norm_w, self.ir.meta.rms_norm_eps);
 
+        let placement = skein_cost::cluster::Placement::from_plan(self.plan);
         let lm_head_w = self.weight("lm_head.weight")?;
-        let logits = normed.matmul(lm_head_w.permute((1, 0))).output();
-        self.cur_op_nodes.insert(LOGITS.to_string(), logits.id);
+        // With a vocab-sharded LM head this produces `[batch, seq, vocab/tp]`;
+        // replicated, it produces the full `[batch, seq, vocab]`.
+        let logits_local = normed.matmul(lm_head_w.permute((1, 0)));
+        let full_shape = vec![self.batch, self.seq, self.ir.meta.vocab];
 
-        // Final segment's output_handoff = [logits].
-        let output_handoff = vec![HandoffTensor {
-            logical_name: LOGITS.to_string(),
-            luminal_id: logits.id,
-            shape: vec![self.batch, self.seq, self.ir.meta.vocab],
-            dtype: self.activation_dtype,
-        }];
-        self.close_current_segment(output_handoff);
+        if placement.tp > 1 {
+            let vocab_local = self
+                .cur_declared
+                .get("lm_head.weight")
+                .expect("lm_head just declared")
+                .shape[0];
+            self.live.insert(
+                LOGITS.to_string(),
+                LiveTensor {
+                    tensor: logits_local,
+                    shape: vec![self.batch, self.seq, vocab_local],
+                    dtype: self.activation_dtype,
+                },
+            );
+            // AllGather concatenates the per-rank logit shards (rank-major,
+            // matching the vocab-slice ordering) into the full logits.
+            let point = point_iter
+                .next()
+                .expect("vocab-parallel logits AllGather point present");
+            assert_eq!(point.tensor, LOGITS);
+            self.cut_segment_at_collective(point, LOGITS, &[]);
+            let gathered = self
+                .live
+                .get(LOGITS)
+                .expect("logits re-introduced after AllGather")
+                .tensor
+                .output();
+            self.cur_op_nodes.insert(LOGITS.to_string(), gathered.id);
+            self.close_current_segment(vec![HandoffTensor {
+                logical_name: LOGITS.to_string(),
+                luminal_id: gathered.id,
+                shape: full_shape,
+                dtype: self.activation_dtype,
+            }]);
+        } else {
+            let logits = logits_local.output();
+            self.cur_op_nodes.insert(LOGITS.to_string(), logits.id);
+            self.close_current_segment(vec![HandoffTensor {
+                logical_name: LOGITS.to_string(),
+                luminal_id: logits.id,
+                shape: full_shape,
+                dtype: self.activation_dtype,
+            }]);
+        }
         Ok(())
     }
 
@@ -598,10 +714,15 @@ impl<'a> DeviceWiring<'a> {
             .expect("k_proj just declared");
         let n_heads_local = q_decl.shape[0] / head_dim;
         let n_kv_heads_local = k_decl.shape[0] / head_dim;
+        // This lowering emits one decode step from position 0 (stateless,
+        // `seq = 1`). The KV-cache decode loop supplies the running position
+        // offset per step; see `rope_tables`.
         Ok(wire_attention_math(
             n_heads_local,
             n_kv_heads_local,
             head_dim,
+            self.ir.meta.rope_theta,
+            0,
             normed,
             q_w,
             k_w,
@@ -610,14 +731,18 @@ impl<'a> DeviceWiring<'a> {
         ))
     }
 
-    /// MoE feed-forward for one block.
+    /// MoE feed-forward for one block, with top-k expert routing.
     ///
-    /// TODO(moe-topk): this lowers a *dense* mixture — every expert the
-    /// device owns is evaluated and weighted by its full-softmax gate
-    /// probability. Mixtral selects the top-k experts per token and
-    /// renormalizes their gate weights over the selected set. Implementing
-    /// the top-k selection needs a top-k / masked-softmax op and should be
-    /// validated against a GPU reference before it replaces the dense path.
+    /// The router gate produces per-expert logits; [`top_k_route`] restricts
+    /// the softmax to the `meta.top_k` highest-logit experts (top-2 for
+    /// Mixtral) and renormalizes over them, so each expert is weighted by its
+    /// true top-k gate probability (0 for non-selected experts).
+    ///
+    /// Compute note: every owned expert is still *evaluated* and then weighted
+    /// (non-selected weights are ~0, so the **output** matches true top-k
+    /// routing). Sparse *compute* — dispatching only the selected experts and
+    /// routing their tokens — is the expert-parallel concern tracked by
+    /// `TODO(ep-routing)`.
     fn wire_block_moe(
         &mut self,
         block: usize,
@@ -633,7 +758,8 @@ impl<'a> DeviceWiring<'a> {
         ))?;
         let routing_logits = normed.matmul(gate_w.permute((1, 0)));
         let n = normed.dims().len();
-        let routing_probs = routing_logits.softmax(n - 1);
+        let top_k = self.ir.meta.top_k.unwrap_or(n_experts).clamp(1, n_experts);
+        let routing_probs = top_k_route(routing_logits, top_k, n_experts, n - 1);
 
         let mut acc: Option<GraphTensor> = None;
         for e in 0..n_experts {
@@ -781,6 +907,101 @@ struct HandoffSpec {
 // inferring them from the GraphTensor, because segments use static shapes.
 // ---------------------------------------------------------------------------
 
+/// Output-correct top-k routing weights: a softmax restricted to the `k`
+/// highest-logit experts along `axis`, renormalized over the selected set.
+/// `k >= n_experts` degenerates to a plain softmax.
+///
+/// `softmax(top-k logits)` is mathematically equal to renormalizing the
+/// top-k entries of the full softmax, which is exactly Mixtral's router.
+///
+/// Note: exact ties at the k-th logit would select more than `k` experts;
+/// for real bf16 gate logits this does not occur in practice.
+pub fn top_k_route(logits: GraphTensor, k: usize, n_experts: usize, axis: usize) -> GraphTensor {
+    if k >= n_experts {
+        return logits.softmax(axis);
+    }
+    // A logit floor that softmax maps to ~0 once subtracted from the kept set.
+    const NEG: f32 = -1e30;
+    // Comparison masks come back as F32; cast the additive terms back to the
+    // logits' dtype (e.g. Bf16) before combining.
+    let dt = logits.dtype;
+    // Find the k-th largest logit along `axis` by iteratively masking out the
+    // running maxima, then keep every logit >= that threshold.
+    let mut threshold = logits.max(axis).expand_dim(axis, n_experts);
+    let mut removed = logits;
+    for _ in 1..k {
+        let is_max = removed.ge(threshold).cast(DType::F32);
+        removed += (is_max * NEG).cast(dt);
+        threshold = removed.max(axis).expand_dim(axis, n_experts);
+    }
+    let keep = logits.ge(threshold).cast(DType::F32);
+    let masked = logits + ((1.0 - keep) * NEG).cast(dt);
+    masked.softmax(axis)
+}
+
+/// GShard-style capacity routing tensors for expert parallelism. Given the
+/// router `gate_logits` `[tokens, n_experts]`, returns `(dispatch, combine)`
+/// each shaped `[tokens, n_experts * capacity]`:
+///
+/// - `dispatched = dispatch.permute((1, 0)).matmul(hidden)` →
+///   `[n_experts * capacity, hidden]` scatters each token into a capacity
+///   slot of each of its top-k experts.
+/// - `out = combine.matmul(expert_out)` (with `expert_out`
+///   `[n_experts * capacity, hidden]`) → `[tokens, hidden]` gathers the
+///   expert outputs back, weighted by the renormalized top-k gate
+///   probabilities.
+///
+/// Capacity slots are assigned globally per expert via an exclusive cumulative
+/// count; tokens past an expert's `capacity` are dropped (their slots never
+/// fill), matching the standard capacity-factor behaviour. This is the
+/// per-EP-rank math: across `ep` devices the `[n_experts*capacity, hidden]`
+/// buffer is reshaped to `[ep, …]` and AllToAll'd so each rank receives the
+/// tokens destined for its expert shard.
+pub fn moe_dispatch_combine(
+    gate_logits: GraphTensor,
+    top_k: usize,
+    n_experts: usize,
+    capacity: usize,
+) -> (GraphTensor, GraphTensor) {
+    let probs = gate_logits.softmax(1); // [T, E]
+    let topk_idx = gate_logits.topk_indexes(top_k, 1); // [T, K] (expert ids)
+    let topk_gate = probs.gather_elements(topk_idx, 1); // [T, K]
+    // Renormalize the gate weights over just the selected experts.
+    let gate_norm = topk_gate / topk_gate.sum(1).expand_dim(1, top_k); // [T, K]
+
+    // Flatten the (token, k) assignments into one axis N = T*K, ordered token-
+    // major, so capacity slots are assigned in a stable global order.
+    let assign_expert = topk_idx.merge_dims(0, 1).cast(DType::F32); // [N]
+    let assign_gate = gate_norm.merge_dims(0, 1); // [N]
+    let n = assign_expert.dims()[0];
+    let cx = gate_logits.graph();
+
+    // Expert one-hot [N, E].
+    let experts = cx.arange(n_experts).cast(DType::F32); // [E]
+    let onehot_e = assign_expert
+        .expand_dim(1, n_experts)
+        .eq(experts.expand_dim(0, n))
+        .cast(DType::F32); // [N, E]
+    // Exclusive cumulative count per expert → the slot each assignment lands in.
+    let pos = ((onehot_e.cumsum(0) - onehot_e) * onehot_e).sum(1); // [N]
+    // Capacity one-hot [N, C]; a position >= capacity yields an all-zero row
+    // (the token is dropped).
+    let slots = cx.arange(capacity).cast(DType::F32); // [C]
+    let onehot_c = pos
+        .expand_dim(1, capacity)
+        .eq(slots.expand_dim(0, n))
+        .cast(DType::F32); // [N, C]
+
+    // Per-assignment dispatch [N, E, C] = expert one-hot ⊗ capacity one-hot.
+    let disp_assign = onehot_e.expand_dim(2, capacity) * onehot_c.expand_dim(1, n_experts);
+    let comb_assign = disp_assign * assign_gate.expand_dim(1, n_experts).expand_dim(2, capacity);
+
+    // [N, E, C] → [N, E*C] → [T, K, E*C] → sum over the K assignments.
+    let dispatch = disp_assign.merge_dims(1, 2).split_dims(0, top_k).sum(1);
+    let combine = comb_assign.merge_dims(1, 2).split_dims(0, top_k).sum(1);
+    (dispatch, combine)
+}
+
 /// `x / sqrt(mean(x²) + eps) * weight` — i.e. RmsNorm.
 fn rms_norm(input: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     let last = input.shape.last_axis();
@@ -808,14 +1029,147 @@ fn embedding_lookup(
     embed_weight.gather((tokens * hidden).expand_dim(2, hidden) + cols)
 }
 
-/// Self-attention with GQA expansion. Looks up Q/K/V/O weights from a
-/// `declared` map and delegates the op graph to [`wire_attention_math`].
-/// The segment orchestrator normally calls [`wire_attention_math`] directly
-/// with per-segment handles; this map-driven entry point is kept for the
-/// hand-computed attention test.
+/// Vocab-parallel embedding lookup. `local_table` is this TP rank's vocab
+/// slice `[vocab_local, hidden]` covering global ids
+/// `[vocab_start, vocab_start + vocab_local)`. A token outside this rank's
+/// slice contributes a zero row; an `AllReduce(sum)` across the TP group then
+/// reconstructs the full embedding, since each id is owned by exactly one
+/// rank. Returns `[batch, seq, hidden]` in the table's dtype.
+pub fn vocab_parallel_embed(
+    tokens: GraphTensor,
+    local_table: GraphTensor,
+    vocab_start: usize,
+    vocab_local: usize,
+    batch: usize,
+    seq: usize,
+    hidden: usize,
+) -> GraphTensor {
+    let cols = tokens
+        .graph()
+        .arange(hidden)
+        .expand_dim(0, batch)
+        .expand_dim(1, seq);
+
+    // local_id = token - vocab_start, clamped to [0, vocab_local-1] so the
+    // gather is always in-bounds; out-of-range tokens are masked to 0 below.
+    let token_f = tokens.cast(DType::F32);
+    let local_clamped = (token_f - vocab_start as f32)
+        .clip(0.0, (vocab_local.saturating_sub(1)) as f32)
+        .cast(DType::Int);
+    let flat = (local_clamped * hidden).expand_dim(2, hidden) + cols;
+    let embeds = local_table.gather(flat);
+
+    // in_range = (token >= vocab_start) & (token < vocab_start + vocab_local).
+    let lo = token_f * 0.0 + vocab_start as f32;
+    let hi = token_f * 0.0 + (vocab_start + vocab_local) as f32;
+    let in_range = token_f.ge(lo).cast(DType::F32) * token_f.lt(hi).cast(DType::F32);
+    let mask = in_range.expand_dim(2, hidden).cast(embeds.dtype);
+    embeds * mask
+}
+
+/// Attention against a paged KV cache, for variable-length prefill and
+/// incremental decode.
 ///
-/// TODO(rope) / TODO(causal-mask): rotary embeddings and the causal mask
-/// are not yet applied here — see the module docstring.
+/// `q`/`k_new`/`v_new` are the current chunk's projections
+/// (`[batch, seq, n_heads*head_dim]` and `[batch, seq, n_kv_heads*head_dim]`);
+/// `k_cache`/`v_cache` hold the previously stored keys/values
+/// (`[batch, past, n_kv_heads*head_dim]`, already RoPE-rotated). RoPE is
+/// applied to `q`/`k_new` at absolute positions `past..past+seq`; the new
+/// keys/values are appended to the cache and attention runs over all
+/// `past+seq` keys under a causal mask where query `past+i` attends keys
+/// `0..=past+i`. Returns `(attn_out [batch, seq, n_heads*head_dim], k_full,
+/// v_full)` — the runtime appends `k_full`/`v_full` to the paged cache.
+///
+/// `past == 0` is the prefill case (no cache concat); `seq == 1`, `past > 0`
+/// is a decode step.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_with_kv_cache(
+    q: GraphTensor,
+    k_new: GraphTensor,
+    v_new: GraphTensor,
+    k_cache: GraphTensor,
+    v_cache: GraphTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    past: usize,
+    rope_theta: f32,
+) -> (GraphTensor, GraphTensor, GraphTensor) {
+    let kv_groups = n_heads / n_kv_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let batch = q.dims()[0];
+    let seq = q.dims()[1];
+
+    // Head-split [batch, seq, heads, head_dim].
+    let q = q.split_dims(2, head_dim);
+    let k_new = k_new.split_dims(2, head_dim);
+    let v_new = v_new.split_dims(2, head_dim);
+
+    // RoPE on the new q/k at absolute positions past..past+seq.
+    let (cos_t, sin_t) = rope_tables(q.graph(), seq, head_dim, rope_theta, past);
+    let q = apply_rope(q, cos_t, sin_t, head_dim);
+    let k_new = apply_rope(k_new, cos_t, sin_t, head_dim);
+
+    // Append the new (rotated) k / (raw) v to the cache. `past == 0` skips the
+    // concat to avoid zero-length cache tensors on the prefill step.
+    let (k_full_hs, v_full_hs) = if past == 0 {
+        (k_new, v_new)
+    } else {
+        let k_cache_hs = k_cache.split_dims(2, head_dim);
+        let v_cache_hs = v_cache.split_dims(2, head_dim);
+        (
+            k_cache_hs.concat_along(k_new, 1),
+            v_cache_hs.concat_along(v_new, 1),
+        )
+    };
+    let total = past + seq; // total key positions = past + current chunk
+
+    // GQA attention. q:[b,seq,Hkv,groups,d]->[b,Hkv,groups,seq,d];
+    // k_full:[b,T,Hkv,d]->[b,Hkv,groups,d,T]; v_full:->[b,Hkv,groups,T,d].
+    let q = q.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4));
+    let k_full = k_full_hs.permute((0, 2, 3, 1)).expand_dim(2, kv_groups);
+    let v_full = v_full_hs.permute((0, 2, 1, 3)).expand_dim(2, kv_groups);
+
+    let scores = q.matmul(k_full) * scale; // [b, Hkv, groups, seq, T]
+    // Causal mask: query at absolute position `past+i` attends key `j` iff
+    // `j <= past+i`. That is the last `seq` rows of the `[T, T]` lower triangle
+    // (`tril`), reusing the tested mask construction.
+    let cx = scores.graph();
+    let tri = cx.tril(total, 0).cast(DType::F32); // [T, T] lower triangle
+    let allowed = if past == 0 {
+        tri // total == seq here → [seq, T]
+    } else {
+        tri.slice((past.., ..)) // last `seq` rows → [seq, T]
+    };
+    let bias = ((allowed - 1.0) * 1.0e9)
+        .expand_dim(0, batch)
+        .expand_dim(1, n_kv_heads)
+        .expand_dim(2, kv_groups)
+        .cast(scores.dtype);
+    let weights = (scores + bias).softmax(4);
+    let attn = weights.matmul(v_full); // [b, Hkv, groups, seq, d]
+
+    // [b, Hkv, groups, seq, d] -> [b, seq, Hkv, groups, d] -> [b, seq, n_heads*d].
+    // `merge_dims` composes with the permute's strides (a plain `ShapeTracker`
+    // reassignment would misread the strided data when groups/heads > 1). The
+    // caller applies `o_proj` to this `[batch, seq, n_heads*head_dim]` output.
+    let attn = attn
+        .permute((0, 3, 1, 2, 4))
+        .merge_dims(3, 4) // [b, seq, Hkv, groups*d]
+        .merge_dims(2, 3); // [b, seq, Hkv*groups*d] = [b, seq, n_heads*d]
+
+    // Flatten the full cache back to [batch, T, n_kv_heads*head_dim] for the
+    // runtime to store.
+    let k_store = k_full_hs.merge_dims(2, 3);
+    let v_store = v_full_hs.merge_dims(2, 3);
+    (attn, k_store, v_store)
+}
+
+/// Self-attention with GQA expansion. Looks up Q/K/V/O weights from a
+/// `declared` map and delegates the op graph to [`wire_attention_math`]
+/// (which applies RoPE and the causal mask). The segment orchestrator
+/// normally calls [`wire_attention_math`] directly with per-segment handles;
+/// this map-driven entry point is kept for the hand-computed attention test.
 pub fn wire_attention(
     cx: &mut LuminalGraph,
     declared: &HashMap<String, DeclaredTensor>,
@@ -844,6 +1198,8 @@ pub fn wire_attention(
         n_heads_local,
         n_kv_heads_local,
         meta.head_dim,
+        meta.rope_theta,
+        0,
         input,
         q_w,
         k_w,
@@ -853,17 +1209,24 @@ pub fn wire_attention(
 }
 
 /// The op-graph half of [`wire_attention`]: no `declared` map needed,
-/// just hand-built Luminal ops over caller-provided weight handles.
+/// just hand-built Luminal ops over caller-provided weight handles. Applies
+/// RoPE to Q/K and an additive causal mask to the attention scores.
 ///
 /// Takes the **device-local** head counts. Under TP the Q/K/V weights
 /// are column-parallel: each device sees only `n_heads / tp` and
 /// `n_kv_heads / tp` heads, and the final shape reassignment must use
 /// those local values, not the cluster-wide `ModelMeta::num_*_heads`.
+///
+/// `position_offset` is the absolute position of this chunk's first token:
+/// `0` for prefill, or the current KV-cache length for a decode step (see
+/// [`rope_tables`]).
 #[allow(clippy::too_many_arguments)]
 pub fn wire_attention_math(
     n_heads_local: usize,
     n_kv_heads_local: usize,
     head_dim: usize,
+    rope_theta: f32,
+    position_offset: usize,
     input: GraphTensor,
     q_w: GraphTensor,
     k_w: GraphTensor,
@@ -872,38 +1235,115 @@ pub fn wire_attention_math(
 ) -> GraphTensor {
     let kv_groups = n_heads_local / n_kv_heads_local;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let batch = input.dims()[0];
+    let seq = input.dims()[1];
 
-    let q = input.matmul(q_w.permute((1, 0)));
-    let k = input.matmul(k_w.permute((1, 0)));
+    // Project, then split the projection into [batch, seq, heads, head_dim].
+    let q = input.matmul(q_w.permute((1, 0))).split_dims(2, head_dim);
+    let k = input.matmul(k_w.permute((1, 0))).split_dims(2, head_dim);
     let v = input.matmul(v_w.permute((1, 0)));
 
-    let q = q
-        .split_dims(2, head_dim)
-        .split_dims(2, kv_groups)
-        .permute((0, 2, 3, 1, 4));
-    let k = k.split_dims(2, head_dim).permute((0, 2, 3, 1));
-    let v = v.split_dims(2, head_dim).permute((0, 2, 1, 3));
+    // RoPE on Q and K (rotate-half / NeoX layout, as Mixtral uses).
+    let (cos_t, sin_t) = rope_tables(input.graph(), seq, head_dim, rope_theta, position_offset);
+    let q = apply_rope(q, cos_t, sin_t, head_dim);
+    let k = apply_rope(k, cos_t, sin_t, head_dim);
 
-    // TODO(rope): apply rotary position embeddings to `q` and `k` here,
-    // before the score matmul, once position ids are plumbed through.
-
+    // GQA reshape: expand each KV head across its group of query heads.
+    let q = q.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4)); // [b, kvh, kvg, seq, hd]
+    let k = k.permute((0, 2, 3, 1)); // [b, kvh, hd, seq]
+    let v = v.split_dims(2, head_dim).permute((0, 2, 1, 3)); // [b, kvh, seq, hd]
     let k = k.expand_dim(2, kv_groups);
     let v = v.expand_dim(2, kv_groups);
 
+    // scores: [b, kvh, kvg, q_seq, k_seq].
     let scores = q.matmul(k) * scale;
-    // TODO(causal-mask): add an additive causal mask to `scores` before the
-    // softmax for prefill (`seq > 1`). It is a no-op for the current
-    // `seq = 1` decode-mode lowering.
+    // Additive causal mask: query at position i may not attend to keys j > i.
+    let bias = causal_bias(input.graph(), seq)
+        .expand_dim(0, batch)
+        .expand_dim(1, n_kv_heads_local)
+        .expand_dim(2, kv_groups)
+        .cast(scores.dtype);
+    let scores = scores + bias;
     let weights = scores.softmax(4);
     let attn = weights.matmul(v);
 
-    let mut attn = attn.permute((0, 3, 1, 2, 4));
-    let dims = attn.dims();
-    let b = dims[0];
-    let s = dims[1];
-    attn.shape = ShapeTracker::new((b, s, Expression::from(n_heads_local * head_dim)));
+    // [b, kvh, kvg, seq, d] -> [b, seq, kvh, kvg, d] -> [b, seq, n_heads*d].
+    // `merge_dims` composes with the permute's strides; a plain `ShapeTracker`
+    // reassignment would misread the strided data whenever `kv_groups > 1`
+    // (e.g. real Mixtral GQA), interleaving heads across sequence positions.
+    let attn = attn
+        .permute((0, 3, 1, 2, 4))
+        .merge_dims(3, 4) // [b, seq, kvh, kvg*d]
+        .merge_dims(2, 3); // [b, seq, kvh*kvg*d] = [b, seq, n_heads_local*d]
 
     attn.matmul(o_w.permute((1, 0)))
+}
+
+/// RoPE `(cos, sin)` tables of shape `[seq, head_dim]` in the rotate-half
+/// (NeoX) layout Mixtral uses. `inv_freq[i] = theta^(-2i/head_dim)` and the
+/// angle table is `outer(positions, inv_freq)` duplicated across the two
+/// halves of `head_dim`.
+///
+/// `position_offset` is the absolute position of the first token in this
+/// chunk: `0` for prefill (positions `0..seq`), and the current KV-cache
+/// length for a decode step (positions `offset..offset+seq`). This is what
+/// makes decode-step RoPE correct — the query/key for a decode token must be
+/// rotated by its true position in the full sequence, not by `0`.
+pub fn rope_tables(
+    cx: &mut LuminalGraph,
+    seq: impl Into<Expression>,
+    head_dim: usize,
+    theta: f32,
+    position_offset: usize,
+) -> (GraphTensor, GraphTensor) {
+    let seq = seq.into();
+    let half = head_dim / 2;
+    // inv_freq[i] = exp(-(2i/head_dim) * ln(theta)).
+    let idx = cx.arange(half).cast(DType::F32);
+    let inv_freq = (idx * (-2.0 / head_dim as f32 * theta.ln())).exp(); // [half]
+    // positions = offset, offset+1, .., offset+seq-1.
+    let positions = cx.arange(seq).cast(DType::F32) + position_offset as f32; // [seq]
+    // outer product → [seq, half].
+    let angles = positions.expand_dim(1, half) * inv_freq.expand_dim(0, seq);
+    // NeoX layout duplicates the angles across both halves → [seq, head_dim].
+    let emb = angles.concat_along(angles, 1);
+    (emb.cos(), emb.sin())
+}
+
+/// Apply RoPE to `x` of shape `[batch, seq, heads, head_dim]`. `cos`/`sin`
+/// are `[seq, head_dim]` and broadcast across batch and heads.
+pub fn apply_rope(
+    x: GraphTensor,
+    cos: GraphTensor,
+    sin: GraphTensor,
+    head_dim: usize,
+) -> GraphTensor {
+    let dims = x.dims();
+    let batch = dims[0];
+    let heads = dims[2];
+    // The cos/sin tables are F32; match `x`'s dtype (e.g. Bf16) before mul.
+    let dt = x.dtype;
+    let cos_b = cos.expand_dim(0, batch).expand_dim(2, heads).cast(dt); // [b, seq, heads, hd]
+    let sin_b = sin.expand_dim(0, batch).expand_dim(2, heads).cast(dt);
+    x * cos_b + rotate_half(x, head_dim) * sin_b
+}
+
+/// `rotate_half([x1, x2]) = [-x2, x1]` along the last (`head_dim`) axis,
+/// where `x1`/`x2` are the two contiguous halves of `head_dim`.
+fn rotate_half(x: GraphTensor, head_dim: usize) -> GraphTensor {
+    let half = head_dim / 2;
+    let x1 = x.slice((.., .., .., ..half));
+    let x2 = x.slice((.., .., .., half..));
+    (x2 * -1.0).concat_along(x1, 3)
+}
+
+/// Additive causal attention bias of shape `[seq, seq]`: `0` on/below the
+/// diagonal (allowed) and a large negative value above it (future keys).
+fn causal_bias(cx: &mut LuminalGraph, seq: impl Into<Expression>) -> GraphTensor {
+    let seq = seq.into();
+    // tril(seq, 0) is 1 on/below the diagonal, 0 above.
+    let lower = cx.tril(seq, 0).cast(DType::F32);
+    (lower - 1.0) * 1.0e9
 }
 
 /// Reconstruct a `GraphTensor` from a previously-declared weight tensor.

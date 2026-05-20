@@ -27,7 +27,9 @@ pub use artifact::{
     ArtifactMetadata, DeclaredTensorMeta, DeviceArtifactLoaded, LoweredSegment, OpRecipe,
     SegmentMetadata, SkeinArtifact,
 };
-pub use dyn_runtime::{DynRuntime, DynRuntimeError, DynRuntimeWrapper};
+pub use dyn_runtime::{
+    DynRuntime, DynRuntimeError, DynRuntimeWrapper, WeightDtype, decode_weight_bytes,
+};
 pub use error::CompileError;
 pub use executor::{
     CollectiveExecutor, DEFAULT_SEARCH_BUDGET, RuntimeSegment, StepOutput, TopologyExecutor,

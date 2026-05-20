@@ -42,11 +42,11 @@ pub enum EmitError {
     SourceMissing { path: PathBuf },
 
     #[error(
-        "no single-file `weights.safetensors` found in {path}; multi-shard \
-         checkpoints indexed by `model.safetensors.index.json` are not yet \
-         supported by the shard writer"
+        "no checkpoint found in {path}: expected either a single-file \
+         `weights.safetensors` or a `model.safetensors.index.json` indexing \
+         multi-shard `*.safetensors` files"
     )]
-    MultiShardCheckpointUnsupported { path: PathBuf },
+    CheckpointNotFound { path: PathBuf },
 
     #[error("could not read source safetensors at {path}: {source}")]
     SafetensorsIo {

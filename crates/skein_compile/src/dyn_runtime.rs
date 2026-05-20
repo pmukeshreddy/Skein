@@ -19,6 +19,94 @@ pub enum DynRuntimeError {
 
     #[error("runtime input {0:?} needs i32 data, but received f32 data")]
     ExpectedI32(String),
+
+    #[error(
+        "weight {tensor:?} byte length {len} is not a multiple of the \
+         {dtype:?} element size"
+    )]
+    WeightByteLength {
+        tensor: String,
+        dtype: WeightDtype,
+        len: usize,
+    },
+}
+
+/// Source precision of a weight tensor's raw safetensors bytes. These are the
+/// dtypes a checkpoint stores weights in; the in-graph compute dtype is the
+/// Plan's choice and is handled separately by the compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightDtype {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl WeightDtype {
+    /// Bytes per element of the on-disk representation.
+    pub fn byte_width(self) -> usize {
+        match self {
+            WeightDtype::F32 => 4,
+            WeightDtype::F16 | WeightDtype::Bf16 => 2,
+        }
+    }
+}
+
+/// Decode raw little-endian safetensors weight bytes into `f32` values. This
+/// is the byte-level loading path shared by the runtime: the CPU
+/// `NativeRuntime` works in `f32`, so weights are widened here. (A GPU
+/// runtime can override [`DynRuntime::set_tensor_bytes_by_name`] to upload the
+/// raw low-precision bytes to device memory instead — GPU-only.)
+pub fn decode_weight_bytes(
+    tensor: &str,
+    bytes: &[u8],
+    dtype: WeightDtype,
+) -> Result<Vec<f32>, DynRuntimeError> {
+    if bytes.len() % dtype.byte_width() != 0 {
+        return Err(DynRuntimeError::WeightByteLength {
+            tensor: tensor.to_string(),
+            dtype,
+            len: bytes.len(),
+        });
+    }
+    let values = match dtype {
+        WeightDtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        WeightDtype::Bf16 => bytes
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        WeightDtype::F16 => bytes
+            .chunks_exact(2)
+            .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+    };
+    Ok(values)
+}
+
+/// IEEE-754 half-precision bit pattern → `f32`.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let f32_bits = match exp {
+        0 if mant == 0 => sign, // signed zero
+        0 => {
+            // Subnormal: normalize into f32's exponent range.
+            let mut e = -1i32;
+            let mut m = mant;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            let exp32 = (127 - 15 + 1 + e) as u32;
+            sign | (exp32 << 23) | ((m & 0x3ff) << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (mant << 13), // inf / nan
+        _ => sign | ((exp + (127 - 15)) << 23) | (mant << 13),
+    };
+    f32::from_bits(f32_bits)
 }
 
 /// Object-safe runtime API.
@@ -33,6 +121,19 @@ pub trait DynRuntime {
     fn set_tensor_by_name(&mut self, name: &str, data: Vec<f32>) -> Result<(), DynRuntimeError>;
     fn set_tensor_i32_by_name(&mut self, name: &str, data: Vec<i32>)
     -> Result<(), DynRuntimeError>;
+
+    /// Load a weight tensor from its raw little-endian safetensors bytes.
+    /// The default decodes to `f32` (correct for the CPU runtime); a GPU
+    /// runtime can override this to upload the low-precision bytes directly.
+    fn set_tensor_bytes_by_name(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        dtype: WeightDtype,
+    ) -> Result<(), DynRuntimeError> {
+        let data = decode_weight_bytes(name, bytes, dtype)?;
+        self.set_tensor_by_name(name, data)
+    }
 }
 
 pub struct DynRuntimeWrapper<R: ComputeRuntime> {

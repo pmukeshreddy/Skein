@@ -220,16 +220,74 @@ pub fn build_weight_shard(
     })
 }
 
+/// `model.safetensors.index.json` schema (only the `weight_map` matters):
+/// maps each tensor name to the `*.safetensors` shard file that holds it.
+#[derive(serde::Deserialize)]
+struct SafetensorsIndex {
+    weight_map: HashMap<String, String>,
+}
+
+/// Resolve each `source_key` to the checkpoint file that holds it, supporting
+/// both a single-file `weights.safetensors` and a multi-shard checkpoint
+/// indexed by `model.safetensors.index.json`.
+fn resolve_source_files(
+    shard: &WeightShard,
+    source_dir: &Path,
+) -> Result<HashMap<String, String>, EmitError> {
+    if source_dir.join("weights.safetensors").exists() {
+        return Ok(shard
+            .slices
+            .iter()
+            .map(|s| (s.source_key.clone(), "weights.safetensors".to_string()))
+            .collect());
+    }
+    let index_path = source_dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let bytes = std::fs::read(&index_path).map_err(|source| EmitError::SafetensorsIo {
+            path: index_path.clone(),
+            source,
+        })?;
+        let index: SafetensorsIndex =
+            serde_json::from_slice(&bytes).map_err(|e| EmitError::SafetensorsParse {
+                path: index_path.clone(),
+                message: format!("{e}"),
+            })?;
+        let mut map = HashMap::with_capacity(shard.slices.len());
+        for slice in &shard.slices {
+            let file = index.weight_map.get(&slice.source_key).ok_or_else(|| {
+                EmitError::SafetensorsParse {
+                    path: index_path.clone(),
+                    message: format!("index has no entry for {}", slice.source_key),
+                }
+            })?;
+            map.insert(slice.source_key.clone(), file.clone());
+        }
+        return Ok(map);
+    }
+    Err(EmitError::CheckpointNotFound {
+        path: source_dir.to_path_buf(),
+    })
+}
+
+fn safetensors_dtype(dtype: Dtype) -> safetensors::Dtype {
+    match dtype {
+        Dtype::Bf16 => safetensors::Dtype::BF16,
+        Dtype::Fp16 => safetensors::Dtype::F16,
+        // FP8 / Int4 variants don't have stable safetensors codes in 0.4.x;
+        // store as raw bytes via the closest match. Source weights are
+        // bf16/fp16 at write time — downcasting happens at compile.
+        Dtype::Fp8E4m3 | Dtype::Fp8E5m2 => safetensors::Dtype::F8_E4M3,
+        Dtype::Int8 => safetensors::Dtype::I8,
+        Dtype::Int4 => safetensors::Dtype::I8,
+    }
+}
+
 /// Materialize a shard to a destination safetensors file.
 ///
-/// `source_dir` is expected to contain the model's safetensors whose
-/// metadata lists the tensors referenced by `shard.slices[*].source_key`.
-///
-/// TODO(multi-shard): only the single-file case (`weights.safetensors`) is
-/// supported. Real checkpoints sharded across several files and indexed by
-/// `model.safetensors.index.json` return
-/// [`EmitError::MultiShardCheckpointUnsupported`] — reading the index and
-/// resolving each `source_key` to its shard file is not yet implemented.
+/// `source_dir` must contain either a single-file `weights.safetensors` or a
+/// `model.safetensors.index.json` indexing multi-shard `*.safetensors` files
+/// (the layout real HF checkpoints ship in). Each `shard.slices[*]` is read
+/// from whichever file holds its `source_key`.
 pub fn write_weight_shard(
     shard: &WeightShard,
     source_dir: &Path,
@@ -241,57 +299,57 @@ pub fn write_weight_shard(
         });
     }
 
-    // Look for a single-file source `weights.safetensors`. Multi-shard
-    // checkpoints indexed by `model.safetensors.index.json` are not yet
-    // supported; surface a clear error rather than silently picking a
-    // sub-file (see TODO(multi-shard) above).
-    let single_file = source_dir.join("weights.safetensors");
-    if !single_file.exists() {
-        return Err(EmitError::MultiShardCheckpointUnsupported {
-            path: source_dir.to_path_buf(),
-        });
+    let key_to_file = resolve_source_files(shard, source_dir)?;
+    // Group slices by source file so each file is read + parsed exactly once.
+    let mut slices_by_file: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, slice) in shard.slices.iter().enumerate() {
+        slices_by_file
+            .entry(key_to_file[&slice.source_key].clone())
+            .or_default()
+            .push(i);
     }
-    let bytes = std::fs::read(&single_file).map_err(|source| EmitError::SafetensorsIo {
-        path: single_file.clone(),
-        source,
-    })?;
-    let st =
-        safetensors::SafeTensors::deserialize(&bytes).map_err(|e| EmitError::SafetensorsParse {
-            path: single_file.clone(),
-            message: format!("{e}"),
-        })?;
 
     // Build the destination buffer. We read each slice's source bytes
     // (concatenating sub-ranges for `InnerAxisSlice`) into an owned
     // `Vec<u8>` per tensor and hand the lot to `safetensors::serialize`.
     let mut owned_buffers: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> =
         Vec::with_capacity(shard.slices.len());
-    for slice in &shard.slices {
-        let view = st
-            .tensor(&slice.source_key)
-            .map_err(|e| EmitError::SafetensorsParse {
-                path: single_file.clone(),
-                message: format!("missing key {}: {e}", slice.source_key),
-            })?;
-        let src_bytes = view.data();
-        let ranges = slice
-            .strategy
-            .source_byte_ranges(&slice.source_shape, slice.source_dtype);
-        let mut buf: Vec<u8> = Vec::new();
-        for r in ranges {
-            buf.extend_from_slice(&src_bytes[r.start as usize..r.end as usize]);
+    for (file, slice_indices) in &slices_by_file {
+        let path = source_dir.join(file);
+        let bytes = std::fs::read(&path).map_err(|source| EmitError::SafetensorsIo {
+            path: path.clone(),
+            source,
+        })?;
+        let st = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| {
+            EmitError::SafetensorsParse {
+                path: path.clone(),
+                message: format!("{e}"),
+            }
+        })?;
+        for &i in slice_indices {
+            let slice = &shard.slices[i];
+            let view = st
+                .tensor(&slice.source_key)
+                .map_err(|e| EmitError::SafetensorsParse {
+                    path: path.clone(),
+                    message: format!("missing key {}: {e}", slice.source_key),
+                })?;
+            let src_bytes = view.data();
+            let ranges = slice
+                .strategy
+                .source_byte_ranges(&slice.source_shape, slice.source_dtype);
+            let mut buf: Vec<u8> = Vec::new();
+            for r in ranges {
+                buf.extend_from_slice(&src_bytes[r.start as usize..r.end as usize]);
+            }
+            owned_buffers.push((
+                slice.source_key.clone(),
+                safetensors_dtype(slice.source_dtype),
+                slice.dest_shape.clone(),
+                buf,
+            ));
         }
-        let dt = match slice.source_dtype {
-            Dtype::Bf16 => safetensors::Dtype::BF16,
-            Dtype::Fp16 => safetensors::Dtype::F16,
-            // FP8 / Int4 variants don't have stable safetensors codes in
-            // 0.4.x; store as raw bytes via the closest match. Source weights
-            // are bf16/fp16 at write time — downcasting happens at compile.
-            Dtype::Fp8E4m3 | Dtype::Fp8E5m2 => safetensors::Dtype::F8_E4M3,
-            Dtype::Int8 => safetensors::Dtype::I8,
-            Dtype::Int4 => safetensors::Dtype::I8,
-        };
-        owned_buffers.push((slice.source_key.clone(), dt, slice.dest_shape.clone(), buf));
     }
 
     let tensor_data: HashMap<String, (safetensors::Dtype, Vec<usize>, &[u8])> = owned_buffers

@@ -125,11 +125,13 @@ through the selected `ComputeRuntime`.
 | `Graph::new()` + op wiring       | ✅ full per-segment op graphs          | —                                    |
 | `cx.build_search_space()`        | —                                     | ✅                                    |
 | `cx.search(runtime, budget)`     | —                                     | ✅ (`Native` or `Cuda` runtime)       |
-| `write_weight_shard`             | ✅ single-file source checkpoint       | —                                    |
+| `write_weight_shard`             | ✅ single-file + multi-shard (index)   | —                                    |
 | `IoManifest` / `topology.json`   | ✅ deterministic JSON                  | consumed at load                     |
 
-See the `TODO(...)` tags in `op_wiring.rs` for the per-op semantics (RoPE,
-causal mask, top-k MoE, EP token routing) that are not yet lowered.
+The op graph implements RoPE, the causal mask, and top-k MoE routing (each
+with a hand-computed test under `skein_emit/tests/`). The remaining
+`TODO(...)` tags in `op_wiring.rs` cover the decode-step position offset and
+expert-parallel token routing.
 
 ## Segment-per-collective architecture
 

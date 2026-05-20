@@ -18,13 +18,22 @@ fn topology_deterministic_for_mixtral() {
     let b_bytes = serde_json::to_vec(&b).unwrap();
     assert_eq!(a_bytes, b_bytes, "emit_topology must be deterministic");
 
-    // tp=2, ep=1: 32 blocks × 2 AllReduces (after attn + after MoE down).
+    // tp=2, ep=1: 32 blocks × 2 AllReduces (after attn + after MoE down),
+    // plus 1 vocab-parallel embedding AllReduce before block 0.
     let ar_count = a
         .collectives
         .iter()
         .filter(|c| c.kind == CollectiveKind::RingAllReduce)
         .count();
-    assert_eq!(ar_count, ir.meta.num_layers * 2);
+    assert_eq!(ar_count, ir.meta.num_layers * 2 + 1);
+
+    // Exactly one vocab-parallel logits AllGather after the LM head.
+    let ag_count = a
+        .collectives
+        .iter()
+        .filter(|c| c.kind == CollectiveKind::AllGather)
+        .count();
+    assert_eq!(ag_count, 1);
 
     // No EP collectives, no SendRecv (single PP stage).
     assert!(
@@ -61,8 +70,9 @@ fn topology_adds_alltoall_under_ep() {
         .iter()
         .filter(|c| c.kind == CollectiveKind::AllToAll)
         .count();
-    // 32 blocks × 2 AllReduces + 32 blocks × 2 AllToAll (dispatch + combine).
-    assert_eq!(ar_count, ir.meta.num_layers * 2);
+    // 32 blocks × 2 AllReduces + 1 embedding AllReduce (vocab-parallel),
+    // and 32 blocks × 2 AllToAll (dispatch + combine).
+    assert_eq!(ar_count, ir.meta.num_layers * 2 + 1);
     assert_eq!(a2a_count, ir.meta.num_layers * 2);
 }
 
