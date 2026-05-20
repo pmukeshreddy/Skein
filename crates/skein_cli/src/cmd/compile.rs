@@ -162,6 +162,14 @@ fn build_artifact<R: ComputeRuntime>(
         &metadata,
         artifact_dir,
     )?;
+    // Bundle the model's tokenizer.json (if the source checkpoint has one) so
+    // the served artifact is self-contained for real prompt/output
+    // tokenization. Best-effort: a missing tokenizer just leaves serve on the
+    // byte fallback.
+    let tokenizer_src = weights_dir.join("tokenizer.json");
+    if tokenizer_src.exists() {
+        let _ = std::fs::copy(&tokenizer_src, artifact_dir.join("tokenizer.json"));
+    }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(artifact)
 }

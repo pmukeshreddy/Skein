@@ -86,6 +86,9 @@ pub enum RuntimeError {
     #[error("server forward worker failed to initialize: {0}")]
     ServerInit(String),
 
+    #[error("tokenizer: {0}")]
+    Tokenizer(String),
+
     #[error("{what} is not yet implemented")]
     NotImplemented { what: &'static str },
 }

@@ -56,14 +56,16 @@ fn segmentation_count_tp2_ep2() {
     let cluster = load_4x_h100_cluster_for_tp2ep2();
     let plan = mk_plan(ir.meta.clone(), 2, 1, 2);
 
-    // tp=2 ep=2: 4 collectives/block × 32 blocks = 128, plus the two
-    // vocab-parallel collectives (embedding AllReduce + logits AllGather) = 130
-    // collectives → 131 segments.
+    // tp=2 ep=2 (dense expert parallel): 3 collectives/block × 32 blocks = 96
+    // — TP AllReduce after attn, EP combine AllReduce after MoE, TP AllReduce
+    // after the MoE down-proj (no EP dispatch; the hidden state is already
+    // replicated across the EP group) — plus the two vocab-parallel collectives
+    // (embedding AllReduce + logits AllGather) = 98 collectives → 99 segments.
     for device_idx in 0..4 {
         let count = segments_per_device(&plan, &cluster, &ir, device_idx);
         assert_eq!(
-            count, 131,
-            "device {device_idx} at tp=2 ep=2: expected 131 segments, got {count}",
+            count, 99,
+            "device {device_idx} at tp=2 ep=2: expected 99 segments, got {count}",
         );
     }
 }

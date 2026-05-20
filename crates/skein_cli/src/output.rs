@@ -16,6 +16,8 @@ use std::sync::Once;
 
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::cli::OutputFormat;
 use crate::error::CliError;
@@ -23,6 +25,11 @@ use crate::error::CliError;
 /// Per-process subscriber installation guard. Tests construct multiple
 /// `Cli` runs in one process; we only set the subscriber once.
 static INSTALL_ONCE: Once = Once::new();
+
+/// Env var: when set to an OTLP gRPC endpoint (e.g. `http://localhost:4317`),
+/// the request/step spans are exported via OpenTelemetry in addition to the
+/// stderr logs.
+const OTLP_ENV: &str = "SKEIN_OTLP_ENDPOINT";
 
 pub fn install_tracing(log_level: &str, output: OutputFormat) {
     INSTALL_ONCE.call_once(|| {
@@ -32,12 +39,51 @@ pub fn install_tracing(log_level: &str, output: OutputFormat) {
         // JSON mode: keep stdout clean for the final JSON object by
         // routing every span/event to stderr without ANSI colors.
         let ansi = matches!(output, OutputFormat::Text);
-        let builder = tracing_subscriber::fmt()
-            .with_env_filter(filter)
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_ansi(ansi);
-        builder.init();
+
+        // Optional OpenTelemetry OTLP export of the `tracing` spans
+        // (`skein.request` / `skein.step`). `Option<Layer>` is itself a
+        // `Layer`, so a single composed subscriber covers both cases.
+        let otel_layer = std::env::var(OTLP_ENV)
+            .ok()
+            .and_then(|endpoint| match build_otlp_layer(&endpoint) {
+                Ok(layer) => Some(layer),
+                Err(e) => {
+                    eprintln!("skein: OTLP export disabled ({OTLP_ENV}={endpoint}): {e}");
+                    None
+                }
+            });
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(otel_layer)
+            .init();
     });
+}
+
+/// Build an OpenTelemetry tracing layer that exports spans to `endpoint` over
+/// OTLP/gRPC. Requires a tokio runtime to be active (we install from inside
+/// `#[tokio::main]`).
+fn build_otlp_layer<S>(
+    endpoint: &str,
+) -> Result<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>, String>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use opentelemetry_otlp::WithExportConfig;
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(endpoint.to_string());
+    // `install_batch` returns the `Tracer` directly in this otlp version.
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(exporter)
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+        .map_err(|e| e.to_string())?;
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
 /// Per-plan summary block emitted at the end of `skein extract`.

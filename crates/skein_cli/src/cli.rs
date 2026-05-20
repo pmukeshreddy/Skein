@@ -122,6 +122,14 @@ pub struct VerifyArgs {
     pub cost: PathBuf,
     #[arg(long)]
     pub enforce: bool,
+    /// Verify against the real HuggingFace `transformers` reference at this
+    /// model path (runs `verify_reference.py`), instead of the Skein-bf16
+    /// reference. This is the true accuracy gate from the README.
+    #[arg(long)]
+    pub hf_reference: Option<PathBuf>,
+    /// Reference dtype for the HF model: bfloat16 | float16 | float32.
+    #[arg(long, default_value = "bfloat16")]
+    pub reference_dtype: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -152,6 +160,24 @@ pub struct ServeArgs {
     /// Bytes consumed by each cached token.
     #[arg(long, default_value_t = 524_288)]
     pub bytes_per_token: u64,
+
+    // ── Multi-GPU distributed generation ──────────────────────────────────
+    /// Launch one process per listed GPU (e.g. `--gpus 0,1,2,3`) and run
+    /// distributed generation across them. Without this, runs single-process.
+    #[arg(long)]
+    pub gpus: Option<String>,
+
+    /// Prompt for distributed generation (multi-GPU path).
+    #[arg(long)]
+    pub prompt: Option<String>,
+
+    /// Tokens to generate in the distributed path.
+    #[arg(long, default_value_t = 32)]
+    pub max_new_tokens: usize,
+
+    /// Shared file path for the NCCL rendezvous id (multi-GPU path).
+    #[arg(long, default_value = "/tmp/skein_rendezvous")]
+    pub rendezvous: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]

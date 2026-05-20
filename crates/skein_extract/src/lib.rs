@@ -20,12 +20,14 @@
 pub mod budgets;
 pub mod candidate;
 pub mod constraints;
+pub mod disaggregate;
 pub mod dp;
 pub mod drift_table;
 pub mod enumerate;
 pub mod error;
 
 pub use candidate::GlobalConfig;
+pub use disaggregate::extract_disaggregated_plan;
 pub use drift_table::DriftTable;
 pub use error::ExtractError;
 

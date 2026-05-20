@@ -1,0 +1,384 @@
+//! Real [`LocalSegments`] adapter over a device's compiled segments.
+//!
+//! [`SegmentRunner`] wraps the `Vec<RuntimeSegment>` that
+//! `skein_compile::load_runtime_segments` produces for one device and drives
+//! them for the [`RankExecutor`](super::rank_executor::RankExecutor): it owns
+//! the rank-local handoff store (logical-name → buffer), feeds a segment its
+//! named inputs, executes it, and captures its named outputs. The collective
+//! results the rank executor writes back land in the same store and are picked
+//! up as inputs by later segments.
+//!
+//! This is backend-agnostic: the `RuntimeSegment`s carry a `dyn DynRuntime`
+//! that is either the CPU `NativeComputeRuntime` or the GPU
+//! `CudaComputeRuntime`. The adapter therefore compiles and is unit-tested on
+//! the CPU build (with a mock `DynRuntime`); on the GPU host the identical code
+//! drives the real CUDA segments.
+
+use std::collections::HashMap;
+
+use skein_compile::RuntimeSegment;
+
+use super::rank_executor::{LocalSegments, RankExecError};
+use crate::kv_cache::{KvCache, parse_kvcache_name};
+
+/// Drives one device's compiled segments + the rank-local handoff store.
+pub struct SegmentRunner {
+    segments: Vec<RuntimeSegment>,
+    /// f32 handoff tensors keyed by logical name (segment outputs + collective
+    /// results).
+    handoffs: HashMap<String, Vec<f32>>,
+    /// Integer handoff tensors (e.g. `input_tokens`).
+    handoffs_i32: HashMap<String, Vec<i32>>,
+    /// Per-layer KV cache. Handoffs named `kvcache_{k|v}_{layer}` are fed from
+    /// the accumulated past and their step output appended here — so the model
+    /// attends to all prior tokens (cached decode) while each segment stays
+    /// fixed-shape per step.
+    kv_cache: KvCache,
+}
+
+impl SegmentRunner {
+    pub fn new(segments: Vec<RuntimeSegment>) -> Self {
+        Self {
+            segments,
+            handoffs: HashMap::new(),
+            handoffs_i32: HashMap::new(),
+            kv_cache: KvCache::new(0),
+        }
+    }
+
+    /// Borrow the KV cache (e.g. to inspect cached length).
+    pub fn kv_cache(&self) -> &KvCache {
+        &self.kv_cache
+    }
+
+    /// Clear the KV cache between requests (reuses the allocation).
+    pub fn reset_kv_cache(&mut self) {
+        self.kv_cache.reset();
+    }
+
+    /// Seed the integer input handoff the first segment consumes (the runtime
+    /// feeds the last token id each decode step, matching the executor).
+    pub fn set_input_tokens(&mut self, name: &str, tokens: Vec<i32>) {
+        self.handoffs_i32.insert(name.to_string(), tokens);
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn segment_err(segment_idx: usize) -> impl Fn(skein_compile::DynRuntimeError) -> RankExecError {
+        move |e| RankExecError::Segment {
+            segment_idx,
+            detail: e.to_string(),
+        }
+    }
+}
+
+impl LocalSegments for SegmentRunner {
+    fn run_segment(&mut self, segment_idx: usize) -> Result<(), RankExecError> {
+        let (input_names, output_names) = {
+            let seg = self
+                .segments
+                .get(segment_idx)
+                .ok_or(RankExecError::Segment {
+                    segment_idx,
+                    detail: "segment index out of range".to_string(),
+                })?;
+            (seg.input_names.clone(), seg.output_names.clone())
+        };
+        let err = Self::segment_err(segment_idx);
+
+        // Feed inputs. A `kvcache_*` input is fed the accumulated past from the
+        // KV cache; otherwise from the handoff store (i32 wins when both exist —
+        // only `input_tokens` is i32 and never collides with an f32 name).
+        for name in &input_names {
+            if let Some((kind, layer)) = parse_kvcache_name(name) {
+                let past = self.kv_cache.past(kind, layer).to_vec();
+                self.segments[segment_idx]
+                    .runtime
+                    .set_tensor_by_name(name, past)
+                    .map_err(&err)?;
+            } else if let Some(data) = self.handoffs_i32.get(name).cloned() {
+                self.segments[segment_idx]
+                    .runtime
+                    .set_tensor_i32_by_name(name, data)
+                    .map_err(&err)?;
+            } else if let Some(data) = self.handoffs.get(name).cloned() {
+                self.segments[segment_idx]
+                    .runtime
+                    .set_tensor_by_name(name, data)
+                    .map_err(&err)?;
+            }
+            // A missing input is left to the segment's own defaults (e.g. a
+            // weight already loaded into the runtime); not an error here.
+        }
+
+        self.segments[segment_idx]
+            .runtime
+            .execute_segment()
+            .map_err(&err)?;
+
+        // Capture named outputs. A `kvcache_*` output is the new token's K/V —
+        // appended to the cache so the next step attends over it; everything
+        // else goes to the handoff store for downstream segments / collectives.
+        for name in &output_names {
+            let data = self.segments[segment_idx]
+                .runtime
+                .get_tensor_by_name(name)
+                .map_err(&err)?;
+            if let Some((kind, layer)) = parse_kvcache_name(name) {
+                self.kv_cache.append(kind, layer, &data);
+            } else {
+                self.handoffs.insert(name.clone(), data);
+            }
+        }
+        Ok(())
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<f32>, RankExecError> {
+        self.handoffs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RankExecError::UnknownTensor(name.to_string()))
+    }
+
+    fn write(&mut self, name: &str, data: Vec<f32>) -> Result<(), RankExecError> {
+        self.handoffs.insert(name.to_string(), data);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skein_compile::{DynRuntime, DynRuntimeError};
+
+    /// A mock `DynRuntime`: on `execute_segment` it doubles its `in` tensor
+    /// into an `out` tensor. Lets us exercise the adapter's input-feed →
+    /// execute → output-capture path with no GPU and no Luminal graph.
+    #[derive(Default)]
+    struct DoublingRuntime {
+        tensors: HashMap<String, Vec<f32>>,
+    }
+
+    impl DynRuntime for DoublingRuntime {
+        fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
+            let input = self.tensors.get("in").cloned().unwrap_or_default();
+            let doubled = input.iter().map(|v| v * 2.0).collect();
+            self.tensors.insert("out".to_string(), doubled);
+            Ok(())
+        }
+        fn get_tensor_by_name(&self, name: &str) -> Result<Vec<f32>, DynRuntimeError> {
+            self.tensors
+                .get(name)
+                .cloned()
+                .ok_or_else(|| DynRuntimeError::UnknownTensor(name.to_string()))
+        }
+        fn set_tensor_by_name(&mut self, name: &str, data: Vec<f32>) -> Result<(), DynRuntimeError> {
+            self.tensors.insert(name.to_string(), data);
+            Ok(())
+        }
+        fn set_tensor_i32_by_name(
+            &mut self,
+            name: &str,
+            data: Vec<i32>,
+        ) -> Result<(), DynRuntimeError> {
+            self.tensors
+                .insert(name.to_string(), data.into_iter().map(|v| v as f32).collect());
+            Ok(())
+        }
+    }
+
+    fn mock_segment() -> RuntimeSegment {
+        RuntimeSegment {
+            runtime: Box::new(DoublingRuntime::default()),
+            input_names: vec!["in".to_string()],
+            output_names: vec!["out".to_string()],
+            capture_names: vec![],
+            weight_names: vec![],
+        }
+    }
+
+    #[test]
+    fn runs_segment_feeding_inputs_and_capturing_outputs() {
+        let mut runner = SegmentRunner::new(vec![mock_segment()]);
+        runner.write("in", vec![1.0, 2.0, 3.0]).unwrap();
+        runner.run_segment(0).unwrap();
+        assert_eq!(runner.read("out").unwrap(), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn collective_result_written_back_is_visible_to_next_read() {
+        let mut runner = SegmentRunner::new(vec![mock_segment()]);
+        // Simulate the rank executor writing an all-reduced tensor back.
+        runner.write("x", vec![9.0]).unwrap();
+        assert_eq!(runner.read("x").unwrap(), vec![9.0]);
+    }
+
+    #[test]
+    fn out_of_range_segment_is_an_error() {
+        let mut runner = SegmentRunner::new(vec![]);
+        assert!(matches!(
+            runner.run_segment(0),
+            Err(RankExecError::Segment { segment_idx: 0, .. })
+        ));
+    }
+
+    /// KV-cached decode mechanics: a `kvcache_k_0` handoff is fed the
+    /// accumulated past and its step output is appended. The mock emits the
+    /// length of the past it was fed, so after N steps the cache holds
+    /// `[0, 1, ... N-1]` — proving the past grows by one each step and outputs
+    /// accumulate (no GPU, no Luminal).
+    #[test]
+    fn kv_cache_accumulates_across_decode_steps() {
+        use crate::kv_cache::KvKind;
+
+        /// On execute does nothing; reports the length of the past it last
+        /// received for `kvcache_k_0` as that step's new (one-element) key.
+        #[derive(Default)]
+        struct CachePastEcho {
+            last_past_len: usize,
+        }
+        impl DynRuntime for CachePastEcho {
+            fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
+                Ok(())
+            }
+            fn get_tensor_by_name(&self, name: &str) -> Result<Vec<f32>, DynRuntimeError> {
+                if name == "kvcache_k_0" {
+                    Ok(vec![self.last_past_len as f32])
+                } else {
+                    Err(DynRuntimeError::UnknownTensor(name.to_string()))
+                }
+            }
+            fn set_tensor_by_name(
+                &mut self,
+                name: &str,
+                data: Vec<f32>,
+            ) -> Result<(), DynRuntimeError> {
+                if name == "kvcache_k_0" {
+                    self.last_past_len = data.len();
+                }
+                Ok(())
+            }
+            fn set_tensor_i32_by_name(
+                &mut self,
+                _name: &str,
+                _data: Vec<i32>,
+            ) -> Result<(), DynRuntimeError> {
+                Ok(())
+            }
+        }
+
+        let seg = RuntimeSegment {
+            runtime: Box::new(CachePastEcho::default()),
+            input_names: vec!["kvcache_k_0".to_string()],
+            output_names: vec!["kvcache_k_0".to_string()],
+            capture_names: vec![],
+            weight_names: vec![],
+        };
+        let mut runner = SegmentRunner::new(vec![seg]);
+        for _ in 0..3 {
+            runner.run_segment(0).unwrap();
+        }
+        // Step 0 fed empty past (len 0), step 1 fed [0] (len 1), step 2 fed
+        // [0,1] (len 2) → appended outputs are [0, 1, 2].
+        assert_eq!(runner.kv_cache().past(KvKind::Key, 0), &[0.0, 1.0, 2.0]);
+        // And the f32 handoff store does NOT also hold the cache tensor.
+        assert!(runner.read("kvcache_k_0").is_err());
+    }
+
+    /// Capstone: the *whole* distributed stack on CPU — real [`SegmentRunner`]
+    /// adapter + [`RankExecutor`] + threaded [`BarrierCollective`] — runs a
+    /// two-rank schedule and produces the correct all-reduced result on both
+    /// ranks. No GPU, no Luminal: this is the multi-process pipeline's
+    /// orchestration validated end to end (the GPU build swaps in CUDA
+    /// segments + NcclCollective behind the same interfaces).
+    #[test]
+    fn full_two_rank_pipeline_runs_on_cpu() {
+        use crate::distributed::{BarrierCollective, RankExecutor};
+        use skein_cost::collectives::CollectiveKind;
+        use skein_emit::segment::SequenceStep;
+        use skein_ir::types::Dtype;
+        use std::sync::Arc;
+        use std::thread;
+
+        /// Per-rank segment runtime: on execute, emits this rank's partial
+        /// contribution `[rank+1, rank+1]` for the collective tensor "x".
+        struct RankPartial {
+            rank: usize,
+            tensors: HashMap<String, Vec<f32>>,
+        }
+        impl DynRuntime for RankPartial {
+            fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
+                self.tensors
+                    .insert("x".to_string(), vec![(self.rank as f32) + 1.0; 2]);
+                Ok(())
+            }
+            fn get_tensor_by_name(&self, name: &str) -> Result<Vec<f32>, DynRuntimeError> {
+                self.tensors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| DynRuntimeError::UnknownTensor(name.to_string()))
+            }
+            fn set_tensor_by_name(
+                &mut self,
+                name: &str,
+                data: Vec<f32>,
+            ) -> Result<(), DynRuntimeError> {
+                self.tensors.insert(name.to_string(), data);
+                Ok(())
+            }
+            fn set_tensor_i32_by_name(
+                &mut self,
+                _name: &str,
+                _data: Vec<i32>,
+            ) -> Result<(), DynRuntimeError> {
+                Ok(())
+            }
+        }
+
+        let schedule = Arc::new(vec![
+            SequenceStep::ExecuteSegment {
+                device_idx: 0,
+                segment_idx: 0,
+            },
+            SequenceStep::ExecuteSegment {
+                device_idx: 1,
+                segment_idx: 0,
+            },
+            SequenceStep::Collective {
+                collective: CollectiveKind::RingAllReduce,
+                participants: vec![0, 1],
+                tensor: "x".to_string(),
+                shape: vec![2],
+                dtype: Dtype::Bf16,
+            },
+        ]);
+
+        let colls = BarrierCollective::group(2).expect("group");
+        let mut joins = Vec::new();
+        for (rank, coll) in colls.into_iter().enumerate() {
+            let schedule = schedule.clone();
+            joins.push(thread::spawn(move || {
+                let seg = RuntimeSegment {
+                    runtime: Box::new(RankPartial {
+                        rank,
+                        tensors: HashMap::new(),
+                    }),
+                    input_names: vec![],
+                    output_names: vec!["x".to_string()],
+                    capture_names: vec![],
+                    weight_names: vec![],
+                };
+                let runner = SegmentRunner::new(vec![seg]);
+                let mut exec = RankExecutor::new(rank, runner);
+                exec.run(&schedule, &coll).expect("rank run");
+                exec.into_runner().read("x").expect("x present")
+            }));
+        }
+        for (rank, j) in joins.into_iter().enumerate() {
+            let x = j.join().expect("rank thread");
+            assert_eq!(x, vec![3.0, 3.0], "rank {rank} got {x:?}");
+        }
+    }
+}

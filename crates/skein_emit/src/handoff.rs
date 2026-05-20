@@ -87,10 +87,16 @@ pub struct CollectivePoint {
 
 /// Compute the device's collective schedule. Same ordering as
 /// `topology::emit_topology`'s per-block iteration:
-///   1. EP dispatch (if `ep > 1` and block has MoE)
-///   2. TP AllReduce after attention (if `tp > 1`)
-///   3. EP combine (if `ep > 1` and block has MoE)
-///   4. TP AllReduce after MoE/MLP (if `tp > 1` and block has FFN)
+///   1. TP AllReduce after attention (if `tp > 1`)
+///   2. EP combine all-reduce (if `ep > 1` and block has MoE)
+///   3. TP AllReduce after MoE/MLP (if `tp > 1` and block has FFN)
+///
+/// Expert parallelism uses the *dense* scheme: each EP rank owns a disjoint
+/// subset of experts and evaluates them on the (EP-replicated) hidden state,
+/// producing a partial MoE output. The EP combine is a sum-all-reduce over
+/// the EP group that reconstructs the full MoE output — numerically identical
+/// to single-device routing. No dispatch collective is needed because the
+/// hidden state is already replicated across the EP group.
 ///
 /// Every device in the plan sees the same count and ordering — they
 /// differ only in which TP / EP groups they sit in, which the
@@ -131,34 +137,16 @@ pub fn device_collective_points(plan: &Plan, ir: &Graph, device_idx: u32) -> Vec
             .map(|p| p.activation)
             .unwrap_or(Dtype::Bf16);
 
-        let moe_layer = ir
+        let has_moe = ir
             .layers
             .iter()
-            .find(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Moe(_)));
-        let has_moe = moe_layer.is_some();
+            .any(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Moe(_)));
         let has_mlp = ir
             .layers
             .iter()
             .any(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Mlp(_)));
 
-        // 1. EP dispatch.
-        if placement.ep > 1 {
-            if let Some(moe) = moe_layer {
-                let LayerKind::Moe(cfg) = &moe.kind else {
-                    unreachable!()
-                };
-                points.push(CollectivePoint {
-                    block,
-                    kind: CollectiveKind::AllToAll,
-                    tensor: collective_moe_dispatch(block),
-                    shape: vec![batch, cfg.top_k, hidden],
-                    dtype: activation_dtype,
-                    participants: ep_group_for_device(device_idx, &placement),
-                });
-            }
-        }
-
-        // 2. TP AllReduce after attn.
+        // 1. TP AllReduce after attn.
         if placement.tp > 1 {
             points.push(CollectivePoint {
                 block,
@@ -170,24 +158,20 @@ pub fn device_collective_points(plan: &Plan, ir: &Graph, device_idx: u32) -> Vec
             });
         }
 
-        // 3. EP combine.
-        if placement.ep > 1 {
-            if let Some(moe) = moe_layer {
-                let LayerKind::Moe(cfg) = &moe.kind else {
-                    unreachable!()
-                };
-                points.push(CollectivePoint {
-                    block,
-                    kind: CollectiveKind::AllToAll,
-                    tensor: collective_moe_combine(block),
-                    shape: vec![batch, cfg.top_k, hidden],
-                    dtype: activation_dtype,
-                    participants: ep_group_for_device(device_idx, &placement),
-                });
-            }
+        // 2. EP combine: sum the per-rank partial expert outputs across the
+        //    EP group. The full MoE output shape is [batch, seq=1, hidden].
+        if placement.ep > 1 && has_moe {
+            points.push(CollectivePoint {
+                block,
+                kind: CollectiveKind::RingAllReduce,
+                tensor: collective_moe_combine(block),
+                shape: vec![batch, 1, hidden],
+                dtype: activation_dtype,
+                participants: ep_group_for_device(device_idx, &placement),
+            });
         }
 
-        // 4. TP AllReduce after MoE/MLP.
+        // 3. TP AllReduce after MoE/MLP.
         if placement.tp > 1 && (has_moe || has_mlp) {
             points.push(CollectivePoint {
                 block,

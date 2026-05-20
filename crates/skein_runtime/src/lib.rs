@@ -24,23 +24,35 @@ pub mod batcher;
 pub mod collectives;
 pub mod cuda;
 pub mod dispatch;
+pub mod distributed;
+pub mod drift_monitor;
 pub mod error;
 pub mod hotswap;
 pub mod kv;
+pub mod kv_cache;
 pub mod kv_transport;
 pub mod observability;
 pub mod server;
+pub mod speculative;
 pub mod token_stream;
+pub mod tokenizer;
 pub mod types;
 
 pub use batcher::{AdmissionDecision, ContinuousBatcher, RejectReason, StepBatch};
 pub use collectives::{CollectiveBackend, CollectiveError, InProcessCollective};
 pub use dispatch::{DispatchError, DispatchOutcome, EagerDispatcher, KernelDispatcher};
+pub use drift_monitor::{DriftAssessment, DriftMonitor, WorkloadProfile};
+pub use distributed::{
+    BarrierCollective, CollectiveError as RankCollectiveError, LocalSegments, RankCollective,
+    RankExecutor, SegmentRunner, WorldLayout,
+};
 pub use error::RuntimeError;
 pub use hotswap::HotSwap;
 pub use kv::{PagedKVAllocator, RadixPrefixTree};
 pub use kv_transport::{KvTransport, LocalKvTransport, TransportError};
 pub use observability::{ProfileHooks, RequestMetrics, StepMetrics};
 pub use server::Server;
+pub use speculative::{SpecError, SpecOutcome, verify as speculative_verify};
 pub use token_stream::TokenStreamer;
+pub use tokenizer::SkeinTokenizer;
 pub use types::{IncomingRequest, RequestId, TokenOutput};

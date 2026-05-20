@@ -42,6 +42,15 @@ pub fn run(args: ExtractArgs, output: OutputFormat) -> Result<(), CliError> {
     );
 
     let plan_json = serde_json::to_string_pretty(&plan)?;
+    // Create the output's parent directory if the caller pointed `--out` at a
+    // not-yet-existing dir (e.g. `artifacts/plan.json`). Writing to a bare
+    // filename in the cwd needs no parent, hence the `Some`-with-non-empty
+    // guard rather than an unconditional `create_dir_all`.
+    if let Some(parent) = args.out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     std::fs::write(&args.out, &plan_json)?;
 
     // Build the report. `plan.content_hash()` returns `Result<_, PlanError>`

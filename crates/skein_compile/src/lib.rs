@@ -33,7 +33,8 @@ pub use dyn_runtime::{
 pub use error::CompileError;
 pub use executor::{
     CollectiveExecutor, DEFAULT_SEARCH_BUDGET, RuntimeSegment, StepOutput, TopologyExecutor,
-    TopologyStepBatch, load_native_runtime_segments, load_runtime_segments,
+    TopologyStepBatch, load_device_runtime_segments, load_native_runtime_segments,
+    load_runtime_segments,
 };
 
 /// Backend abstraction. Two concrete impls: `CudaComputeRuntime` (Luminal's

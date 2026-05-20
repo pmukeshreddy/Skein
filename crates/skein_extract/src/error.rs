@@ -51,4 +51,10 @@ pub enum ExtractError {
         dp_infeasible: u64,
         dominant_rejection: Option<RejectReason>,
     },
+
+    #[error(
+        "invalid P/D disaggregation split: requested {decode_devices} decode \
+         device(s) of {total} total — need 1..{total} so both pools are non-empty"
+    )]
+    InvalidDisaggregation { decode_devices: usize, total: usize },
 }

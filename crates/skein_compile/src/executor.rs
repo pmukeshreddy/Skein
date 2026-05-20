@@ -232,6 +232,32 @@ pub fn load_runtime_segments<R: crate::ComputeRuntime + 'static>(
     Ok(all_devices)
 }
 
+/// Load and compile the segments for a *single* device. Used by the
+/// multi-process multi-GPU path, where each rank process owns exactly one
+/// device and must not build the others' graphs. `device_idx` is matched
+/// against `DeviceArtifactLoaded::device_idx`.
+pub fn load_device_runtime_segments<R: crate::ComputeRuntime + 'static>(
+    artifact: &SkeinArtifact,
+    device_idx: usize,
+    search_budget: usize,
+) -> Result<Vec<RuntimeSegment>, CompileError> {
+    let device = artifact
+        .devices
+        .iter()
+        .find(|d| d.device_idx == device_idx)
+        .ok_or(CompileError::MissingSegment {
+            device_idx,
+            segment_idx: 0,
+        })?;
+    let lowered = device.rebuild_graphs()?;
+    let mut runtime_segments = Vec::with_capacity(lowered.len());
+    for segment in lowered {
+        runtime_segments.push(compile_segment::<R>(segment, search_budget)?);
+    }
+    load_weights_into_segments(&device.weights_path, runtime_segments.as_mut_slice())?;
+    Ok(runtime_segments)
+}
+
 fn compile_segment<R: crate::ComputeRuntime + 'static>(
     mut segment: Segment,
     search_budget: usize,

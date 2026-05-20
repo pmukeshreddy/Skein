@@ -90,7 +90,7 @@ use crate::error::EmitError;
 use crate::graph_builder::{DeclaredTensor, shard_param_dims, to_luminal_dtype};
 use crate::handoff::{
     CollectivePoint, EMBED_OUT, INPUT_TOKENS, LOGITS, carry_post_attn, carry_pre_block,
-    collective_attn_out, collective_ffn_out, collective_moe_combine, collective_moe_dispatch,
+    collective_attn_out, collective_ffn_out, collective_moe_combine,
     device_collective_points,
 };
 use crate::segment::{HandoffTensor, Segment, SequenceStep};
@@ -525,41 +525,17 @@ impl<'a> DeviceWiring<'a> {
             .iter()
             .any(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Mlp(_)));
 
-        // Pull the input carry — output of the previous block's tail.
+        // Pull the input carry — output of the previous block's tail. Under EP
+        // the hidden state is replicated across the EP group, so there is no
+        // dispatch collective before MoE (dense expert parallel; the combine
+        // all-reduce after MoE sums the per-rank partial expert outputs).
         let carry_in = carry_pre_block(block);
+
+        // (1) Pre-attn ops: input_layernorm + q/k/v + attn → block_N_attn_out.
         let hidden = self
             .live
             .get(&carry_in)
             .expect("pre-block carry missing")
-            .tensor;
-
-        // (1) EP dispatch (before attn collective in topology order).
-        if placement.ep > 1 && has_moe {
-            let point = point_iter
-                .next()
-                .expect("ep dispatch point not present in iter");
-            assert_eq!(point.tensor, collective_moe_dispatch(block));
-            // Structural handoff only: re-view `hidden` to the dispatch
-            // collective's shape so the segment graph is complete and the
-            // collective has a typed input. TODO(ep-routing): emit the real
-            // per-token scatter to remote experts (see module docstring).
-            let dispatch_tensor = self.reshape_for_handoff(hidden, &point.shape);
-            self.live.insert(
-                point.tensor.clone(),
-                LiveTensor {
-                    tensor: dispatch_tensor,
-                    shape: point.shape.clone(),
-                    dtype: point.dtype,
-                },
-            );
-            self.cut_segment_at_collective(point, &point.tensor, &[&carry_in]);
-        }
-
-        // (2) Pre-attn ops: input_layernorm + q/k/v + attn → block_N_attn_out.
-        let hidden = self
-            .live
-            .get(&carry_in)
-            .expect("pre-block carry missing after optional dispatch cut")
             .tensor;
         let norm1_w = self.weight(&format!("model.layers.{block}.input_layernorm.weight"))?;
         let normed_1 = rms_norm(hidden, norm1_w, self.ir.meta.rms_norm_eps);
@@ -622,38 +598,37 @@ impl<'a> DeviceWiring<'a> {
             },
         );
 
-        // (6) EP combine after MoE.
+        // (6) EP combine after MoE: all-reduce (sum) the per-rank partial
+        // expert outputs across the EP group. `ffn_out` is this rank's sum over
+        // the experts it owns; summing across the EP group reconstructs the
+        // full MoE output (dense expert parallel).
         if placement.ep > 1 && has_moe {
             let point = point_iter
                 .next()
                 .expect("ep combine point not present in iter");
             assert_eq!(point.tensor, collective_moe_combine(block));
-            // Same structural handoff as dispatch — re-view ffn_out into
-            // [batch, top_k, hidden] for the collective tensor.
-            // TODO(ep-routing): emit the real gather of expert outputs.
-            let combine_tensor = self.reshape_for_handoff(ffn_out, &point.shape);
+            let combine_name = collective_moe_combine(block);
             self.live.insert(
-                point.tensor.clone(),
+                combine_name.clone(),
                 LiveTensor {
-                    tensor: combine_tensor,
-                    shape: point.shape.clone(),
-                    dtype: point.dtype,
+                    tensor: ffn_out,
+                    shape: vec![self.batch, self.seq, self.hidden],
+                    dtype: self.activation_dtype,
                 },
             );
-            self.cut_segment_at_collective(point, &point.tensor, &[&carry_post, &ffn_name]);
-            // After the cut, fold the combined tensor back to ffn_name's
-            // shape and re-register under ffn_name for the downstream
-            // ffn-AllReduce step.
+            self.cut_segment_at_collective(point, &combine_name, &[&carry_post]);
+            // After the all-reduce the combined tensor is the full MoE output;
+            // re-register it under ffn_name for the downstream TP ffn-AllReduce
+            // (when tp > 1) and the post-block residual.
             let combined = self
                 .live
-                .get(&point.tensor)
+                .get(&combine_name)
                 .expect("combined missing")
                 .tensor;
-            let folded = self.reshape_for_handoff(combined, &[self.batch, self.seq, self.hidden]);
             self.live.insert(
                 ffn_name.clone(),
                 LiveTensor {
-                    tensor: folded,
+                    tensor: combined,
                     shape: vec![self.batch, self.seq, self.hidden],
                     dtype: self.activation_dtype,
                 },
@@ -740,9 +715,14 @@ impl<'a> DeviceWiring<'a> {
     ///
     /// Compute note: every owned expert is still *evaluated* and then weighted
     /// (non-selected weights are ~0, so the **output** matches true top-k
-    /// routing). Sparse *compute* — dispatching only the selected experts and
-    /// routing their tokens — is the expert-parallel concern tracked by
-    /// `TODO(ep-routing)`.
+    /// routing). Under expert parallelism (`ep > 1`) each device owns a
+    /// disjoint subset of experts (see [`Self::owns_expert`]) and therefore
+    /// produces a *partial* MoE output; the EP combine all-reduce in
+    /// [`Self::wire_block`] sums these partials across the EP group into the
+    /// full output. This is the *dense* expert-parallel scheme. Sparse compute
+    /// — routing only each token's selected experts via the GShard
+    /// dispatch/combine in [`moe_dispatch_combine`] — is a future throughput
+    /// optimization, not a correctness requirement.
     fn wire_block_moe(
         &mut self,
         block: usize,
@@ -879,19 +859,6 @@ impl<'a> DeviceWiring<'a> {
         Err(EmitError::UnknownParamPattern { name: name.into() })
     }
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /// Re-view `t` under `target_shape` via direct `ShapeTracker`
-    /// assignment, producing a typed input/output for a collective handoff.
-    /// Used only on the EP dispatch/combine boundaries — see the
-    /// `TODO(ep-routing)` note in the module docstring.
-    fn reshape_for_handoff(&self, mut t: GraphTensor, target_shape: &[usize]) -> GraphTensor {
-        let dims: Vec<Expression> = target_shape.iter().copied().map(Expression::from).collect();
-        t.shape = ShapeTracker::new(dims);
-        t
-    }
 }
 
 /// Shape + dtype + logical name spec for a tensor to introduce as an
@@ -1251,6 +1218,108 @@ pub fn decode_attention_with_cache(
     attn.permute((0, 3, 1, 2, 4)) // [b, 1, Hkv, groups, d]
         .merge_dims(3, 4)
         .merge_dims(2, 3) // [b, 1, n_heads*d]
+}
+
+/// Single-token cached decode against a **growing, runtime-fed** KV cache.
+///
+/// This is the serving counterpart used by the runtime [`KvCache`]
+/// (`skein_runtime`): each decode step the runtime feeds the accumulated past
+/// (`k_cache`/`v_cache`, shape `[batch, past, n_kv_heads*head_dim]`, where
+/// `past` is a *dynamic* dimension that grows by one each step) and the current
+/// absolute `position` (`[1]`); the graph returns the attention output plus the
+/// new token's **rotated** key and its value, which the runtime appends to the
+/// cache for the next step.
+///
+/// The single query is the latest token, so it attends to *every* cached key
+/// plus its own — no causal mask is needed (unlike prefill). RoPE is applied to
+/// q and the new k at the runtime `position`, matching the rotation already
+/// stored for the cached keys.
+///
+/// Numerics validated on GPU (the CPU `NativeRuntime` cannot execute the block;
+/// the dynamic-`past` concat in particular — including the `past == 0` first
+/// step — should be checked on hardware).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode_step(
+    q: GraphTensor,
+    k_new: GraphTensor,
+    v_new: GraphTensor,
+    k_cache: GraphTensor,
+    v_cache: GraphTensor,
+    position: GraphTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) -> (GraphTensor, GraphTensor, GraphTensor) {
+    let kv_groups = n_heads / n_kv_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let half = head_dim / 2;
+
+    // Runtime-position RoPE tables for a single position. Build the `arange`
+    // in one borrow of the graph (luminal threads it through raw pointers).
+    let inv_freq = {
+        let cx = q.graph();
+        let idx = cx.arange(half).cast(DType::F32);
+        (idx * (-2.0 / head_dim as f32 * rope_theta.ln())).exp() // [half]
+    };
+    let pos_f = position.cast(DType::F32); // [1]
+    let angles = pos_f.expand_dim(1, half) * inv_freq.expand_dim(0, 1); // [1, half]
+    let emb = angles.concat_along(angles, 1); // [1, head_dim]
+
+    // Rotate the current q and k at `position`.
+    let q_hs = q.split_dims(2, head_dim); // [b, 1, n_heads, d]
+    let qd = q_hs.dims();
+    let q_cos = emb
+        .cos()
+        .expand_dim(0, qd[0])
+        .expand_dim(2, qd[2])
+        .cast(q.dtype);
+    let q_sin = emb
+        .sin()
+        .expand_dim(0, qd[0])
+        .expand_dim(2, qd[2])
+        .cast(q.dtype);
+    let q_hs = q_hs * q_cos + rotate_half(q_hs, head_dim) * q_sin;
+
+    let k_hs = k_new.split_dims(2, head_dim); // [b, 1, n_kv, d]
+    let kd = k_hs.dims();
+    let k_cos = emb
+        .cos()
+        .expand_dim(0, kd[0])
+        .expand_dim(2, kd[2])
+        .cast(k_new.dtype);
+    let k_sin = emb
+        .sin()
+        .expand_dim(0, kd[0])
+        .expand_dim(2, kd[2])
+        .cast(k_new.dtype);
+    let k_hs = k_hs * k_cos + rotate_half(k_hs, head_dim) * k_sin; // [b, 1, n_kv, d]
+    let v_hs = v_new.split_dims(2, head_dim); // [b, 1, n_kv, d]
+
+    // Concatenate the past cache with the current token along the sequence
+    // axis. `past == 0` (first step) yields an empty cache; the concat then
+    // reduces to the current token.
+    let k_cache_hs = k_cache.split_dims(2, head_dim); // [b, past, n_kv, d]
+    let v_cache_hs = v_cache.split_dims(2, head_dim);
+    let k_full_hs = k_cache_hs.concat_along(k_hs, 1); // [b, past+1, n_kv, d]
+    let v_full_hs = v_cache_hs.concat_along(v_hs, 1);
+
+    // GQA attention; single query → no causal mask.
+    let q5 = q_hs.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4)); // [b,n_kv,groups,1,d]
+    let k5 = k_full_hs.permute((0, 2, 3, 1)).expand_dim(2, kv_groups); // [b,n_kv,groups,d,T]
+    let v5 = v_full_hs.permute((0, 2, 1, 3)).expand_dim(2, kv_groups); // [b,n_kv,groups,T,d]
+    let scores = q5.matmul(k5) * scale; // [b,n_kv,groups,1,T]
+    let weights = scores.softmax(4);
+    let attn = weights.matmul(v5); // [b,n_kv,groups,1,d]
+    let attn = attn
+        .permute((0, 3, 1, 2, 4))
+        .merge_dims(3, 4)
+        .merge_dims(2, 3); // [b, 1, n_heads*d]
+
+    // The new (rotated) key and value, flattened for the runtime to append.
+    let k_store = k_hs.merge_dims(2, 3); // [b, 1, n_kv*d]
+    let v_store = v_hs.merge_dims(2, 3);
+    (attn, k_store, v_store)
 }
 
 /// Self-attention with GQA expansion. Looks up Q/K/V/O weights from a

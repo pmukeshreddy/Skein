@@ -25,6 +25,10 @@ pub struct InflightRequest {
     pub chunks: Option<ChunkPlan>,
     /// Output tokens emitted so far. Used by `retire` to seal the stream.
     pub output_tokens_emitted: u32,
+    /// Tokens generated for this request so far, in order. The decode step
+    /// feeds the running sequence (`prompt_tokens` ++ `generated_tokens`) to
+    /// the executor; the executor consumes the last token each step.
+    pub generated_tokens: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -51,6 +55,7 @@ impl InflightSet {
             admitted_at_ms,
             chunks,
             output_tokens_emitted: 0,
+            generated_tokens: Vec::new(),
             request,
             sender,
         };

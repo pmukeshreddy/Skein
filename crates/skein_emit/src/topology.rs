@@ -82,10 +82,10 @@ pub fn emit_topology(plan: &Plan, _cluster: &Cluster, ir: &Graph) -> Topology {
     }
 
     // Iterate decoder blocks in execution order. Each block:
-    //   (1) optional EP AllToAll dispatch before MoE
-    //   (2) TP AllReduce after attention
-    //   (3) optional EP AllToAll combine after MoE
-    //   (4) TP AllReduce after MoE/MLP
+    //   (1) TP AllReduce after attention
+    //   (2) optional EP combine AllReduce after MoE (dense expert parallel:
+    //       sum the per-rank partial expert outputs across the EP group)
+    //   (3) TP AllReduce after MoE/MLP
     // Plus PP SendRecv at every stage boundary.
     for block in 0..num_blocks {
         let stage = block_to_stage(block, num_blocks, placement.pp);
@@ -121,31 +121,6 @@ pub fn emit_topology(plan: &Plan, _cluster: &Cluster, ir: &Graph) -> Topology {
             }
         }
 
-        // EP dispatch (before MoE FFN, for MoE blocks only).
-        if placement.ep > 1 {
-            if let Some(moe) = ir
-                .layers
-                .iter()
-                .find(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Moe(_)))
-            {
-                let LayerKind::Moe(cfg) = &moe.kind else {
-                    unreachable!()
-                };
-                let ep_group = ep_group_leaders(stage, &placement);
-                let bytes_shape = vec![batch, cfg.top_k, hidden];
-                collectives.push(TopologyEntry {
-                    sequence_idx: seq,
-                    kind: CollectiveKind::AllToAll,
-                    participants: ep_group.clone(),
-                    tensor_name: format!("block_{block}_moe_dispatch"),
-                    shape: bytes_shape.clone(),
-                    dtype: attn_dtype,
-                    after_node: format!("block_{block}_router"),
-                });
-                seq += 1;
-            }
-        }
-
         // TP AllReduce after the attention block's o_proj.
         if placement.tp > 1 {
             let tp_group = tp_group_leaders(stage, &placement);
@@ -161,23 +136,21 @@ pub fn emit_topology(plan: &Plan, _cluster: &Cluster, ir: &Graph) -> Topology {
             seq += 1;
         }
 
-        // EP combine (after MoE FFN).
+        // EP combine (after MoE FFN): dense expert parallel sums the per-rank
+        // partial expert outputs across the EP group via an all-reduce.
         if placement.ep > 1 {
-            if let Some(moe) = ir
+            let has_moe = ir
                 .layers
                 .iter()
-                .find(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Moe(_)))
-            {
-                let LayerKind::Moe(cfg) = &moe.kind else {
-                    unreachable!()
-                };
+                .any(|l| l.block_idx == Some(block) && matches!(l.kind, LayerKind::Moe(_)));
+            if has_moe {
                 let ep_group = ep_group_leaders(stage, &placement);
                 collectives.push(TopologyEntry {
                     sequence_idx: seq,
-                    kind: CollectiveKind::AllToAll,
+                    kind: CollectiveKind::RingAllReduce,
                     participants: ep_group,
                     tensor_name: format!("block_{block}_moe_combine"),
-                    shape: vec![batch, cfg.top_k, hidden],
+                    shape: vec![batch, 1, hidden],
                     dtype: attn_dtype,
                     after_node: format!("block_{block}_expert_out"),
                 });

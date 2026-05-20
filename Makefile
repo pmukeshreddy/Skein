@@ -37,12 +37,16 @@ clean:
 	$(CARGO) clean
 
 # Plan search only — no GPU required (runs with whatever FEATURES resolves to).
+# `extract` requires --drift and --cost (no defaults); they must be passed
+# explicitly or the command aborts with a clap "required arguments" error.
 extract-mixtral:
 	$(CARGO) run -p skein_cli $(FEATURES) -- extract \
-	    --model configs/mixtral_8x7b_config.json \
+	    --model   configs/mixtral_8x7b_config.json \
 	    --cluster cluster/h100_2x.toml \
-	    --trace  cluster/sample_trace.jsonl \
-	    --out    artifacts/plan.json
+	    --trace   cluster/sample_trace.jsonl \
+	    --drift   models/mixtral_8x7b_drift.toml \
+	    --cost    cluster/cost_constants.toml \
+	    --out     artifacts/plan.json
 
 # GPU pipeline targets.
 require-cuda:
@@ -52,17 +56,27 @@ require-cuda:
 	    exit 1; \
 	fi
 
+# `compile` requires --drift, --cost, and --weights (a real safetensors
+# checkpoint dir) in addition to --model/--cluster/--trace. Point
+# HF_MODEL_PATH at the downloaded checkpoint, e.g.
+#   make compile-mixtral HF_MODEL_PATH=/data/mixtral-8x7b
 compile-mixtral: require-cuda
 	$(CARGO) run -p skein_cli -- compile \
-	    --model configs/mixtral_8x7b_config.json \
+	    --model   configs/mixtral_8x7b_config.json \
 	    --cluster cluster/h100_2x.toml \
-	    --trace  cluster/sample_trace.jsonl \
-	    --out    artifacts/
+	    --trace   cluster/sample_trace.jsonl \
+	    --drift   models/mixtral_8x7b_drift.toml \
+	    --cost    cluster/cost_constants.toml \
+	    --weights $(HF_MODEL_PATH) \
+	    --out     artifacts/
 
+# `verify` compares the artifact against a bf16 *Skein* reference artifact.
+# With no --reference it uses <artifact>/reference_bf16, which `compile`
+# writes during advisory parity — so omit --reference here rather than
+# passing an HF checkpoint path (which verify does not accept).
 verify-mixtral: require-cuda
 	$(CARGO) run -p skein_cli -- verify \
 	    --artifact artifacts/LATEST \
-	    --reference $(HF_MODEL_PATH) \
 	    --sample-from cluster/sample_trace.jsonl
 
 bench: require-cuda

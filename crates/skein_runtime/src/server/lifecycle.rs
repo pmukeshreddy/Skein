@@ -115,4 +115,20 @@ impl Server {
     pub async fn serve(&self) -> Result<(), RuntimeError> {
         crate::server::forward::serve(self).await
     }
+
+    /// Start the forward driver in the background without binding the HTTP
+    /// listener. After this returns, requests submitted via [`Server::submit`]
+    /// are picked up by the driver and streamed. Intended for integration
+    /// tests; production callers use [`Server::serve`].
+    #[doc(hidden)]
+    pub async fn start_driver_for_test(&self) -> Result<(), RuntimeError> {
+        #[cfg(feature = "cuda")]
+        {
+            crate::server::forward::start_driver::<skein_compile::CudaComputeRuntime>(self)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            crate::server::forward::start_driver::<skein_compile::NativeComputeRuntime>(self)
+        }
+    }
 }

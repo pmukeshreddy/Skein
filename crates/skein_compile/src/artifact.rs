@@ -215,6 +215,21 @@ impl SkeinArtifact {
         Self::load(out_dir)
     }
 
+    /// Reconstruct the source IR graph stored in the per-device recipe. The
+    /// HF parity gate (`skein verify --hf-reference`) needs it to drive the
+    /// `transformers` reference forward against the same architecture.
+    pub fn ir(&self) -> Result<Graph, CompileError> {
+        let device = self.devices.first().ok_or(CompileError::ArtifactHasNoDevices)?;
+        let seg = device
+            .segments
+            .first()
+            .ok_or(CompileError::ArtifactHasNoDevices)?;
+        match &seg.op_recipe {
+            OpRecipe::WireSegments { ir_json, .. } => serde_json::from_slice(ir_json)
+                .map_err(|source| CompileError::RecipeJson { what: "ir", source }),
+        }
+    }
+
     pub fn load(dir: &Path) -> Result<Self, CompileError> {
         let plan: Plan = read_json(&dir.join("plan.json"))?;
         let sequencing: Vec<SequenceStep> = read_json(&dir.join("topology.json"))?;

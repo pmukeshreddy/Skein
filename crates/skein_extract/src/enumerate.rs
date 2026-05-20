@@ -111,11 +111,20 @@ pub fn enumerate_batch_policies() -> Vec<BatchPolicy> {
 }
 
 pub fn enumerate_cuda_graphs_configs() -> Vec<CudaGraphsConfig> {
-    // Plan search must only consider cuda_graphs=false until skein_runtime's
-    // CudaGraphDispatcher implements real capture/replay. Blocking prerequisite:
-    // CudaComputeRuntime must expose its primary CUDA stream so the dispatcher
-    // can begin/end stream capture; pinned Luminal keeps the stream private.
-    // Widen this enumeration when the prerequisite is met.
+    // Plan search only considers cuda_graphs=false today — but note the core
+    // benefit is already delivered on the GPU build, just one layer down: the
+    // Luminal `CudaRuntime` compiles each kernel subgraph into a real CUDA
+    // graph by *manual node construction* (`cuGraphAddKernelNode` +
+    // `cuGraphInstantiateWithFlags` + `cuGraphLaunch`; not stream capture), so
+    // per-subgraph kernel-launch overhead is amortized regardless of this flag.
+    // This flag would instead control Skein's *step-level* graph (one graph
+    // across all segments + collectives for a whole decode step), whose
+    // `skein_runtime::cuda::CudaGraphCache` is still a stub. That, too, is
+    // buildable via Luminal's `pub CudaGraphHandle::add_kernel_node` (no stream
+    // capture needed — the earlier "legacy stream not capturable" concern does
+    // not apply, since nothing here captures). It stays gated only because the
+    // step-level cache isn't implemented, not because it's blocked. Widen this
+    // enumeration when that cache lands.
     vec![CudaGraphsConfig {
         enable: false,
         capture_classes: Vec::new(),

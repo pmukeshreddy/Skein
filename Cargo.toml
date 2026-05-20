@@ -36,9 +36,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 prometheus  = "0.13"
 futures-util = "0.3"
 opentelemetry = "0.22"
+opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.15"
+tracing-opentelemetry = "0.23"
 blake3      = "1.5"
 safetensors = "0.4"
 bincode     = "1.3"
+# Real BPE/WordPiece tokenizer (HuggingFace `tokenizers`). default-features off
+# drops progressbar/http/esaxx; `onig` is the regex backend (bundles its
+# oniguruma C source, built via `cc` — needs a C compiler, present on the
+# Linux/macOS build hosts). Used by the serving runtime to encode prompts and
+# decode generated tokens.
+tokenizers  = { version = "0.20", default-features = false, features = ["onig"] }
 
 # --- testing ---
 proptest    = "1.4"
@@ -65,6 +74,10 @@ luminal = { git = "https://github.com/luminal-ai/luminal", rev = "e558ce68498df8
 # the `cuda` feature. Requires an NVIDIA toolchain to build.
 cudarc = { version = "=0.16.6", default-features = false, features = [
     "nvrtc", "driver", "cublas", "cublaslt", "cuda-12080", "dynamic-loading", "std",
+    # `nccl` enables the multi-GPU collective bindings (`cudarc::nccl::Comm`)
+    # used by `skein_runtime::cuda::nccl::NcclCollective`. Same toolchain
+    # requirement as the rest of cudarc.
+    "nccl",
 ] }
 
 [profile.release]

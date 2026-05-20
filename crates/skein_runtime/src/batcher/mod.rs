@@ -34,6 +34,16 @@ pub struct StepBatch {
     pub uniform_decode_size: Option<u32>,
 }
 
+/// Result of accepting a freshly-generated token for a request. The forward
+/// driver uses this to stream the token and decide whether to retire.
+pub struct AcceptOutcome {
+    /// A clone of the request's token-stream sender. The driver sends the
+    /// token on this *after* releasing the batcher lock (the send is async).
+    pub sender: TokenSender,
+    /// `true` once the request has emitted its full `max_output_tokens`.
+    pub is_final: bool,
+}
+
 pub struct ContinuousBatcher {
     policy: BatchPolicy,
     estimator: LatencyEstimator,
@@ -120,6 +130,74 @@ impl ContinuousBatcher {
             decode_requests,
             total_kv_pages,
             uniform_decode_size,
+        }
+    }
+
+    /// The running token sequence for an in-flight request:
+    /// `prompt_tokens` followed by every token generated so far. The forward
+    /// driver feeds this to the executor; returns `None` if the request is
+    /// not in flight.
+    pub fn current_sequence(&self, id: RequestId) -> Option<Vec<u32>> {
+        let req = self.inflight.get(id)?;
+        let mut seq = Vec::with_capacity(req.request.prompt_tokens.len() + req.generated_tokens.len());
+        seq.extend_from_slice(&req.request.prompt_tokens);
+        seq.extend_from_slice(&req.generated_tokens);
+        Some(seq)
+    }
+
+    /// Record a token the executor produced for `id`: append it to the
+    /// request's output, advance `Prefill -> Decode` on the first token, and
+    /// report whether the request has now emitted its full output. Returns
+    /// `None` if the request is not in flight (e.g. already retired).
+    pub fn accept_token(&mut self, id: RequestId, token: u32) -> Option<AcceptOutcome> {
+        let policy_is_chunked = matches!(self.policy, BatchPolicy::ContinuousChunked { .. });
+        let req = self.inflight.get_mut(id)?;
+        req.generated_tokens.push(token);
+        req.output_tokens_emitted += 1;
+        // A prefill request transitions to decode once it emits its first
+        // token. (Chunked prefill advances chunk-by-chunk elsewhere; here we
+        // only flip when not mid-chunk.)
+        if req.phase == Phase::Prefill && (!policy_is_chunked || req.chunks.is_none()) {
+            req.phase = Phase::Decode;
+        }
+        let is_final = req.output_tokens_emitted >= req.request.max_output_tokens;
+        Some(AcceptOutcome {
+            sender: req.sender.clone(),
+            is_final,
+        })
+    }
+
+    /// Pull queued (delayed) requests whose `ready_at_ms` has passed and
+    /// re-run admission against current load. Admitted requests move into the
+    /// in-flight set; still-delayed ones are requeued; rejected ones have
+    /// their stream closed. Called once per driver step.
+    pub fn promote_ready(&mut self, now_ms: u64) {
+        let mut budget = self.queue.len();
+        while budget > 0 {
+            budget -= 1;
+            let Some(entry) = self.queue.pop_ready(now_ms) else {
+                break;
+            };
+            let decision = admission::decide(
+                &entry.request,
+                now_ms,
+                self.policy.max_batch(),
+                self.inflight.len() as u32,
+                &self.workload.slo,
+                &self.estimator,
+            );
+            match decision {
+                AdmissionDecision::Admit => {
+                    self.inflight
+                        .insert(entry.request, entry.sender, self.policy, now_ms);
+                }
+                AdmissionDecision::Delay { until_ms } => {
+                    self.queue.push(entry.request, entry.sender, until_ms);
+                }
+                AdmissionDecision::Reject { .. } => {
+                    entry.sender.close();
+                }
+            }
         }
     }
 

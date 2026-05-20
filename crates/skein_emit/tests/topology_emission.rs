@@ -54,7 +54,7 @@ fn topology_deterministic_for_mixtral() {
 }
 
 #[test]
-fn topology_adds_alltoall_under_ep() {
+fn topology_adds_ep_combine_allreduce_under_ep() {
     let ir = load_mixtral_ir();
     let cluster = build_4x_h100_cluster();
     let plan = mk_plan(ir.meta.clone(), 2, 1, 2);
@@ -70,10 +70,11 @@ fn topology_adds_alltoall_under_ep() {
         .iter()
         .filter(|c| c.kind == CollectiveKind::AllToAll)
         .count();
-    // 32 blocks × 2 AllReduces + 1 embedding AllReduce (vocab-parallel),
-    // and 32 blocks × 2 AllToAll (dispatch + combine).
-    assert_eq!(ar_count, ir.meta.num_layers * 2 + 1);
-    assert_eq!(a2a_count, ir.meta.num_layers * 2);
+    // Dense expert parallel: per block there are 3 all-reduces — TP after attn,
+    // EP combine after MoE, TP after the MoE down-proj — plus 1 vocab-parallel
+    // embedding all-reduce before block 0. No AllToAll (no token dispatch).
+    assert_eq!(ar_count, ir.meta.num_layers * 3 + 1);
+    assert_eq!(a2a_count, 0);
 }
 
 #[test]
