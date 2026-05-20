@@ -378,17 +378,6 @@ impl CudaGraphOp {
                     .get(idx)
                     .map(String::as_str)
                     .unwrap_or("unknown");
-                // A growable KV cache (`kvcache_*`) is legitimately empty at the
-                // first decode step (past length 0): the input resolves to a
-                // 0-length / null buffer, but the consuming concat reads zero
-                // elements from it under that step's dynamic `past` dim, so the
-                // null pointer is never dereferenced. Allow it; every other
-                // input still errors loudly on a genuinely missing buffer.
-                // (`input_label` is the input op's full Debug string, e.g.
-                // `...Input { ... label: "kvcache_k_0" ... }`, so match nested.)
-                if input_label.contains("kvcache_") {
-                    continue;
-                }
                 anyhow::bail!(
                     "missing input buffer {idx} for CUDA kernel {} at LLIR node {:?}; input LLIR node {:?} ({input_label})",
                     kernel.kernel_name,
