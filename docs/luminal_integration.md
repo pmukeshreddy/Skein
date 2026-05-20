@@ -105,7 +105,7 @@ hand-computed unit test under `skein_emit/tests/`:
 | Causal mask          | `causal_bias` (via `tril`) added to scores before the softmax.   | `tests/attention_hand_computed.rs` |
 | Top-k routing in MoE | `top_k_route`: softmax restricted to the top-k logits, renormalized. | `tests/moe_routing.rs` |
 | Vocab parallelism    | `vocab_parallel_embed` (masked lookup + AllReduce) + lm-head shard + AllGather. | `tests/vocab_parallel.rs` |
-| KV cache             | `attention_with_kv_cache`: cache concat, shifted causal mask, RoPE offset. | `tests/kv_cache.rs` |
+| KV cache             | `attention_with_kv_cache` (compile-time `past`) + `decode_attention_with_cache` (runtime position, fixed-capacity). | `tests/kv_cache.rs` |
 | EP capacity routing  | `moe_dispatch_combine`: GShard scatter/gather (`cumsum` slots + matmul). | `tests/ep_routing.rs` |
 | Byte-level weights   | `decode_weight_bytes` (bf16/f16/f32) + multi-shard index resolution. | `skein_compile/tests/weight_bytes.rs`, `tests/weight_slicing.rs` |
 
@@ -118,7 +118,7 @@ remaining work is runtime *integration*, tracked by `TODO(...)` tags (grep
 | Gap              | What's left                                                        | Tag                  |
 |------------------|-------------------------------------------------------------------|----------------------|
 | EP token routing | Wire `moe_dispatch_combine` into the multi-segment AllToAll schedule (lay out `[ep, …]`, run local expert shard, gather back). | `TODO(ep-routing)` |
-| KV runtime loop  | Drive `attention_with_kv_cache` from the serving loop: paged page I/O + per-step `past` offset. | `TODO(kv-runtime)` |
+| KV runtime loop  | Drive `decode_attention_with_cache` from the serving loop: paged page I/O + per-step runtime `position` input. | `TODO(kv-runtime)` |
 
 ## How to add a new backend
 

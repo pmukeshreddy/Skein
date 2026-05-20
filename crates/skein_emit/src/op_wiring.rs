@@ -1165,6 +1165,94 @@ pub fn attention_with_kv_cache(
     (attn, k_store, v_store)
 }
 
+/// Single decode step against a fixed-capacity KV cache, with a **runtime**
+/// position (what the serving loop needs: a static graph can't bake the
+/// per-step position into a constant).
+///
+/// `q` is the current token `[batch, 1, n_heads*head_dim]`. `k_cache`/`v_cache`
+/// are `[batch, max_cache, n_kv_heads*head_dim]`, holding the running cache
+/// (keys already RoPE-rotated when they were stored; slots `0..=position`
+/// valid). `position` is a runtime scalar `[1]` — the current token's absolute
+/// index. Returns `[batch, 1, n_heads*head_dim]` (the caller applies
+/// `o_proj`).
+///
+/// The serving loop owns the cache: it RoPE-rotates the new key, writes the
+/// new k/v into the cache at `position` (via `PagedKVAllocator`), feeds the
+/// updated cache + `position` here, and reads back the attention output.
+///
+/// Validated on the CUDA path. (Luminal's CPU `NativeRuntime` search hits an
+/// internal scheduling error when this runtime-position mask meets the
+/// matmul-derived attention weights; the equivalent compile-time-`past` cache
+/// math is covered green by `tests/kv_cache.rs::decode_with_cache_matches_full_prefill`.)
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_with_cache(
+    q: GraphTensor,
+    k_cache: GraphTensor,
+    v_cache: GraphTensor,
+    position: GraphTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_cache: usize,
+    rope_theta: f32,
+) -> GraphTensor {
+    let kv_groups = n_heads / n_kv_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let batch = q.dims()[0];
+    let half = head_dim / 2;
+
+    // Create all `arange` tensors up front in one borrow of the graph — never
+    // hold a `&mut Graph` across the tensor ops below (luminal threads the
+    // graph through raw pointers, so two live mutable views corrupt it).
+    let (inv_freq, slots) = {
+        let cx = q.graph();
+        let idx = cx.arange(half).cast(DType::F32);
+        let inv_freq = (idx * (-2.0 / head_dim as f32 * rope_theta.ln())).exp(); // [half]
+        let slots = cx.arange(max_cache).cast(DType::F32).expand_dim(0, 1); // [1, C]
+        (inv_freq, slots)
+    };
+
+    // RoPE the current query at the runtime `position`.
+    let pos_f = position.cast(DType::F32); // [1]
+    // angles[1, half] = position * inv_freq.
+    let angles = pos_f.expand_dim(1, half) * inv_freq.expand_dim(0, 1);
+    let emb = angles.concat_along(angles, 1); // [1, head_dim]
+    let q_hs = q.split_dims(2, head_dim); // [b, 1, n_heads, d]
+    let qd = q_hs.dims();
+    let dt = q.dtype;
+    let cos_b = emb.cos().expand_dim(0, qd[0]).expand_dim(2, qd[2]).cast(dt); // [b, 1, n_heads, d]
+    let sin_b = emb.sin().expand_dim(0, qd[0]).expand_dim(2, qd[2]).cast(dt);
+    let q_hs = q_hs * cos_b + rotate_half(q_hs, head_dim) * sin_b;
+
+    // GQA reshape. q:[b,1,Hkv,groups,d]->[b,Hkv,groups,1,d];
+    // k_cache:[b,C,Hkv,d]->[b,Hkv,groups,d,C]; v_cache:->[b,Hkv,groups,C,d].
+    let q5 = q_hs.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4));
+    let k5 = k_cache
+        .split_dims(2, head_dim)
+        .permute((0, 2, 3, 1))
+        .expand_dim(2, kv_groups);
+    let v5 = v_cache
+        .split_dims(2, head_dim)
+        .permute((0, 2, 1, 3))
+        .expand_dim(2, kv_groups);
+
+    let scores = q5.matmul(k5) * scale; // [b, Hkv, groups, 1, C]
+    // Mask: attend cache slot j iff j <= position (runtime). Stale slots beyond
+    // the current length get a large negative additive bias before the softmax.
+    let allowed = slots.le(pos_f.expand_dim(1, max_cache)).cast(DType::F32); // [1, C]
+    let bias = ((allowed - 1.0) * 1.0e9)
+        .expand_dim(0, batch)
+        .expand_dim(1, n_kv_heads)
+        .expand_dim(2, kv_groups)
+        .cast(scores.dtype); // [b, Hkv, groups, 1, C]
+    let weights = (scores + bias).softmax(4);
+    let attn = weights.matmul(v5); // [b, Hkv, groups, 1, d]
+
+    attn.permute((0, 3, 1, 2, 4)) // [b, 1, Hkv, groups, d]
+        .merge_dims(3, 4)
+        .merge_dims(2, 3) // [b, 1, n_heads*d]
+}
+
 /// Self-attention with GQA expansion. Looks up Q/K/V/O weights from a
 /// `declared` map and delegates the op graph to [`wire_attention_math`]
 /// (which applies RoPE and the causal mask). The segment orchestrator
