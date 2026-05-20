@@ -7,9 +7,8 @@ license      = { workspace = true }
 
 [features]
 default = []
-# Phase B paths (real Luminal kernel sampling + Python HF reference drift
-# sampling) are gated behind this feature so Mac builds never instantiate
-# them.
+# CUDA calibration paths run the same real samplers against CUDA-backed
+# Skein artifacts on target hardware.
 cuda = []
 
 [lib]

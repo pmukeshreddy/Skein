@@ -30,9 +30,10 @@ pub fn tokenize_prompt_bytes(prompt: &str, vocab: u32) -> Vec<u32> {
     tokens
 }
 
-/// Compare the Skein artifact against the HF reference for every prompt in
-/// `sample_prompts`. Returns a `ParityReport` whose `passed` field is the
-/// conjunction of:
+/// Compare a Skein artifact against an external reference for every prompt
+/// in `sample_prompts`. This is the verify-only path for architecture
+/// integration checks; the production parity gate uses `verify_skein_pair`.
+/// Returns a `ParityReport` whose `passed` field is the conjunction of:
 ///
 /// - Every per-prompt, per-layer MSE is within the layer's dtype-derived
 ///   tolerance.

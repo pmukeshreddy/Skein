@@ -36,7 +36,6 @@ pub fn mixtral_extract_args(prefix: &str) -> (ExtractArgs, PathBuf) {
         drift: repo_root().join("models/mixtral_8x7b_drift.toml"),
         cost: repo_root().join("cluster/cost_constants.toml"),
         out: dir.join("plan.json"),
-        disaggregated: false,
     };
     (args, dir)
 }

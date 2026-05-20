@@ -1,11 +1,10 @@
 //! Observability: step + request metric ring buffers, Prometheus exporter,
-//! tracing spans. Full OpenTelemetry exporter wiring lands in Phase B; the
-//! Phase A skeleton uses `tracing::info_span!` so request/step events
-//! show up under any tracing-subscriber installed by the front door.
+//! and structured tracing spans. Consumers decide where spans are exported
+//! by installing a `tracing-subscriber`.
 
 pub mod metrics;
-pub mod otel;
 pub mod prometheus;
+pub mod tracing_spans;
 
 use std::collections::VecDeque;
 use std::sync::Arc;

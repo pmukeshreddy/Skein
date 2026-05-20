@@ -4,7 +4,10 @@ mod common;
 use common::*;
 
 use skein_extract::constraints;
-use skein_extract::enumerate::enumerate_global_configs;
+use skein_extract::enumerate::{
+    enumerate_cuda_graphs_configs, enumerate_global_configs, enumerate_spec_decode_configs,
+};
+use skein_extract::extract_plan;
 
 #[test]
 fn enumeration_size_bounded() {
@@ -42,4 +45,33 @@ fn enumeration_size_bounded() {
         let reason = constraints::reject(g, &cluster, &ir, &cost_model);
         assert_eq!(passes, reason.is_none());
     }
+}
+
+#[test]
+fn spec_decode_and_cuda_graphs_are_not_enumerated_until_runtime_wires_them() {
+    let spec = enumerate_spec_decode_configs();
+    assert_eq!(spec.len(), 1);
+    assert!(!spec[0].enable);
+    assert!(spec[0].draft.is_none());
+
+    let cuda_graphs = enumerate_cuda_graphs_configs();
+    assert_eq!(cuda_graphs.len(), 1);
+    assert!(!cuda_graphs[0].enable);
+    assert!(cuda_graphs[0].capture_classes.is_empty());
+}
+
+#[test]
+fn extracted_plan_never_enables_unwired_runtime_features() {
+    let ir = load_mixtral_ir();
+    let cluster = load_2x_h100_cluster();
+    let cost_model = load_cost_model();
+    let drift_table = load_drift_table();
+    let workload = load_workload();
+
+    let plan = extract_plan(&ir, &cluster, &workload, &drift_table, &cost_model)
+        .expect("representative search produces a plan");
+    assert!(!plan.execution.spec_decode.enable);
+    assert!(plan.execution.spec_decode.draft.is_none());
+    assert!(!plan.execution.cuda_graphs.enable);
+    assert!(plan.execution.cuda_graphs.capture_classes.is_empty());
 }

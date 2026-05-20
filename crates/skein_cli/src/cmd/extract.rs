@@ -1,8 +1,8 @@
-//! `skein extract` — Phase A search-only entry point.
+//! `skein extract` — search-only entry point.
 //!
-//! Loads IR / cluster / workload / drift / cost-model, rejects
-//! `--disaggregated` (Phase B), runs `skein_extract::extract_plan`,
-//! serializes the chosen `Plan` to JSON, and emits an `ExtractReport`.
+//! Loads IR / cluster / workload / drift / cost-model, runs
+//! `skein_extract::extract_plan`, serializes the chosen `Plan` to JSON,
+//! and emits an `ExtractReport`.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -17,14 +17,6 @@ use crate::load::{load_cluster, load_cost_model, load_drift_table, load_ir, load
 use crate::output::{ExtractReport, ReportParallelism, print_report};
 
 pub fn run(args: ExtractArgs, output: OutputFormat) -> Result<(), CliError> {
-    if args.disaggregated {
-        return Err(CliError::PhaseBOnly {
-            what: "P/D disaggregated mode",
-            tracking: "Phase B Step 13 (skein compile --disaggregated). \
-                       Phase A extract supports only non-disaggregated plans.",
-        });
-    }
-
     tracing::info!("skein extract: loading inputs");
     let ir = load_ir(&args.model)?;
     let cluster_spec = load_cluster(&args.cluster)?;

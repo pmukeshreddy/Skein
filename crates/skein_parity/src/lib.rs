@@ -1,8 +1,8 @@
 //! `skein_parity` — the post-compile parity gate.
 //!
-//! Compares the Skein artifact's per-layer activations + final logits
-//! against the HF bf16 reference and decides pass/fail per the workload
-//! SLO. On failure, records the offending `(layer, component, dtype,
+//! Compares a candidate Skein artifact's per-layer activations + final
+//! logits against a Skein-bf16 reference artifact and decides pass/fail per
+//! the workload SLO. On failure, records the offending `(layer, component, dtype,
 //! measured_mse)` to the model's drift table and signals the caller (the
 //! compile orchestrator) to re-invoke `skein_extract::extract_plan` — the
 //! Plan that just lost parity is now predicted as drift-violating and
@@ -20,9 +20,10 @@
 //!   `PhaseAStub` wraps it and injects deterministic per-layer drift to
 //!   exercise the verification flow end-to-end on Mac.
 //!
-//! Phase B replaces the stubs with the real `PythonSubprocessReference`
-//! (spawns `verify_reference.py` with `transformers`) and the real
-//! `SkeinForward` against a reloadable `SkeinArtifact`. The Mac path uses
+//! The external `PythonSubprocessReference` path remains available for
+//! verify-only architecture checks against `transformers`; the production
+//! parity gate uses real `SkeinForward` implementations against reloadable
+//! `SkeinArtifact`s. The Mac path uses
 //! `NativeComputeRuntime` and in-process collectives; CUDA-specific pieces
 //! remain feature-gated.
 

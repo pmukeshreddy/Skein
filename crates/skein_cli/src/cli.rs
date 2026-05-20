@@ -73,10 +73,6 @@ pub struct ExtractArgs {
     /// Where to write the chosen `Plan` as JSON.
     #[arg(long, default_value = "plan.json")]
     pub out: PathBuf,
-
-    /// Enumerate P/D-disaggregated plans. Phase B only; Phase A rejects.
-    #[arg(long)]
-    pub disaggregated: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -107,8 +103,6 @@ pub struct CompileArgs {
     pub parity_prompts_path: Option<PathBuf>,
     #[arg(long, default_value_t = 8)]
     pub n_parity_prompts: usize,
-    #[arg(long)]
-    pub disaggregated: bool,
 }
 
 #[derive(Args, Debug, Clone)]

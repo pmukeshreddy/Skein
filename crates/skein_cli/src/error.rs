@@ -31,8 +31,7 @@ pub enum CliError {
         tracking: &'static str,
     },
 
-    /// User-visible argument-level failure. The CLI uses this to reject
-    /// flags like `--disaggregated` on Phase A.
+    /// User-visible argument-level failure.
     #[error("{0}")]
     BadArgument(String),
 

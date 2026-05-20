@@ -4,13 +4,16 @@ use std::path::Path;
 
 use skein_calibrate::corpus::{DriftPromptSource, SamplingStrategy};
 use skein_calibrate::{default_public_prompt_source, sample_drift_prompts};
-use skein_compile::{ComputeRuntime, NativeComputeRuntime, SkeinArtifact};
+use skein_compile::{ComputeRuntime, SkeinArtifact};
 use skein_ir::workload::{Slo, Workload};
 use skein_parity::{RealSkeinForward, ToleranceTable, tokenize_prompt_bytes, verify_skein_pair};
 
 use crate::cli::{OutputFormat, VerifyArgs};
 use crate::error::CliError;
 use crate::load::load_cost_model;
+
+#[cfg(not(feature = "cuda"))]
+use skein_compile::NativeComputeRuntime;
 
 pub fn run(args: VerifyArgs, output: OutputFormat) -> Result<(), CliError> {
     #[cfg(feature = "cuda")]

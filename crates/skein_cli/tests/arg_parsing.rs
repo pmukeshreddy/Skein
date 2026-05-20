@@ -32,7 +32,6 @@ fn extract_parses_required_args() {
             assert_eq!(args.cost.to_str().unwrap(), "/e.toml");
             // Default `out`.
             assert_eq!(args.out.to_str().unwrap(), "plan.json");
-            assert!(!args.disaggregated);
         }
         other => panic!("unexpected subcommand: {other:?}"),
     }

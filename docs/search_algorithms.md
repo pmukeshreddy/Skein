@@ -135,5 +135,5 @@ table; the search picks the right point on it without tuning weights.
   bandwidth, launch overhead. Adjust on Phase B from real H100 measurements.
 - `models/<model>_drift.toml` — per-(layer, component, dtype) drift. The
   Phase A file is a placeholder calibrated to relative ordering only; the
-  absolute numbers should be measured against the HF bf16 reference and
+  absolute numbers should be measured against the Skein-bf16 reference and
   written back by `skein_calibrate` in Phase B.

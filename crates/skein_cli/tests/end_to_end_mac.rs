@@ -35,7 +35,6 @@ fn skein_compile_verify_tiny_mac() {
             enforce_parity: false,
             parity_prompts_path: Some(inputs.prompts.clone()),
             n_parity_prompts: 2,
-            disaggregated: false,
         },
         OutputFormat::Text,
     )

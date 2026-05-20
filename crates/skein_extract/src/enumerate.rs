@@ -10,8 +10,7 @@ use skein_ir::cluster::ClusterSpec;
 use skein_ir::ir::Graph;
 use skein_ir::plan::ParallelismPlacement;
 use skein_ir::types::{
-    BatchPolicy, CaptureClass, CudaGraphsConfig, DraftSpec, KVLayout, PrefixCacheConfig,
-    RadixReusePolicy, SpecDecodeConfig,
+    BatchPolicy, CudaGraphsConfig, KVLayout, PrefixCacheConfig, RadixReusePolicy, SpecDecodeConfig,
 };
 
 use crate::candidate::GlobalConfig;
@@ -112,27 +111,23 @@ pub fn enumerate_batch_policies() -> Vec<BatchPolicy> {
 }
 
 pub fn enumerate_cuda_graphs_configs() -> Vec<CudaGraphsConfig> {
-    vec![
-        CudaGraphsConfig {
-            enable: false,
-            capture_classes: vec![],
-        },
-        CudaGraphsConfig {
-            enable: true,
-            capture_classes: default_capture_classes(),
-        },
-    ]
+    // Plan search must only consider cuda_graphs=false until skein_runtime's
+    // CudaGraphDispatcher implements real capture/replay. Blocking prerequisite:
+    // CudaComputeRuntime must expose its primary CUDA stream so the dispatcher
+    // can begin/end stream capture; pinned Luminal keeps the stream private.
+    // Widen this enumeration when the prerequisite is met.
+    vec![CudaGraphsConfig {
+        enable: false,
+        capture_classes: Vec::new(),
+    }]
 }
 
 pub fn enumerate_spec_decode_configs() -> Vec<SpecDecodeConfig> {
-    // Phase A only emits `disabled`. The cost model does not price spec
-    // decode yet; including both arms in the outer would only produce
-    // tied-rank duplicates. Phase B re-introduces the axis once
-    // `skein_calibrate` measures the draft model's acceptance rate.
-    let _ = DraftSpec {
-        model_path: String::new(),
-        speculation_depth: 0,
-    }; // touched only so the import survives.
+    // Plan search must only consider spec_decode=false until skein_runtime's
+    // SpeculativeDecoder lands. The blocking architectural prerequisite is
+    // GPU-side KV cache ownership: PagedKVAllocator currently tracks page
+    // metadata only, while spec-decode rollback requires owning the KV tensor
+    // contents. Widen this enumeration when the prerequisite is met.
     vec![SpecDecodeConfig {
         enable: false,
         draft: None,
@@ -148,18 +143,4 @@ pub fn enumerate_prefix_cache_configs() -> Vec<PrefixCacheConfig> {
         enable: true,
         reuse_policy: RadixReusePolicy::LruByLastAccess,
     }]
-}
-
-/// Capture classes for the "CUDA Graphs on" arm. Powers of two from 1..=64
-/// for `batch_size` paired with a single representative `kv_class`. The
-/// runtime fills out the kv_class axis at calibration time; here we just
-/// need ≥ 4 classes to hit the 0.95 coverage row of the cost model's
-/// CUDA-Graphs table.
-fn default_capture_classes() -> Vec<CaptureClass> {
-    (0..=6)
-        .map(|i| CaptureClass {
-            batch_size: 1u32 << i,
-            kv_class: 1,
-        })
-        .collect()
 }

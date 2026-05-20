@@ -141,7 +141,10 @@ mod cuda_impl {
     impl ComputeRuntime for CudaComputeRuntime {
         fn build_and_search(cx: &mut Graph, budget: usize) -> Result<Self, CompileError> {
             cx.build_search_space::<CudaRuntime>();
-            let inner = cx.search(CudaRuntime::default(), budget);
+            let runtime = CudaRuntime::new().map_err(|source| CompileError::CudaRuntimeInit {
+                source: Box::new(source),
+            })?;
+            let inner = cx.search(runtime, budget);
             Ok(Self { inner })
         }
 

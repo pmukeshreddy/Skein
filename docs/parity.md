@@ -1,10 +1,27 @@
-# Parity — `skein_parity`
+# Parity verification
 
-The parity gate sits *after* compile and *before* serve. It compares the
-Skein artifact's per-layer activations + final logits against the HF
-reference dtype selected for verification, decides pass/fail, and on
-failure records the offending measurement to the drift table so the next
-`skein_extract` run picks a different Plan.
+Parity in Skein measures **Skein-at-bf16** against
+**Skein-at-candidate-dtype**, layer-by-layer activation MSE plus final-logit
+KL divergence. Both sides of the comparison go through Skein's own compile
+path; bf16 is the reference, the search-picked dtype map is the candidate.
+
+This matches the industry standard for post-training quantization validation.
+AWQ measures AWQ-FP4 vs AWQ-FP16; GPTQ measures GPTQ-INT4 vs GPTQ-FP16;
+NVIDIA Model Optimizer follows the same pattern. The reference engine and the
+candidate engine are the same engine at different precisions.
+
+## Why Skein-vs-Skein, not Skein-vs-HF
+
+Comparing Skein's quantized output to an HF reference conflates two sources
+of difference: (a) the dtype change that Skein's search introduced, and
+(b) any differences between Skein's compile path and HF's eager execution.
+Only (a) is what the cost model needs to predict. Skein-vs-Skein isolates
+(a) cleanly.
+
+The HF reference path remains available for a separate use case:
+`skein verify --reference <hf-model>` validates that Skein's bf16 compile
+output matches a known-good external implementation. This is run once per
+model architecture during integration, not per-compile.
 
 ## Two-tier accuracy protection
 
@@ -13,9 +30,9 @@ failure records the offending measurement to the drift table so the next
    `models/<model>_drift.toml`. The DP rejects any per-block dtype
    assignment whose cumulative drift exceeds `workload.slo.max_accuracy_drift`.
 2. **Measured drift in the parity gate** (`skein_parity`). Predictions are
-   not measurements. After compile, the gate runs the real artifact against
-   the HF reference on sample prompts and checks whether the *measured*
-   drift agrees with the prediction.
+   not measurements. After compile, the gate runs Skein-bf16 and the
+   candidate Skein artifact on sample prompts and checks whether the
+   *measured* drift agrees with the prediction.
 
 A Plan that passes the DP but fails the parity gate signals that the drift
 table's prediction was too optimistic for the failing
@@ -26,22 +43,21 @@ re-search. Over time the drift table converges to a calibrated state.
 
 Drift behaviour is input-distribution-dependent. A model that quantizes
 cleanly on short chat prompts may drift outside SLO on long-context RAG
-prompts. The parity gate samples from `workload.requests` (the same trace
-the cost model and search used) so the verification matches the production
-distribution.
+prompts. The parity gate samples from public calibration prompts or a
+user-supplied prompt corpus so verification matches the target distribution.
 
-## Reference dtype is independent of deployment dtype
+## External reference dtype is independent of deployment dtype
 
-The HuggingFace reference subprocess takes a string dtype (`"bfloat16"`,
-`"float16"`, or `"float32"`). This is intentionally not
+The Python external reference subprocess is verify-only and takes a string
+dtype (`"bfloat16"`, `"float16"`, or `"float32"`). This is intentionally not
 `skein_ir::types::Dtype`: Skein's deployment dtype enum models production
 weight / activation / KV choices (`bf16`, `fp16`, `fp8`, `int8`, `int4`)
 that feed cost, drift, and calibration tables.
 
-The reference dtype answers a different question: what precision should the
-ground-truth model use while parity compares final logits and hook
-activations? Mac development can use `float32` for CPU-friendly GPT-2 checks;
-H100 verification usually uses `bfloat16` for Mixtral.
+The external reference dtype answers a different question: what precision
+should the known-good external model use while validating Skein-bf16? Mac
+development can use `float32` for CPU-friendly GPT-2 checks; H100 integration
+usually uses `bfloat16` for Mixtral.
 
 ## Python subprocess protocol
 
@@ -67,9 +83,10 @@ environment is usable. Subprocess stderr is always captured and surfaced in
 
 ## Activation hook convention
 
-The HF reference registers hooks on decoder blocks and captures the block
-output hidden state: post-block residual, before the next block's norm. The
-Skein side captures the matching Luminal node named
+The external reference for `skein verify --reference` registers hooks on
+decoder blocks and captures the block output hidden state: post-block
+residual, before the next block's norm. The Skein side captures the matching
+Luminal node named
 `hidden_after_block_N`. This is equivalent to the `block_N_ffn_out` handoff
 after the final residual for segmented plans, and keeps parity comparisons
 on the same semantic boundary.
@@ -83,11 +100,12 @@ device safetensors shard, and executes through
 executor inside its forward worker, so parity and live serving walk the same
 `SequenceStep` schedule.
 
-Mac workflow: install the reference requirements into a venv, use
-`PythonSubprocessReference::new("gpt2", "float32")` for the HF side, and use
-the tiny-artifact fixture for native Skein execution. H100 workflow: use the
-Mixtral checkpoint path and `bfloat16`, then swap the native runtime and
-mock collective for CUDA/NCCL composition under the CUDA feature.
+Mac workflow: use the tiny-artifact fixture for native Skein execution and
+Skein-bf16 parity. For the separate external verification workflow, install
+the reference requirements into a venv and use
+`PythonSubprocessReference::new("gpt2", "float32")`. H100 workflow: compile
+Mixtral through Skein at bf16 and the candidate dtype map, then compare those
+artifacts under the CUDA feature.
 
 ## Drift-table update protocol — monotonic up
 
@@ -117,7 +135,7 @@ on-disk file is byte-stable across runs.
 compile artifact A
   ├── extract_plan picks Plan_A using drift_table
   ├── lower_per_device produces artifacts/<plan_hash_A>/
-  └── verify_plan compares against HF reference
+  └── verify_plan compares against Skein-bf16 reference
        │
        ├── passed: true → write parity_report.json, serve
        │

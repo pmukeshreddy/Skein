@@ -55,4 +55,8 @@ impl CudaGraphDispatcher {
             captured: std::collections::HashMap::new(),
         }
     }
+
+    pub fn captured_len(&self) -> usize {
+        self.captured.len()
+    }
 }

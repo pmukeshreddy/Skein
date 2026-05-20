@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use skein_calibrate::corpus::{DriftPromptSource, SamplingStrategy};
 use skein_calibrate::{default_public_prompt_source, sample_drift_prompts};
-use skein_compile::{ArtifactMetadata, ComputeRuntime, NativeComputeRuntime, SkeinArtifact};
+use skein_compile::{ArtifactMetadata, ComputeRuntime, SkeinArtifact};
 use skein_cost::Cluster;
 use skein_extract::extract_plan;
 use skein_ir::plan::{DtypeMap, Plan};
@@ -16,6 +16,9 @@ use skein_parity::{RealSkeinForward, ToleranceTable, tokenize_prompt_bytes, veri
 use crate::cli::{CompileArgs, OutputFormat};
 use crate::error::CliError;
 use crate::load::{load_cluster, load_cost_model, load_drift_table, load_ir, load_workload};
+
+#[cfg(not(feature = "cuda"))]
+use skein_compile::NativeComputeRuntime;
 
 pub fn run(args: CompileArgs, output: OutputFormat) -> Result<(), CliError> {
     #[cfg(feature = "cuda")]
@@ -32,12 +35,6 @@ pub fn run_compile_inner<R: ComputeRuntime + 'static>(
     args: CompileArgs,
     _output: OutputFormat,
 ) -> Result<(), CliError> {
-    if args.disaggregated {
-        return Err(CliError::BadArgument(
-            "skein compile --disaggregated is not wired in this pipeline yet".into(),
-        ));
-    }
-
     tracing::info!("skein compile: loading inputs");
     let ir = load_ir(&args.model)?;
     let cluster_spec = load_cluster(&args.cluster)?;

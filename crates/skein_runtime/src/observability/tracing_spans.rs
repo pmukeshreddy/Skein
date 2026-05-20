@@ -1,7 +1,11 @@
-//! Trace emission. Phase A uses `tracing::info_span!` so requests / steps
-//! show up under any installed `tracing-subscriber`. The full OpenTelemetry
-//! exporter (OTLP, batched, with resource attributes) lands in Phase B once
-//! the deployment story for the collector is locked in.
+//! Structured tracing spans for request and step lifecycle.
+//!
+//! Emits `tracing::Span` via the `tracing` crate. A `tracing-subscriber`
+//! installed by the consumer determines what happens to the spans (stdout,
+//! file, OTLP, etc.). This module does not install or own a subscriber.
+//!
+//! OTLP / OpenTelemetry exporter integration is not in this module; it
+//! belongs in deployment-level wiring and is tracked separately.
 
 use crate::types::RequestId;
 

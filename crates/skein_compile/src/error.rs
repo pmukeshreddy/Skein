@@ -68,6 +68,12 @@ pub enum CompileError {
     #[error("collective execution failed: {0}")]
     Collective(String),
 
+    #[error("luminal CudaRuntime initialization failed")]
+    CudaRuntimeInit {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("artifact weight tensor {tensor:?} is missing from {path}")]
     MissingWeight {
         path: std::path::PathBuf,

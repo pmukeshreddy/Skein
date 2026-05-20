@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 use skein_calibrate::corpus::CalibrationCorpus;
 use skein_calibrate::hardware::{HardwareSpec, ModelSpec};
 use skein_calibrate::{calibrate, default_public_prompt_source};
-use skein_compile::NativeComputeRuntime;
 use skein_cost::CostConstants;
 use skein_extract::DriftTable;
 
 use crate::cli::{CalibrateArgs, OutputFormat};
 use crate::error::CliError;
+
+#[cfg(not(feature = "cuda"))]
+use skein_compile::NativeComputeRuntime;
 
 pub fn run(args: CalibrateArgs, _output: OutputFormat) -> Result<(), CliError> {
     #[cfg(not(feature = "cuda"))]

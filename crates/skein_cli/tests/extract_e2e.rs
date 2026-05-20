@@ -1,10 +1,8 @@
-//! Tests 1 + 2 + 6 — end-to-end extract, determinism, --disaggregated
-//! gating.
+//! Extract CLI end-to-end and determinism tests.
 
 mod common;
 use common::*;
 
-use skein_cli::CliError;
 use skein_cli::cli::OutputFormat;
 use skein_cli::cmd;
 
@@ -49,22 +47,4 @@ fn extract_deterministic() {
         a_bytes, b_bytes,
         "plan.json should be byte-identical across runs"
     );
-}
-
-// Test 6 — `--disaggregated` on Phase A returns `PhaseBOnly`. Phase B will
-// route this through the real disaggregated search.
-#[test]
-fn disaggregated_phase_a_rejected() {
-    let (mut args, _dir) = mixtral_extract_args("skein_cli_disagg");
-    args.disaggregated = true;
-    let err = cmd::extract::run(args, OutputFormat::Text).unwrap_err();
-    match err {
-        CliError::PhaseBOnly { what, .. } => {
-            assert!(
-                what.contains("disaggregated"),
-                "error should name the rejected option, got `{what}`"
-            );
-        }
-        other => panic!("expected PhaseBOnly, got {other:?}"),
-    }
 }

@@ -21,7 +21,7 @@ use crate::error::WorkloadError;
 pub struct Slo {
     pub ttft_p95_ms: u32,
     pub tpot_p95_ms: u32,
-    /// KL divergence ceiling vs the bf16 HF reference, on a per-request
+    /// KL divergence ceiling vs the Skein-bf16 reference, on a per-request
     /// basis. The drift-compliance metric measures the fraction of requests
     /// that meet this.
     pub max_accuracy_drift: f64,
