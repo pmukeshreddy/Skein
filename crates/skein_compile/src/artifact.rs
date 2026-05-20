@@ -41,7 +41,7 @@ pub struct SegmentMetadata {
 
 /// High-level recipe for rebuilding graph segments.
 ///
-/// Prompt 2a intentionally avoids serializing raw Luminal ops. The current
+/// The artifact format intentionally avoids serializing raw Luminal ops. The
 /// lowering implementation is deterministic from `(Plan, IR, ClusterSpec,
 /// device_idx)`, so the recipe stores that source description and rebuilds
 /// through `skein_emit::build_device_graph`.

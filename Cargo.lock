@@ -2256,7 +2256,6 @@ dependencies = [
 name = "skein_parity"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "safetensors 0.4.5",
  "serde",
  "serde_json",

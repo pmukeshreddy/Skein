@@ -1,6 +1,7 @@
 //! `skein_cost` — analytic cost model for `Plan` scoring.
 //!
-//! The cost model runs on Mac. It has zero CUDA-feature-gated code.
+//! The cost model is pure analysis: it has zero CUDA-feature-gated code and
+//! runs on any host.
 //!
 //! Five additive terms (all in microseconds, per device):
 //!

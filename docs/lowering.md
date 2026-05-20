@@ -4,8 +4,8 @@
 cluster:
 
 1. A `luminal::Graph` whose tensor declarations already carry the sharded
-   shapes — Luminal's Phase B compile pass operates on these shapes and is
-   not aware of TP/EP.
+   shapes — Luminal's compile pass operates on these shapes and is not aware
+   of TP/EP.
 2. A `WeightShard` listing the source byte ranges this device owns. The
    bytes are *not* moved by `lower_per_device`; that's
    `weights::write_weight_shard`'s job.
@@ -42,13 +42,13 @@ Resolution priority (early exits short-circuit):
    to pick column- or row-parallel.
 4. Otherwise → `Replicated`.
 
-### EP + TP simplification (Phase A)
+### EP + TP simplification
 
 When `ep > 1`, expert weights go to `ExpertOwned` / `ExpertElsewhere` and do
-**not** further sub-shard via TP. Stacking TP-within-expert on top of EP is a
-Phase B extension that requires runtime support for nested
-all-reduce + all-to-all. With `ep == 1`, expert weights fall through to TP
-rules normally (w1/w3 column-parallel, w2 row-parallel).
+**not** further sub-shard via TP. Stacking TP-within-expert on top of EP
+would require runtime support for nested all-reduce + all-to-all (not yet
+wired). With `ep == 1`, expert weights fall through to TP rules normally
+(w1/w3 column-parallel, w2 row-parallel).
 
 ## Column vs row parallel for Mixtral
 
@@ -63,11 +63,11 @@ rules normally (w1/w3 column-parallel, w2 row-parallel).
 | `block_sparse_moe.experts.<N>.w1`/`w3.weight`          | column-parallel  |
 | `block_sparse_moe.experts.<N>.w2.weight`               | row-parallel     |
 | `block_sparse_moe.gate.weight`                         | replicated (tiny router) |
-| `model.embed_tokens.weight`, `lm_head.weight`          | replicated (Phase A) |
+| `model.embed_tokens.weight`, `lm_head.weight`          | replicated       |
 | `*_layernorm.weight`, `model.norm.weight`              | replicated       |
 
-Vocab-parallel embedding + LM head is a Phase B extension once the runtime
-can shard the vocab axis and reconstitute the logits on output.
+TODO(vocab-parallel): shard the embedding + LM head across the vocab axis and
+reconstitute the logits on output.
 
 ## Weight slicing — byte-range arithmetic
 
@@ -107,23 +107,31 @@ and asserts byte equality.
   `WeightShard`'s lookup); serialization order is `Vec`-driven, never
   hash-driven.
 
-Determinism matters for the Phase A Step 6 artifact-hashing path:
+Determinism matters for the artifact-hashing path:
 `blake3(serde_json::to_vec(&Plan)?) → artifacts/<plan_hash>/` only works if
 the per-device graph + topology + weight shard are also reproducible.
 
-## Phase A vs Phase B split
+## Responsibility split: `skein_emit` vs `skein_compile`
 
-| Concern                          | Phase A (Mac, no GPU)                                  | Phase B (H100)                          |
-|----------------------------------|--------------------------------------------------------|-----------------------------------------|
-| `Graph::new()` + `cx.tensor(...)` | ✅ exercised, tests assert shapes                       | ✅                                       |
-| `cx.build_search_space()`        | ❌ not called                                           | ✅ via `skein_compile`                   |
-| `cx.search(runtime, budget)`     | ❌ not called                                           | ✅ via `skein_compile`                   |
-| Op wiring (matmul, residual)     | ❌ tensors declared without edges                       | ✅ planned for `skein_emit` Phase B work |
-| `write_weight_shard`             | ✅ via synthetic fixture in `weight_slicing.rs`         | ✅ against the real Mixtral checkpoint   |
-| `IoManifest` write               | ✅ JSON via serde                                       | ✅                                       |
-| `topology.json` emission         | ✅                                                      | ✅                                       |
+`skein_emit` builds the full per-device op graphs (declarations + matmul /
+residual / norm edges, segmented at collective boundaries) and the
+weight-shard / IO-manifest / topology metadata. It never runs Luminal's
+search. `skein_compile` takes those graphs and runs
+`cx.build_search_space::<R>()` + `cx.search(...)` per segment, then executes
+through the selected `ComputeRuntime`.
 
-## Segment-per-collective architecture (Phase B Prompt 1b)
+| Concern                          | `skein_emit`                          | `skein_compile`                      |
+|----------------------------------|---------------------------------------|--------------------------------------|
+| `Graph::new()` + op wiring       | ✅ full per-segment op graphs          | —                                    |
+| `cx.build_search_space()`        | —                                     | ✅                                    |
+| `cx.search(runtime, budget)`     | —                                     | ✅ (`Native` or `Cuda` runtime)       |
+| `write_weight_shard`             | ✅ single-file source checkpoint       | —                                    |
+| `IoManifest` / `topology.json`   | ✅ deterministic JSON                  | consumed at load                     |
+
+See the `TODO(...)` tags in `op_wiring.rs` for the per-op semantics (RoPE,
+causal mask, top-k MoE, EP token routing) that are not yet lowered.
+
+## Segment-per-collective architecture
 
 `LoweredGraph` holds a sequence of [`Segment`]s — one Luminal graph per
 collective-bracketed region of the device's forward pass — plus a

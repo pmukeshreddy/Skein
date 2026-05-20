@@ -1,5 +1,5 @@
 //! `CalibrationError` — one `thiserror` enum across corpus, aggregation,
-//! writers, and Phase B gating.
+//! sampling, and writers.
 
 use std::path::PathBuf;
 

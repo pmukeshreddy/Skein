@@ -6,10 +6,13 @@ rust-version = { workspace = true }
 license      = { workspace = true }
 
 [features]
+# Library default is empty; the `skein_cli` binary forwards `cuda` here and
+# carries the production GPU default. See that crate's Cargo.toml.
 default = []
-# Phase B paths (real HF subprocess + real Skein forward) are gated behind
-# this feature so Mac builds never accidentally instantiate them.
-cuda = []
+# Selects the CUDA compute + runtime backends for the forward pass driven by
+# `RealSkeinForward`. Build with `--no-default-features` for the in-process
+# CPU path used in CI and local development.
+cuda = ["skein_compile/cuda", "skein_runtime/cuda"]
 
 [lib]
 path = "src/lib.rs"
@@ -24,7 +27,6 @@ serde         = { workspace = true }
 serde_json    = { workspace = true }
 toml          = { workspace = true }
 thiserror     = { workspace = true }
-blake3        = { workspace = true }
 tracing       = { workspace = true }
 
 [dev-dependencies]

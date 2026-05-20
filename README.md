@@ -20,11 +20,11 @@ trace.jsonl    ─┘    (typed IR)   (enum+DP search)
                                             ▼
                             skein_emit (per-device luminal::Graph)
                                             │
-                                            ▼  (Phase B)
+                                            ▼
                           skein_compile (Luminal search → Runtime)
                                             │
                                             ▼
-                          skein_parity (KL drift vs HF reference)
+                          skein_parity (KL drift vs bf16 reference)
                                             │
                                             ▼
                           skein_runtime (paged KV, batcher, hot-swap)
@@ -32,21 +32,24 @@ trace.jsonl    ─┘    (typed IR)   (enum+DP search)
 
 Nine crates, all in `crates/`:
 
-| Crate | Phase | Role |
-|---|---|---|
-| `skein_ir`        | A | typed IR, `Plan`/`ClusterSpec`/`Workload` types, HF importer |
-| `skein_cost`      | A | analytic 5-term cost model (compute + comm + memory + bubble + launch) |
-| `skein_extract`   | A | enumeration over global axes + DP over per-layer dtype |
-| `skein_emit`      | A | `Plan` → per-device `luminal::Graph` + sharded weights + topology |
-| `skein_compile`   | B | ~20-line wrapper around Luminal's `cx.search(...)` |
-| `skein_parity`    | B | logit-level KL/MSE check vs HF `transformers` reference |
-| `skein_runtime`   | A/B | paged KV, continuous batcher, CUDA Graphs cache, hot-swap |
-| `skein_cli`       | A/B | `compile`, `serve`, `bench`, `calibrate`, `verify`, `extract` |
-| `skein_calibrate` | B | offline calibration of cost constants + drift table |
+| Crate | Role |
+|---|---|
+| `skein_ir`        | typed IR, `Plan`/`ClusterSpec`/`Workload` types, HF importer |
+| `skein_cost`      | analytic 5-term cost model (compute + comm + memory + bubble + launch) |
+| `skein_extract`   | enumeration over global axes + DP over per-layer dtype |
+| `skein_emit`      | `Plan` → per-device `luminal::Graph` + sharded weights + topology |
+| `skein_compile`   | wrapper around Luminal's `cx.search(...)` + artifact format |
+| `skein_parity`    | logit-level KL/MSE parity gate (Skein-bf16 vs candidate) |
+| `skein_runtime`   | paged KV, continuous batcher, CUDA Graphs cache, hot-swap, server |
+| `skein_cli`       | `compile`, `serve`, `bench`, `calibrate`, `verify`, `extract` |
+| `skein_calibrate` | offline calibration of cost constants + drift table |
 
-Phase A is everything that compiles on macOS without CUDA. Phase B is the H100
-side and only builds with `--features cuda`. See `docs/design.md` for the
-detailed split.
+The production target is NVIDIA H100. The default build enables the `cuda`
+feature, selecting the `CudaComputeRuntime` and the NCCL / CUDA Graphs / RDMA
+runtime paths. Building with `--no-default-features` selects the CPU
+`NativeComputeRuntime` and the in-process collective backend — used for CI and
+for developing the planning + runtime logic without a GPU. See `docs/` for the
+detailed design of each stage.
 
 ## Validation metrics (vs vLLM on 2× H100 SXM5, Mixtral 8x7B)
 
@@ -63,17 +66,13 @@ detailed split.
 If any metric fails the project stops and reports which architectural decision
 to revisit. We do not paper over with prose.
 
-## Phase A quick start (Mac, no GPU)
+## Plan search (no GPU required)
 
-Build:
-
-```
-cargo build --release
-```
-
-Run a plan search on the bundled Mixtral fixture:
+Plan extraction is pure analysis — it runs anywhere, including a CPU-only
+build. Build and run a search on the bundled Mixtral config:
 
 ```
+cargo build --release --no-default-features
 ./target/release/skein extract \
     --model   configs/mixtral_8x7b_config.json \
     --cluster cluster/h100_2x.toml \
@@ -83,32 +82,28 @@ Run a plan search on the bundled Mixtral fixture:
     --out     plan.json
 ```
 
-This runs the full enumeration + DP search and writes `plan.json` — no
-GPU required. Expect under 1 s on a modern Mac. Pass `--output json` to
-emit the report as a single JSON object (suitable for `jq`):
+This runs the full enumeration + DP search and writes `plan.json` — no GPU
+required, typically under 1 s. Pass `--output json` to emit the report as a
+single JSON object (suitable for `jq`):
 
 ```
 ./target/release/skein extract ... --output json | jq .
 ```
 
-The other subcommands — `compile`, `verify`, `serve`, `calibrate`,
-`bench` — require `--features cuda` on an NVIDIA host. Invoking them on
-Phase A returns a clear `RequiresCuda` error with the exact rebuild
-command.
+## Full pipeline (H100)
 
-## Phase B (H100 server)
+The default build targets CUDA:
 
 ```
-cargo build --release --features cuda
+cargo build --release
 ./target/release/skein compile  --model ... --cluster ... --weights ... --out artifacts/
-./target/release/skein verify   --artifact artifacts/LATEST --reference <hf_path>
+./target/release/skein verify   --artifact artifacts/LATEST --reference <bf16-artifact>
 ./target/release/skein serve    --artifact artifacts/LATEST --port 8080
 ./target/release/skein bench    --artifact artifacts/LATEST --baseline <vllm-endpoint> \
                                 --metrics throughput,goodput,drift_compliance
 ```
 
-Calibration (run once per `(hardware, model)` pair, reuse across
-compiles):
+Calibration (run once per `(hardware, model)` pair, reuse across compiles):
 
 ```
 ./target/release/skein calibrate \
@@ -117,21 +112,14 @@ compiles):
     --corpus   crates/skein_calibrate/corpus/mixtral_8x7b.toml
 ```
 
-## Build (alternative make targets)
-
-Mac (Phase A only):
+## Build (make targets)
 
 ```
-make build
+make build        # cuda by default; --no-default-features when nvcc is absent
 make test
 make lint
-```
 
-H100 (full pipeline):
-
-```
-make build        # auto-enables --features cuda when nvcc is on PATH
-make compile-mixtral
+make compile-mixtral   # GPU pipeline targets; abort cleanly without CUDA
 make verify-mixtral
 make bench
 ```

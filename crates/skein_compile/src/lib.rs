@@ -6,21 +6,14 @@
 //! `compile_with_luminal::<R>` invokes `cx.build_search_space::<R::Inner>()`
 //! followed by `cx.search(R::Inner::default(), budget)`.
 //!
-//! ## Phase 1a scope
+//! ## Backends
 //!
-//! - `NativeComputeRuntime` is always available; works on Mac via Luminal's
-//!   `NativeRuntime`. Used by every Phase A test that exercises a real
-//!   Luminal compile-and-execute path.
-//! - `CudaComputeRuntime` is `#[cfg(feature = "cuda")]`-gated and pulls in
-//!   `luminal_cuda_lite::CudaRuntime`. Compile-time only on Mac (no GPU
-//!   needed for the trait impl to type-check), execution requires an H100.
-//!
-//! ## Deferred to Prompt 1b
-//!
-//! Multi-segment compile. When the runtime needs collective boundaries
-//! (tp > 1, ep > 1), each per-device `LoweredGraph` becomes a sequence
-//! of segments and this function compiles each segment independently.
-//! Today it compiles a single graph end-to-end.
+//! - `CudaComputeRuntime` is the production backend: `#[cfg(feature =
+//!   "cuda")]`-gated, wrapping `luminal_cuda_lite::CudaRuntime`. It is the
+//!   default build target and runs on NVIDIA GPUs.
+//! - `NativeComputeRuntime` wraps Luminal's CPU `NativeRuntime`. It builds
+//!   unconditionally and is the backend used by CI and by every test that
+//!   exercises a real Luminal compile-and-execute path without a GPU.
 
 use luminal::op::Runtime;
 use luminal::prelude::{Graph, NativeRuntime, NodeIndex};
@@ -41,10 +34,10 @@ pub use executor::{
     TopologyStepBatch, load_native_runtime_segments, load_runtime_segments,
 };
 
-/// Backend abstraction. Two concrete impls: `NativeComputeRuntime`
-/// (Luminal's `NativeRuntime`, always available) and
-/// `CudaComputeRuntime` (Luminal's `CudaRuntime`, `#[cfg(feature = "cuda")]`).
-/// Phase B Metal / ROCm backends drop in as new impls.
+/// Backend abstraction. Two concrete impls: `CudaComputeRuntime` (Luminal's
+/// `CudaRuntime`, `#[cfg(feature = "cuda")]`, the production backend) and
+/// `NativeComputeRuntime` (Luminal's CPU `NativeRuntime`, always available).
+/// Additional backends (e.g. Metal, ROCm) drop in as new impls.
 pub trait ComputeRuntime: Sized {
     /// Run Luminal's search-based compile against `cx` with the given
     /// budget, then return the resulting runtime ready to execute.
@@ -74,9 +67,8 @@ pub trait ComputeRuntime: Sized {
 /// `Vec<Segment>`'s underlying graphs.
 ///
 /// Sequential compilation: segments are compiled one after another.
-/// Parallel compilation is a follow-up if the wall-time becomes the
-/// bottleneck on H100; on Mac NativeRuntime the search budget is the
-/// dominant cost and parallelism doesn't help much.
+/// TODO(parallel-compile): compile segments concurrently if compile
+/// wall-time on the GPU host becomes a bottleneck.
 pub fn compile_with_luminal<R: ComputeRuntime>(
     segments: &mut [Graph],
     search_budget: usize,
@@ -92,8 +84,8 @@ pub fn compile_with_luminal<R: ComputeRuntime>(
 // NativeComputeRuntime — Luminal's CPU runtime. Always available.
 // ---------------------------------------------------------------------------
 
-/// Wraps Luminal's `NativeRuntime`. Available unconditionally; this is
-/// the runtime Phase A tests and Phase 1a's `compile_e2e` tests target.
+/// Wraps Luminal's CPU `NativeRuntime`. Available unconditionally; this is
+/// the runtime CI and the `compile_e2e` tests target when no GPU is present.
 pub struct NativeComputeRuntime {
     inner: NativeRuntime,
 }

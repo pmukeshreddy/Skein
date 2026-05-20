@@ -6,7 +6,7 @@ use common::*;
 use skein_emit::{ShardRole, shard_role_for_param};
 use skein_ir::ir::LayerKind;
 
-// Test 1 — layernorm + final norm + (Phase A) embedding/lm_head are
+// Test 1 — layernorm + final norm + embedding/lm_head are
 // Replicated regardless of parallelism.
 #[test]
 fn shard_role_replicated_for_norms() {

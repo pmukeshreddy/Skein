@@ -3,24 +3,23 @@
 //! a cluster-wide `topology.json` describing the NCCL collectives the
 //! runtime must issue between graph invocations.
 //!
-//! Phase A scope: build the graphs and the slicing/topology metadata. No
-//! `cx.build_search_space()` / `cx.search()` — those are Phase B (`skein_compile`).
-//! Phase A tests verify graph structure, weight-slice byte ranges, and
-//! topology determinism without compiling anything through Luminal.
+//! `skein_emit` builds the graphs and the slicing/topology metadata. The
+//! Luminal search/compile pass itself (`cx.build_search_space()` /
+//! `cx.search()`) lives downstream in `skein_compile`; the emit tests verify
+//! graph structure, weight-slice byte ranges, and topology determinism.
 //!
 //! # Public surface
 //!
 //! - [`lower_per_device`] — the headline entry point. Returns a
 //!   [`DeviceArtifact`] with the per-device graph, weight shard, and IO
 //!   manifest.
-//! - [`emit_topology`] — cluster-wide collective list. Same `(Plan, IR)`
-//!   produces byte-identical output (used by `skein` for content-addressable
-//!   artifact directories in Phase A Step 6).
+//! - [`emit_topology`] — cluster-wide collective list. The same `(Plan, IR)`
+//!   produces byte-identical output, which the content-addressable artifact
+//!   directory hashing relies on.
 //! - [`shard_role`] — pure resolution of a parameter's per-device role
 //!   (replicated, TP-sharded, EP-owned, etc.).
-//! - [`weights::write_weight_shard`] — writes the device's slice to a
-//!   destination safetensors file. Phase A tests exercise this with a
-//!   synthetic fixture; the real Mixtral path runs in Phase B.
+//! - [`weights::write_weight_shard`] — writes the device's slice from the
+//!   source safetensors to a destination shard file.
 
 pub mod error;
 pub mod graph_builder;
@@ -50,8 +49,8 @@ use skein_ir::plan::Plan;
 /// The per-device artifact `skein_emit` produces.
 ///
 /// `graph` carries the uncompiled `luminal::Graph` *and* a name-indexed
-/// `declared` map so tests / Phase B's `skein_compile` can look up a
-/// parameter's declared shape without walking the graph manually.
+/// `declared` map so `skein_compile` (and tests) can look up a parameter's
+/// declared shape without walking the graph manually.
 /// `weight_shard` lists the source byte ranges this device owns;
 /// `io_manifest` is the manifest the runtime uses to validate at load time.
 pub struct DeviceArtifact {

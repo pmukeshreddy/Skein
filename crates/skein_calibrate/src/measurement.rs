@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use skein_cost::OpKind;
 use skein_ir::types::{Component, Dtype};
 
-/// One kernel-runtime measurement. Phase B's sampler produces these;
-/// Phase A code aggregates and fits constants from them.
+/// One kernel-runtime measurement. The kernel sampler produces these and the
+/// aggregation/fit code derives cost constants from them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelMeasurement {
     pub op_kind: OpKind,

@@ -1,6 +1,6 @@
 //! Paged KV allocator. Owns the page array, the free + cached-LRU lists,
-//! and (optionally) the radix prefix tree. Phase A: in-process, mock
-//! device — no GPU involved.
+//! and (optionally) the radix prefix tree. Page accounting is host-side; the
+//! page bytes live in device memory on the CUDA build.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -32,8 +32,7 @@ impl PagedKVAllocator {
     /// Build an allocator from a `Plan` and a per-device KV memory budget.
     /// `bytes_per_token` is the cost of one token's K+V at the chosen
     /// dtype × num_kv_heads × head_dim (`skein_cost::memory::block_kv_bytes`
-    /// computes this from a Plan in the Phase B integration; tests pass
-    /// it directly).
+    /// computes this from a Plan; tests pass it directly).
     pub fn new(
         plan: &Plan,
         total_kv_bytes: u64,
@@ -43,8 +42,8 @@ impl PagedKVAllocator {
         let page_size = match plan.kv.layout {
             KVLayout::Paged { page_size } => page_size,
             // Contiguous = one giant page per request. We model it as
-            // page_size=1 for now so the arithmetic stays uniform; the real
-            // contiguous path is a Phase B optimization.
+            // page_size=1 so the arithmetic stays uniform.
+            // TODO(contiguous-kv): a dedicated contiguous allocation path.
             KVLayout::Contiguous => 1,
         };
         if bytes_per_token == 0 || page_size == 0 {

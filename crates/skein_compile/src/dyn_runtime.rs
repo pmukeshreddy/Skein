@@ -23,7 +23,7 @@ pub enum DynRuntimeError {
 
 /// Object-safe runtime API.
 ///
-/// This trait is intentionally single-threaded at Prompt 2a. At the pinned
+/// This trait is intentionally single-threaded. At the pinned
 /// Luminal rev, `luminal::Graph` owns `dyn HLIROp` / `dyn CustomOp` values
 /// that are neither `Send` nor `Sync`, so a wrapper that owns the graph
 /// cannot soundly implement those auto traits without unsafe code.

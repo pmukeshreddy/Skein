@@ -40,9 +40,9 @@ pub struct ServerBuildInputs<'a> {
 }
 
 impl Server {
-    /// Build a `Server`. Phase A consumes everything the runtime needs from
-    /// the Plan / Workload / `CostConstants` triple. Phase B's CUDA path
-    /// additionally loads the per-device compiled artifacts.
+    /// Build a `Server` from the Plan / Workload / `CostConstants` triple.
+    /// The forward-pass driver additionally loads the per-device compiled
+    /// artifacts at `serve()` time.
     pub fn new(inputs: ServerBuildInputs<'_>) -> Result<Self, RuntimeError> {
         let kv = PagedKVAllocator::new(
             &inputs.plan,
@@ -90,11 +90,10 @@ impl Server {
         let now_ms = crate::observability::wall_now_ms();
         let (streamer, sender) = TokenStreamer::paired();
         let decision = self.batcher.write().await.admit(request, sender, now_ms);
-        // Phase B: the forward-pass driver picks the request up from the
-        // batcher and starts producing tokens. On Phase A the streamer
-        // exists but no tokens will arrive — the front door's `recv` will
-        // pend forever unless the test closes it. Tests assert on the
-        // decision returned by the batcher, not on streamed output.
+        // `submit` only enqueues; the forward-pass driver (`serve`) picks the
+        // request up from the batcher and produces tokens. When no driver is
+        // running the streamer exists but no tokens arrive — tests assert on
+        // the admission decision, not on streamed output.
         let _ = decision;
         Ok(streamer)
     }
@@ -111,7 +110,8 @@ impl Server {
         (decision, streamer)
     }
 
-    /// Forward-pass driver. Phase B serves HTTP on Mac with the native runtime.
+    /// Forward-pass driver: serves the HTTP streaming endpoint backed by the
+    /// topology executor.
     pub async fn serve(&self) -> Result<(), RuntimeError> {
         crate::server::forward::serve(self).await
     }

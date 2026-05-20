@@ -43,8 +43,8 @@ impl HardwareSpec {
 }
 
 /// Model identifier — a name + optional path to the HF `config.json`. The
-/// path is consumed only by the Phase B drift sampler; the cost-constants
-/// writer doesn't need it.
+/// path is consumed only by the drift sampler; the cost-constants writer
+/// doesn't need it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub name: String,

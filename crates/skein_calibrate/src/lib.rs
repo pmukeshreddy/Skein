@@ -1,18 +1,21 @@
 //! `skein_calibrate` — offline calibration tool.
 //!
-//! Phase A scope: data plumbing.
+//! Fits the cost-model constants and the drift table from measurements taken
+//! on the target hardware:
 //!
 //! - `CalibrationCorpus` loader + validator.
 //! - `KernelMeasurement` / `DriftMeasurement` structs + statistical
 //!   aggregation (median for efficiency, p95 for drift).
+//! - Real samplers ([`sampler`]) that compile and execute kernels and
+//!   Skein-vs-Skein drift through a `ComputeRuntime`.
 //! - Deterministic, byte-stable TOML writers that preserve unmeasured
-//!   fields. The cost-constants writer renders the same canonical
-//!   structure cluster/cost_constants.toml ships with; the drift writer
-//!   produces a canonical drift TOML.
+//!   fields. The cost-constants writer renders the same canonical structure
+//!   `cluster/cost_constants.toml` ships with; the drift writer produces a
+//!   canonical drift TOML.
 //!
-//! Phase B wires real samplers. Mac runs them through `NativeComputeRuntime`
-//! for pipeline-valid but non-production measurements; CUDA builds select the
-//! production runtime on target hardware.
+//! The samplers are generic over the runtime: `CudaComputeRuntime` produces
+//! production constants on the target GPU, while `NativeComputeRuntime`
+//! produces pipeline-valid but non-production measurements on a CPU host.
 
 pub mod corpus;
 pub mod cost_fit;
@@ -72,11 +75,10 @@ pub struct FittedDriftEntry {
     pub value: f64,
 }
 
-/// Top-level calibration entry point. Calls the GPU samplers (Phase B),
-/// aggregates measurements, and writes both TOML files.
-///
-/// Phase A: the samplers refuse, so this function refuses with the same
-/// error. Tests bypass via the lower-level aggregation + writer functions.
+/// Top-level calibration entry point. Runs the kernel + drift samplers
+/// through the chosen `ComputeRuntime`, aggregates the measurements, and
+/// writes both TOML files. Tests exercise the lower-level aggregation +
+/// writer functions directly.
 #[allow(clippy::too_many_arguments)] // CLI-style entry point — every arg is a real configuration knob
 pub fn calibrate<R: ComputeRuntime + 'static>(
     hardware: HardwareSpec,
@@ -89,9 +91,9 @@ pub fn calibrate<R: ComputeRuntime + 'static>(
     out_drift: &Path,
 ) -> Result<CalibrationReport, CalibrationError> {
     let kernel_measurements = sampler::sample_kernel_runtimes::<R>(corpus, &hardware)?;
-    // Sample drift prompts from the real workload trace first (Phase A
-    // capable on Mac — it's just JSONL + selection logic), then hand the
-    // sampled prompt list to the Phase-B drift sampler.
+    // Select the drift prompts from the real workload trace (pure JSONL +
+    // selection logic), then hand the sampled prompt list to the drift
+    // sampler.
     let drift_prompts = sample_drift_prompts(&corpus.drift_source)?;
     let reference_path =
         model

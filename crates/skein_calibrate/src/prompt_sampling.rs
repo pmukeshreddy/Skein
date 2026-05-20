@@ -1,9 +1,9 @@
 //! Drift-prompt sampling.
 //!
 //! Reads a JSONL trace file (one `{"prompt": "..."}` object per line) and
-//! samples `n_drift_prompts` according to the configured strategy. Phase A
-//! runs entirely on Mac — only the *GPU drift measurement* on the sampled
-//! prompts is Phase B.
+//! samples `n_drift_prompts` according to the configured strategy. This is
+//! pure selection logic; the drift *measurement* on the sampled prompts runs
+//! through the compute runtime.
 //!
 //! Determinism is part of the contract: same `(trace, n, strategy, seed)` →
 //! byte-identical output. Drift calibration depends on this so re-runs

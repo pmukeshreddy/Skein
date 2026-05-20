@@ -1,4 +1,5 @@
-//! Test 11 — Server surfaces work without CUDA.
+//! Server lifecycle: admission and serve-init error handling on the
+//! in-process (CPU) build.
 
 mod common;
 use common::*;
@@ -25,7 +26,7 @@ fn build_server() -> Server {
         total_kv_bytes: 1024 * 32 * 32,
         bytes_per_token: 32,
     })
-    .expect("Server::new should succeed on Phase A")
+    .expect("Server::new should succeed on the in-process build")
 }
 
 #[tokio::test]

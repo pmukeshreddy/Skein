@@ -1,5 +1,5 @@
 //! `ParityError` — one `thiserror` enum across comparison, reference,
-//! drift-update, and Phase-B gating.
+//! drift-update, and the compile/runtime boundary.
 
 use std::path::PathBuf;
 
@@ -20,23 +20,6 @@ pub enum ParityError {
          hardcoded"
     )]
     MissingTolerance(PathBuf),
-
-    #[error("could not read mock-reference fixture at {path}: {source}")]
-    FixtureIo {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("could not parse mock-reference fixture at {path}: {source}")]
-    FixtureParse {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-
-    #[error("mock-reference fixture has no entry for tokens {tokens:?}")]
-    NoFixtureMatch { tokens: Vec<u32> },
 
     #[error("unsupported reference dtype {dtype:?}; expected one of: bfloat16, float16, float32")]
     InvalidReferenceDtype { dtype: String },
@@ -71,16 +54,4 @@ pub enum ParityError {
 
     #[error("drift table I/O error: {0}")]
     DriftTable(#[from] skein_extract::ExtractError),
-
-    #[error(
-        "{what} requires the Phase B CUDA build (rebuild with `--features cuda` \
-         on an H100 host); Mac/Phase A cannot run this code path"
-    )]
-    RequiresCuda { what: &'static str },
-
-    #[error(
-        "{what} is a Phase B implementation: the structure is in place but \
-         the real implementation lands in Phase B Step 10"
-    )]
-    PhaseBOnly { what: &'static str },
 }

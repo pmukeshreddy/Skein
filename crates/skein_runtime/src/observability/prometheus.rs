@@ -39,7 +39,7 @@ impl PromMetrics {
         )?;
         let comm_us_total = prometheus::Counter::new(
             "skein_step_comm_us_total",
-            "Total comm time across all steps, microseconds (Phase B)",
+            "Total comm time across all steps, microseconds",
         )?;
         let kv_pages_in_use = IntGauge::new("skein_kv_pages_in_use", "Currently active KV pages")?;
         let batch_size_hist = Histogram::with_opts(

@@ -54,7 +54,7 @@ fn constraints_reject_undivisible_tp() {
 // Test 3 — TP=1 OOMs on a small-memory cluster even with int4 weights.
 //
 // The spec's original framing was "TP=1 on 80 GB H100 OOMs". After we worked
-// the numbers (see PR notes for Phase A Step 3), Mixtral 8x7B at int4
+// the numbers, Mixtral 8x7B at int4
 // weights + fp8 KV at batch=8 / kv_len=2048 actually fits in 80 GB.
 // `global_memory_fits` therefore *does* allow TP=1 in that configuration —
 // which is correct: the inner DP gets a chance to pick an int4 dtype map.

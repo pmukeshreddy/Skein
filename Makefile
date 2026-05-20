@@ -1,16 +1,17 @@
 # Skein build/test/lint targets.
 #
-# Auto-detect CUDA availability by checking for `nvcc` on PATH. Mac builds run
-# without `--features cuda`; H100 builds enable it. Phase B targets abort with
-# a clear error when run on a machine without CUDA — never silently degrade.
+# The default build targets CUDA. On a host without `nvcc` the targets fall
+# back to `--no-default-features` (the CPU `NativeComputeRuntime` path) so the
+# planning + runtime logic still builds and tests. GPU-only targets abort with
+# a clear error on a host without CUDA — they never silently degrade.
 
 CARGO        ?= cargo
 HAS_CUDA     := $(shell command -v nvcc >/dev/null 2>&1 && echo yes || echo no)
 
 ifeq ($(HAS_CUDA),yes)
-FEATURES := --features cuda
-else
 FEATURES :=
+else
+FEATURES := --no-default-features
 endif
 
 .PHONY: build test lint fmt fmt-check clean \
@@ -35,15 +36,15 @@ fmt-check:
 clean:
 	$(CARGO) clean
 
-# Phase A (works on Mac): emit the Plan only, no Luminal compile.
+# Plan search only — no GPU required (runs with whatever FEATURES resolves to).
 extract-mixtral:
-	$(CARGO) run -p skein_cli -- extract \
+	$(CARGO) run -p skein_cli $(FEATURES) -- extract \
 	    --model configs/mixtral_8x7b_config.json \
 	    --cluster cluster/h100_2x.toml \
 	    --trace  cluster/sample_trace.jsonl \
 	    --out    artifacts/plan.json
 
-# Phase B (CUDA-only).
+# GPU pipeline targets.
 require-cuda:
 	@if [ "$(HAS_CUDA)" != "yes" ]; then \
 	    echo "error: this target requires CUDA (nvcc not found on PATH)"; \
@@ -52,20 +53,20 @@ require-cuda:
 	fi
 
 compile-mixtral: require-cuda
-	$(CARGO) run -p skein_cli --features cuda -- compile \
+	$(CARGO) run -p skein_cli -- compile \
 	    --model configs/mixtral_8x7b_config.json \
 	    --cluster cluster/h100_2x.toml \
 	    --trace  cluster/sample_trace.jsonl \
 	    --out    artifacts/
 
 verify-mixtral: require-cuda
-	$(CARGO) run -p skein_cli --features cuda -- verify \
+	$(CARGO) run -p skein_cli -- verify \
 	    --artifact artifacts/LATEST \
 	    --reference $(HF_MODEL_PATH) \
 	    --sample-from cluster/sample_trace.jsonl
 
 bench: require-cuda
-	$(CARGO) run -p skein_cli --features cuda -- bench \
+	$(CARGO) run -p skein_cli -- bench \
 	    --artifact artifacts/LATEST \
 	    --workload cluster/sample_trace.jsonl \
 	    --baseline $(VLLM_ENDPOINT) \

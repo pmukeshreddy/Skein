@@ -1,7 +1,7 @@
-//! Corpus loading + validation. The corpus no longer carries
-//! `drift_prompts` literally — those would be synthetic data. It carries
-//! a `DriftPromptSource` pointing to a real workload trace, sampled at
-//! calibration time.
+//! Corpus loading + validation. The corpus does not carry `drift_prompts`
+//! literally — hardcoded prompts would not reflect the production input
+//! distribution. It carries a `DriftPromptSource` pointing to a real
+//! workload trace, sampled at calibration time.
 
 mod common;
 

@@ -29,7 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Plan search only — outputs `plan.json`. Runs on Mac (Phase A).
+    /// Plan search only — outputs `plan.json`. No GPU required.
     Extract(ExtractArgs),
 
     /// Full compile: search + lower + Luminal compile + parity + artifact write.
@@ -44,7 +44,7 @@ pub enum Command {
     /// Calibrate cost constants + drift table from runtime measurements.
     Calibrate(CalibrateArgs),
 
-    /// Three validation metrics vs vLLM. Phase B.
+    /// Three validation metrics vs a vLLM baseline. Requires a CUDA build.
     Bench(BenchArgs),
 }
 

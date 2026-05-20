@@ -1,6 +1,10 @@
-//! Shared fixtures for `skein_parity` integration tests. Builds a tiny
-//! in-memory `MockReference` whose activations match the real Mixtral
-//! `num_layers = 32` so the per-layer loop in `verify_plan` has work to do.
+//! Shared fixtures for `skein_parity` integration tests.
+//!
+//! These tests exercise the real `verify_plan` / `verify_skein_pair`
+//! orchestration logic (tolerance gating, KL SLO gating, failing-layer
+//! selection) using small test-local doubles for the reference and
+//! artifact-side forward passes. The doubles live here, in the test crate —
+//! they are not part of the shipped library surface.
 
 #![allow(dead_code)]
 
@@ -13,7 +17,7 @@ use skein_ir::plan::*;
 use skein_ir::types::*;
 use skein_ir::workload::{Slo, Workload};
 use skein_parity::{
-    HFReference, MockReference, PhaseAStub, ReferenceOutput, SkeinForward, ToleranceTable,
+    HFReference, ParityError, ReferenceOutput, SkeinForward, SkeinOutput, ToleranceTable,
 };
 
 pub const NUM_BLOCKS: usize = 32;
@@ -124,32 +128,6 @@ pub fn load_tolerances() -> ToleranceTable {
     ToleranceTable::from_cost_constants(&load_cost_constants())
 }
 
-/// Deterministic mock-reference activations for a list of test prompts.
-/// Tokenization uses `MockReference::tokenize`'s BLAKE3 scheme, so each
-/// prompt maps to a unique token vector. The activation values are
-/// per-block constant `0.1 * (block_idx + 1)` and logits are
-/// `[0.0..VOCAB]` — these are arbitrary but small enough that drift
-/// injection makes the MSE math easy to reason about by hand.
-pub fn build_mock_reference(prompts: &[String]) -> MockReference {
-    let mut entries: HashMap<Vec<u32>, ReferenceOutput> = HashMap::new();
-    let stub_for_tokenize = MockReference::from_entries(HashMap::new());
-    for prompt in prompts {
-        let tokens = stub_for_tokenize.tokenize(prompt).unwrap();
-        let per_layer_activations: Vec<Vec<f32>> = (0..NUM_BLOCKS)
-            .map(|b| vec![0.1_f32 * (b as f32 + 1.0); HIDDEN])
-            .collect();
-        let final_logits: Vec<f32> = (0..VOCAB).map(|i| i as f32).collect();
-        entries.insert(
-            tokens,
-            ReferenceOutput {
-                per_layer_activations,
-                final_logits,
-            },
-        );
-    }
-    MockReference::from_entries(entries)
-}
-
 pub fn sample_prompts() -> Vec<String> {
     vec![
         "alpha".to_string(),
@@ -159,7 +137,121 @@ pub fn sample_prompts() -> Vec<String> {
     ]
 }
 
-/// Sanity helper for tests that don't actually exercise the stub.
-pub fn passthrough_stub(reference: MockReference) -> impl SkeinForward {
-    PhaseAStub::new(reference)
+/// Deterministic, model-free tokenizer for tests: maps a prompt to a fixed
+/// four-token sequence derived from its bytes. Distinct prompts map to
+/// distinct sequences, which is all the orchestration tests need.
+fn tokenize_for_test(prompt: &str) -> Vec<u32> {
+    let bytes = prompt.as_bytes();
+    (0..4)
+        .map(|i| {
+            let mut acc = 0u32;
+            for (j, b) in bytes.iter().enumerate() {
+                if j % 4 == i {
+                    acc = acc.wrapping_mul(31).wrapping_add(*b as u32);
+                }
+            }
+            acc % 32_000
+        })
+        .collect()
+}
+
+/// In-memory `HFReference`: a fixed token→activations map plus the test
+/// tokenizer. Per-block activations are the constant `0.1 * (block + 1)`
+/// and logits are `[0, 1, .., VOCAB)` — small values that make the MSE / KL
+/// arithmetic easy to reason about by hand.
+#[derive(Debug, Clone)]
+pub struct InMemoryReference {
+    entries: HashMap<Vec<u32>, ReferenceOutput>,
+}
+
+impl InMemoryReference {
+    pub fn for_prompts(prompts: &[String]) -> Self {
+        let mut entries = HashMap::new();
+        for prompt in prompts {
+            let per_layer_activations = (0..NUM_BLOCKS)
+                .map(|b| vec![0.1_f32 * (b as f32 + 1.0); HIDDEN])
+                .collect();
+            let final_logits = (0..VOCAB).map(|i| i as f32).collect();
+            entries.insert(
+                tokenize_for_test(prompt),
+                ReferenceOutput {
+                    per_layer_activations,
+                    final_logits,
+                },
+            );
+        }
+        Self { entries }
+    }
+
+    pub fn lookup(&self, tokens: &[u32]) -> ReferenceOutput {
+        self.entries
+            .get(tokens)
+            .cloned()
+            .expect("reference has no entry for tokens")
+    }
+}
+
+impl HFReference for InMemoryReference {
+    fn forward_with_hooks(&self, tokens: &[u32]) -> Result<ReferenceOutput, ParityError> {
+        Ok(self.lookup(tokens))
+    }
+
+    fn tokenize(&self, prompt: &str) -> Result<Vec<u32>, ParityError> {
+        Ok(tokenize_for_test(prompt))
+    }
+}
+
+/// Test-local `SkeinForward` that derives its output from an
+/// [`InMemoryReference`] plus a configurable per-layer additive offset and a
+/// uniform final-logit offset. The per-layer MSE between reference and Skein
+/// is then exactly `offset²`, which lets a test dial drift to a known
+/// magnitude.
+pub struct OffsetForward {
+    reference: InMemoryReference,
+    layer_offsets: Vec<f32>,
+    final_logit_offset: f32,
+}
+
+impl OffsetForward {
+    pub fn new(reference: InMemoryReference) -> Self {
+        Self {
+            reference,
+            layer_offsets: Vec::new(),
+            final_logit_offset: 0.0,
+        }
+    }
+
+    pub fn with_layer_offsets(mut self, offsets: Vec<f32>) -> Self {
+        self.layer_offsets = offsets;
+        self
+    }
+
+    pub fn with_final_logit_offset(mut self, offset: f32) -> Self {
+        self.final_logit_offset = offset;
+        self
+    }
+}
+
+impl SkeinForward for OffsetForward {
+    fn forward_with_hooks(&mut self, tokens: &[u32]) -> Result<SkeinOutput, ParityError> {
+        let ReferenceOutput {
+            mut per_layer_activations,
+            mut final_logits,
+        } = self.reference.lookup(tokens);
+        for (i, layer) in per_layer_activations.iter_mut().enumerate() {
+            let offset = self.layer_offsets.get(i).copied().unwrap_or(0.0);
+            if offset != 0.0 {
+                layer.iter_mut().for_each(|v| *v += offset);
+            }
+        }
+        if self.final_logit_offset != 0.0 {
+            final_logits
+                .iter_mut()
+                .for_each(|v| *v += self.final_logit_offset);
+        }
+        Ok(SkeinOutput {
+            per_layer_activations,
+            final_logits,
+        })
+    }
 }

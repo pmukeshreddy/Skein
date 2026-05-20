@@ -29,8 +29,8 @@ pub struct StepBatch {
     pub decode_requests: Vec<RequestId>,
     pub total_kv_pages: u32,
     /// Set when every decode in the batch shares the same `(batch_size,
-    /// kv_class)` pair — Phase B's CUDA Graphs dispatch uses this to pick
-    /// a captured graph.
+    /// kv_class)` pair — the CUDA Graphs dispatcher uses this to pick a
+    /// captured graph.
     pub uniform_decode_size: Option<u32>,
 }
 

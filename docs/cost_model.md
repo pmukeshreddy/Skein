@@ -1,8 +1,8 @@
 # Cost model
 
-`skein_cost` scores a `Plan` analytically. It runs on Mac, in microseconds
-per call, against a representative decode-step workload. It does **not**
-measure real kernels — that is `skein_calibrate`'s job and lands in Phase B.
+`skein_cost` scores a `Plan` analytically, in microseconds per call, against
+a representative decode-step workload. It runs on any host (no GPU required)
+and does **not** measure real kernels — that is `skein_calibrate`'s job.
 
 ## Five additive terms
 
@@ -133,7 +133,7 @@ skein calibrate --hardware <name> --model <config.json> \
 `skein_calibrate` runs sample Luminal compiles on a representative corpus,
 measures kernel runtimes for each `(op, dtype)`, fits an efficiency
 constant, and writes it back. It also fits the drift table consumed by the
-DP in `skein_extract`. This is a Phase B step — it needs an H100.
+DP in `skein_extract`. Producing production constants needs the target GPU.
 
 ## What the cost model does **not** include
 

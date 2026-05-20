@@ -6,9 +6,11 @@ rust-version = { workspace = true }
 license      = { workspace = true }
 
 [features]
+# Library default is empty; the `skein_cli` binary forwards `cuda` here and
+# carries the production GPU default. See that crate's Cargo.toml.
 default = []
 # CUDA-gated paths: NCCL between graph runs, CUDA Graphs capture/dispatch,
-# RDMA for P/D KV transfer.
+# RDMA for prefill/decode KV transfer.
 cuda = []
 
 [lib]

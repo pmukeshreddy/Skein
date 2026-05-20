@@ -6,10 +6,14 @@ rust-version = { workspace = true }
 license      = { workspace = true }
 
 [features]
-default = []
-# Enables CUDA-backed compile/runtime internals on NVIDIA hosts. The Mac
-# native paths stay real for compile, serve, verify, and calibrate.
-cuda = ["skein_compile/cuda"]
+# The `skein` binary defaults to the production CUDA build. `cuda` forwards to
+# every CUDA-bearing library crate, so `cargo build` (and `cargo build
+# --workspace`) targets the GPU. Building with `--no-default-features` selects
+# the CPU `NativeComputeRuntime` path end-to-end (used by CI and GPU-less
+# development) — the library crates default to empty features, so the toggle
+# disables CUDA everywhere.
+default = ["cuda"]
+cuda = ["skein_compile/cuda", "skein_runtime/cuda", "skein_parity/cuda"]
 
 # Hybrid layout: integration tests need to call into the command runners
 # directly. Both the library and the binary live in this crate.

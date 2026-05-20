@@ -1,4 +1,5 @@
-//! `skein serve` — Phase B runtime server (Mac native + H100 CUDA).
+//! `skein serve` — runtime server (CUDA by default, CPU on
+//! `--no-default-features`).
 
 use skein_compile::SkeinArtifact;
 use skein_runtime::Server;

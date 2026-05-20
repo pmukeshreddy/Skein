@@ -9,9 +9,8 @@
 //! 2. **Expert (EP)**, MoE-only. If the parameter is an MoE expert weight
 //!    and `ep > 1`, the expert index is bucketed by `expert_idx % ep`. The
 //!    device whose `ep_idx` matches owns it (`ExpertOwned`); the others
-//!    see `ExpertElsewhere`. EP supersedes TP for expert weights — Phase A
-//!    does not stack TP-within-expert on top of EP. Document the
-//!    simplification in `docs/lowering.md`.
+//!    see `ExpertElsewhere`. EP supersedes TP for expert weights — we do
+//!    not stack TP-within-expert on top of EP (see `docs/lowering.md`).
 //! 3. **Tensor (TP)**, applies to non-expert weights. Direction is read
 //!    from the parameter's HF safetensors key:
 //!    - `self_attn.q_proj`, `k_proj`, `v_proj`, `mlp.gate_proj`/`up_proj`,
@@ -21,8 +20,8 @@
 //!      → `TpInputShard` (split columns).
 //!    - All others (norms, MoE router gate) → `Replicated`.
 //!
-//!    Phase A leaves `embed_tokens` and `lm_head` `Replicated`; the
-//!    vocab-parallel variant is a Phase B extension.
+//!    `embed_tokens` and `lm_head` are left `Replicated`.
+//!    TODO(vocab-parallel): shard the embedding / LM head across TP ranks.
 //! 4. **Otherwise** → `Replicated`.
 //!
 //! The function is pure: no I/O, no global state, deterministic.
@@ -48,7 +47,7 @@ pub enum ShardRole {
     /// The parameter's owning block belongs to a pipeline stage that's not
     /// on this device — skip lowering.
     PipelineStageElsewhere,
-    /// Layer has no parameters (marker / collective / placeholder).
+    /// Layer has no parameters (e.g. a marker or collective-only layer).
     NoParams,
 }
 
@@ -112,7 +111,7 @@ pub fn shard_role_for_param(
         return tp_role_for(role, placement.tp, tp_idx);
     }
 
-    // 4. Replicated (norms, MoE router gate, embed/lm_head in Phase A).
+    // 4. Replicated (norms, MoE router gate, embed/lm_head).
     ShardRole::Replicated
 }
 
@@ -206,8 +205,8 @@ pub fn param_kind_for(name: &str) -> ParamKind {
         return ParamKind::TpDirectional(TpDirection::RowParallel);
     }
 
-    // Embedding and LM head: Phase A keeps these replicated. Vocab-parallel
-    // sharding is a Phase B extension.
+    // Embedding and LM head are kept replicated.
+    // TODO(vocab-parallel): shard these across TP ranks.
     if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
         return ParamKind::Replicated;
     }

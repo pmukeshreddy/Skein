@@ -23,7 +23,7 @@ pub enum ImportError {
 
     #[error(
         "architecture {arch} is recognized by Skein but not yet wired through \
-         the importer; only MixtralForCausalLM is implemented in Phase A"
+         the importer; only MixtralForCausalLM is currently implemented"
     )]
     ArchitectureNotYetImplemented { arch: String },
 

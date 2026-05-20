@@ -1,13 +1,10 @@
 # Per-(layer, component, dtype) KL-divergence drift contribution for Mixtral
 # 8x7B vs the bf16 reference.
 #
-# !!! PLACEHOLDER — TO BE CALIBRATED IN PHASE B !!!
-#
-# The values below are educated guesses sourced from published quantization
-# studies (LLM.int8(), GPTQ, AWQ, SmoothQuant ablations). They represent the
-# *relative* drift ordering of dtypes — bf16 = 0.0 by definition, fp8 << int8
-# << int4. Absolute magnitudes are not measured and should NOT be trusted
-# numerically. Replace with measured values via:
+# The defaults below are reference starting points whose *relative* dtype
+# ordering follows published quantization studies (LLM.int8(), GPTQ, AWQ,
+# SmoothQuant): bf16 = 0.0 by definition, fp8 << int8 << int4. Recalibrate the
+# absolute magnitudes against the target hardware before relying on them:
 #
 #     skein calibrate --hardware h100_sxm5 \
 #         --model configs/mixtral_8x7b_config.json \
@@ -17,7 +14,8 @@
 #   [default.<component>]      — drift per dtype for every (component, dtype)
 #                                pair. Required: every dtype must appear.
 #   [layer.<idx>.<component>]  — optional per-layer override that wins over
-#                                the default. Phase A ships defaults only.
+#                                the default. Written by `skein calibrate` and
+#                                by the parity gate's drift-table update.
 #
 # Components: weight, activation, kv_cache.
 # Dtypes:     bf16, fp16, fp8_e4m3, fp8_e5m2, int8, int4.

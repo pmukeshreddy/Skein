@@ -42,12 +42,11 @@ pub enum EmitError {
     SourceMissing { path: PathBuf },
 
     #[error(
-        "writing real Mixtral weights requires the source safetensors files \
-         in {path}; Phase A only ships synthetic-fixture tests of the slicing \
-         logic. Provide the source checkpoint to enable production writes \
-         (Phase B)"
+        "no single-file `weights.safetensors` found in {path}; multi-shard \
+         checkpoints indexed by `model.safetensors.index.json` are not yet \
+         supported by the shard writer"
     )]
-    WeightWriteRequiresFixture { path: PathBuf },
+    MultiShardCheckpointUnsupported { path: PathBuf },
 
     #[error("could not read source safetensors at {path}: {source}")]
     SafetensorsIo {

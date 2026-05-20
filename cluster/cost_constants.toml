@@ -5,10 +5,11 @@
 #     skein calibrate --hardware <name> --model <config.json> \
 #         --out-cost cluster/cost_constants.toml
 #
-# The values below are starting points sourced from NVIDIA datasheets and
-# published profiling. They are *not* sustained measurements — they exist so
-# Phase A's search loop produces sensibly-ranked Plans without an H100 in
-# hand. Replace before trusting `total_cost` numerically.
+# The values below are reference starting points sourced from NVIDIA
+# datasheets and published profiling. They are *not* sustained measurements —
+# they let the search loop produce sensibly-ranked Plans out of the box.
+# Recalibrate against the target hardware before trusting `total_cost`
+# numerically.
 
 # -----------------------------------------------------------------------------
 # Scalar top-level constants. TOML scope: anything written before the first
@@ -108,7 +109,7 @@ decode_kv_tokens = 2048
 # Per-dtype activation-MSE tolerance for the parity gate (`skein_parity`).
 # A layer's tolerance is the *max* of its (weight, activation, kv) per-dtype
 # tolerances — the layer can drift at least as much as its loosest component
-# allows. Starting values; recalibrate via `skein calibrate` in Phase B.
+# allows. Starting values; recalibrate via `skein calibrate`.
 [parity_tolerance_mse]
 bf16     = 1.0e-3
 fp16     = 1.0e-3
@@ -119,7 +120,7 @@ int4     = 2.0e-2
 
 # Runtime knobs consumed by `skein_runtime`. Buffer sizes, timeouts, and
 # the SLO-aware admission estimator's constants. Every value here is a
-# tunable — production values come from `skein calibrate` in Phase B.
+# tunable — production values come from `skein calibrate`.
 [runtime]
 # Step + request metrics ring-buffer capacity. Older entries drop when full.
 # Sized to hold ~30 min of metrics at a typical request rate.
@@ -150,7 +151,7 @@ per_token_decode_us_at_b1 = 8000.0
 batch_scaling_exponent = 0.7
 
 # Prefill cost per prompt token, microseconds. Roughly compute-bound on
-# H100 at bf16; recalibrated per-(model, hardware) in Phase B.
+# H100 at bf16; recalibrated per-(model, hardware) via `skein calibrate`.
 prefill_per_token_us = 25.0
 
 # State-space discretization for `skein_extract`'s inner DP. The DP keys on

@@ -1,6 +1,6 @@
 //! Test 6 — declared luminal::Graph tensor shapes reflect the Plan's sharding.
 //!
-//! Under Phase 1b's segmented LoweredGraph, `declared` lives per-segment;
+//! In the segmented LoweredGraph, `declared` lives per-segment;
 //! we look up each weight by walking the segments and asserting the
 //! first place it appears matches the expected sharded shape.
 

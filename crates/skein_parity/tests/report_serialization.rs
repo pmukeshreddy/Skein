@@ -41,7 +41,7 @@ fn report_serialization_roundtrip() {
     assert_eq!(report, back);
 
     // Byte-equal serialization on the *same* in-memory report — this is
-    // what the content-addressable artifact path in Phase A Step 6 relies
+    // what the content-addressable artifact path relies
     // on. Two serializations of the same Rust value must produce the same
     // bytes.
     let json2 = serde_json::to_string(&report).unwrap();

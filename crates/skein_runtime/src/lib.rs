@@ -9,15 +9,16 @@
 //! - [`hotswap::HotSwap`] — drain in-flight, verify shape compatibility,
 //!   atomic POSIX-rename symlink swap.
 //! - [`observability::ProfileHooks`] — step + request metric ring buffers,
-//!   Prometheus exporter, `tracing` spans (full OTel exporter wiring is
-//!   Phase B).
+//!   Prometheus exporter, `tracing` spans.
 //! - [`server::Server`] — owns the above and exposes a unified `submit /
-//!   serve` API. `serve()` runs the Phase B HTTP streaming path through the
-//!   shared topology executor.
+//!   serve` API. `serve()` runs the HTTP streaming path through the shared
+//!   topology executor.
 //!
-//! The Mac build stays CPU-only and keeps CUDA imports behind
-//! `#[cfg(feature = "cuda")]`; native collectives, dispatch, and KV
-//! transport run real single-process semantics.
+//! The default build targets CUDA (NCCL collectives, CUDA Graphs dispatch,
+//! RDMA KV transport) behind `#[cfg(feature = "cuda")]`. Building with
+//! `--no-default-features` selects the in-process collective + eager
+//! dispatch path used for single-node serving, CI, and runtime-logic
+//! development.
 
 pub mod batcher;
 pub mod collectives;
@@ -33,7 +34,7 @@ pub mod token_stream;
 pub mod types;
 
 pub use batcher::{AdmissionDecision, ContinuousBatcher, RejectReason, StepBatch};
-pub use collectives::{CollectiveBackend, CollectiveError, MockCollective};
+pub use collectives::{CollectiveBackend, CollectiveError, InProcessCollective};
 pub use dispatch::{DispatchError, DispatchOutcome, EagerDispatcher, KernelDispatcher};
 pub use error::RuntimeError;
 pub use hotswap::HotSwap;

@@ -1,4 +1,4 @@
-//! Phase B Prompt 1b — multi-segment LoweredGraph tests.
+//! Multi-segment LoweredGraph tests.
 //!
 //! Test 1: segmentation count exact for tp=2 ep=1 and tp=2 ep=2.
 //! Test 2: handoff name alignment across each collective boundary.
@@ -140,7 +140,7 @@ fn each_segment_compiles_independently_native() {
         lowered.segments.len(),
         elapsed
     );
-    // Acceptance budget from the Prompt 1b spec: <60s on Mac.
+    // Compile-time budget for the segmented graph on a CPU host: < 60s.
     assert!(
         elapsed.as_secs() < 60,
         "per-segment compile budget exceeded ({} segments in {:?})",

@@ -13,9 +13,8 @@
 //!   `ExpertOwned` selects rows of a stacked-experts tensor.
 //!
 //! `write_weight_shard` materializes the shard to a destination
-//! safetensors file. The synthetic-fixture test exercises this; the real
-//! Mixtral path requires the source files to be on disk and returns an
-//! explicit Phase-B-only error otherwise.
+//! safetensors file from a single-file source checkpoint; multi-shard
+//! checkpoints return an explicit error (see TODO(multi-shard) there).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -223,11 +222,14 @@ pub fn build_weight_shard(
 
 /// Materialize a shard to a destination safetensors file.
 ///
-/// `source_dir` is expected to contain `index.json` and one or more
-/// `.safetensors` shards whose metadata lists the tensors referenced by
-/// `shard.slices[*].source_key`. Phase A only supports the single-file
-/// case (one `<name>.safetensors`); multi-shard checkpoints fall through
-/// to a Phase B error.
+/// `source_dir` is expected to contain the model's safetensors whose
+/// metadata lists the tensors referenced by `shard.slices[*].source_key`.
+///
+/// TODO(multi-shard): only the single-file case (`weights.safetensors`) is
+/// supported. Real checkpoints sharded across several files and indexed by
+/// `model.safetensors.index.json` return
+/// [`EmitError::MultiShardCheckpointUnsupported`] — reading the index and
+/// resolving each `source_key` to its shard file is not yet implemented.
 pub fn write_weight_shard(
     shard: &WeightShard,
     source_dir: &Path,
@@ -239,13 +241,13 @@ pub fn write_weight_shard(
         });
     }
 
-    // Look for a single-file source `weights.safetensors`. Real Mixtral
-    // checkpoints are sharded across several files and indexed by
-    // `model.safetensors.index.json`; surface a Phase B error rather than
-    // silently picking a sub-file.
+    // Look for a single-file source `weights.safetensors`. Multi-shard
+    // checkpoints indexed by `model.safetensors.index.json` are not yet
+    // supported; surface a clear error rather than silently picking a
+    // sub-file (see TODO(multi-shard) above).
     let single_file = source_dir.join("weights.safetensors");
     if !single_file.exists() {
-        return Err(EmitError::WeightWriteRequiresFixture {
+        return Err(EmitError::MultiShardCheckpointUnsupported {
             path: source_dir.to_path_buf(),
         });
     }
@@ -283,9 +285,8 @@ pub fn write_weight_shard(
             Dtype::Bf16 => safetensors::Dtype::BF16,
             Dtype::Fp16 => safetensors::Dtype::F16,
             // FP8 / Int4 variants don't have stable safetensors codes in
-            // 0.4.x; store as raw bytes via the closest match. This is fine
-            // for Phase A's synthetic fixture tests — production weights
-            // are bf16/fp16 at write time, downcasting happens at compile.
+            // 0.4.x; store as raw bytes via the closest match. Source weights
+            // are bf16/fp16 at write time — downcasting happens at compile.
             Dtype::Fp8E4m3 | Dtype::Fp8E5m2 => safetensors::Dtype::F8_E4M3,
             Dtype::Int8 => safetensors::Dtype::I8,
             Dtype::Int4 => safetensors::Dtype::I8,

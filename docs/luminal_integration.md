@@ -1,11 +1,10 @@
 # Luminal integration
 
 How Skein talks to [Luminal](https://github.com/luminal-ai/luminal) for
-kernel optimization. This document is the cheat sheet a Phase B engineer
-should read before adding a new op to `skein_emit::op_wiring` or a new
-backend to `skein_compile`. It is **not** a Luminal tutorial — read the
-upstream README for that. This file pins what Skein assumes about the
-Luminal API at our pinned rev.
+kernel optimization. This document is the cheat sheet to read before adding
+a new op to `skein_emit::op_wiring` or a new backend to `skein_compile`. It
+is **not** a Luminal tutorial — read the upstream README for that. This file
+pins what Skein assumes about the Luminal API at our pinned rev.
 
 ## Pinned rev
 
@@ -29,11 +28,12 @@ needs Luminal to compile and execute a graph. Two impls today:
 
 | impl                    | Available             | Backed by                          |
 |-------------------------|-----------------------|------------------------------------|
+| `CudaComputeRuntime`    | `--features cuda` (default) | `luminal_cuda_lite::CudaRuntime`   |
 | `NativeComputeRuntime`  | Always                | `luminal::prelude::NativeRuntime`  |
-| `CudaComputeRuntime`    | `--features cuda`     | `luminal_cuda_lite::CudaRuntime`   |
 
-Phase B adds Metal / ROCm as new impls without changing call sites —
-`compile_with_luminal::<R>` selects the backend at the call site.
+Additional backends (Metal / ROCm) drop in as new impls without changing
+call sites — `compile_with_luminal::<R>` selects the backend at the call
+site.
 
 Trait surface (`crates/skein_compile/src/lib.rs`):
 
@@ -46,9 +46,9 @@ pub trait ComputeRuntime: Sized {
 }
 ```
 
-The `f32` data path is what every Skein test uses; production weight
-loading will go through `set_data_bytes` (not yet on the trait — added in
-the Phase B step that wires real weight bytes through).
+The `f32` data path is what every Skein test uses.
+TODO(weight-bytes): production weight loading should go through a
+`set_data_bytes` entry point (not yet on the trait).
 
 ## Op-availability cheat sheet (pinned rev)
 
@@ -94,25 +94,24 @@ each verified by reading `luminal/src/frontend/` at the pinned rev:
 - **`luminal_nn::MoE`** is a plain dense-matmul MoE with top-k routing;
   Mixtral SwiGLU MoE needs a hand-built block (`wire_moe`).
 
-## Op gaps deferred to later prompts
+## Deferred op lowering (TODO)
 
-The 1a wiring is intentionally a *subset* of true Mixtral semantics.
-Each gap is its own follow-up, sized to the prompt that consumes it:
+The current op wiring is intentionally a *subset* of full Mixtral
+semantics. Each gap is tracked by a `TODO(...)` tag in
+`skein_emit::op_wiring` (and the others noted below); a grep for `TODO(`
+across `skein_emit`/`skein_runtime` finds every deferred piece.
 
-| Gap                                  | Effect on output                                 | Lands in       |
-|--------------------------------------|--------------------------------------------------|----------------|
-| RoPE on Q/K                          | No positional encoding — attention is position-blind. | Prompt that exercises generation quality. |
-| Causal mask                          | Softmax sees future positions during prefill.    | Same.          |
-| Top-k routing in MoE                 | Every expert contributes weighted by its softmax prob; real Mixtral picks top-2 only. | Prompt that hooks `topk_indexes` + `gather` for expert weights. |
-| Real KV cache                        | Forward pass is stateless — no KV reuse, no paged layout. | Phase B runtime work. |
+| Gap                  | Effect on output                                                   | Tag                  |
+|----------------------|-------------------------------------------------------------------|----------------------|
+| RoPE on Q/K          | No positional encoding — attention is position-blind.             | `TODO(rope)`         |
+| Causal mask          | Softmax sees future positions during prefill (`seq > 1`).         | `TODO(causal-mask)`  |
+| Top-k routing in MoE | Dense mixture over all experts; Mixtral picks top-2 only. Hook `topk_indexes` + `gather`. | `TODO(moe-topk)`     |
+| EP token routing     | Dispatch/combine are wired structurally but tokens aren't routed. | `TODO(ep-routing)`   |
+| Real KV cache        | The parity forward pass is stateless — no KV reuse.               | runtime KV work      |
 
-All four are tracked in `op_wiring.rs`'s module docstring and gated by
-explicit comments at the call site, so a grep for `1a known gap` finds
-every deferred piece.
+## How to add a new backend
 
-## How a Phase B step adds a new backend
-
-The pattern (used by Prompt 1a for `CudaComputeRuntime`):
+The pattern `CudaComputeRuntime` follows:
 
 1. Add the upstream crate as an optional `cargo` dep behind a feature.
    Pin to the same Luminal rev.
@@ -120,8 +119,8 @@ The pattern (used by Prompt 1a for `CudaComputeRuntime`):
    `#[cfg(feature = "<flag>")] mod` inside `skein_compile`.
 3. Add a `#[cfg(feature = "<flag>")] #[test]` that compile-checks
    `compile_with_luminal::<NewRuntime>` — execution tests are
-   GPU-conditional and live in the Phase B step that has a real GPU.
+   GPU-conditional.
 4. Re-export the new type from `skein_compile`'s public surface so the
    CLI can pick it via `compile_with_luminal::<R>` at runtime.
 
-Metal and ROCm follow this exact shape when their steps land.
+Metal and ROCm follow this exact shape.

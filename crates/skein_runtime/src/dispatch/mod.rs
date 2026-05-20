@@ -44,6 +44,7 @@ impl KernelDispatcher for EagerDispatcher {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Default)]
 pub struct CudaGraphDispatcher {
     captured: std::collections::HashMap<(u32, u32), ()>,
 }
@@ -51,9 +52,7 @@ pub struct CudaGraphDispatcher {
 #[cfg(feature = "cuda")]
 impl CudaGraphDispatcher {
     pub fn new() -> Self {
-        Self {
-            captured: std::collections::HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn captured_len(&self) -> usize {

@@ -1,7 +1,7 @@
 //! Test 3 — `wire_segments` produces a structurally valid `LoweredGraph`
 //! for the full Mixtral 8x7B IR at tp=1.
 //!
-//! Adapted for Phase 1b's segmented LoweredGraph: op_nodes and declared
+//! In the segmented LoweredGraph, op_nodes and declared
 //! are per-segment, so we walk all segments to find the expected
 //! tensors. At tp=1 there's exactly one segment per device.
 //!

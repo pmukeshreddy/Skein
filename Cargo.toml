@@ -56,14 +56,13 @@ skein_calibrate = { path = "crates/skein_calibrate" }
 # --- Luminal ---
 # Search-based API: `cx.tensor(shape_tuple)` where each shape entry is
 # `Into<Expression>` (usize for static dims, char for dynamic). Pinned to a
-# verified main-branch rev that builds clean on Mac (no CUDA toolkit needed
-# for the graph-construction path Phase A uses). Phase B will enable CUDA via
-# a separate `luminal_cuda_lite` crate dep (verify the exact name when wiring
-# `skein_compile`).
+# verified rev. The graph-construction path builds without a CUDA toolkit;
+# the CUDA compute backend comes from `luminal_cuda_lite`, pulled in by
+# `skein_compile` only under the `cuda` feature.
 luminal = { git = "https://github.com/luminal-ai/luminal", rev = "e558ce68498df842107ccb32e316efff4801ccc1" }
 
-# cudarc — verified against `cargo search` at project bootstrap; pinned exactly.
-# Only pulled in by crates that opt into the `cuda` feature.
+# cudarc — pinned exactly; pulled in transitively by `luminal_cuda_lite` under
+# the `cuda` feature. Requires an NVIDIA toolchain to build.
 cudarc = { version = "=0.16.6", default-features = false, features = [
     "nvrtc", "driver", "cublas", "cublaslt", "cuda-12080", "dynamic-loading", "std",
 ] }

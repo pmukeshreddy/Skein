@@ -1,4 +1,5 @@
-//! Tests 4–7 + 9 — verify_plan flow, drift-table update, Phase-B gating.
+//! verify_plan flow, drift-table monotonic update, and reference-dtype
+//! validation.
 
 mod common;
 use common::*;
@@ -6,14 +7,15 @@ use common::*;
 use skein_ir::types::{Component, Dtype};
 use skein_parity::drift_update::update_drift_table_on_failure;
 use skein_parity::report::FailingLayerReport;
-use skein_parity::{HFReference, ParityError, PhaseAStub, PythonSubprocessReference, verify_plan};
+use skein_parity::{ParityError, PythonSubprocessReference, verify_plan};
 
-// Test 4 — passes when the stub returns identical activations.
+// verify_plan passes when the artifact-side forward returns activations
+// identical to the reference.
 #[test]
-fn verify_plan_passes_under_mock_reference_no_drift() {
+fn verify_plan_passes_with_no_drift() {
     let prompts = sample_prompts();
-    let reference = build_mock_reference(&prompts);
-    let mut skein = PhaseAStub::new(reference.clone());
+    let reference = InMemoryReference::for_prompts(&prompts);
+    let mut skein = OffsetForward::new(reference.clone());
     let tolerances = load_tolerances();
     let plan = mk_plan(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16);
     let workload = loose_slo();
@@ -29,7 +31,7 @@ fn verify_plan_passes_under_mock_reference_no_drift() {
         &tolerances,
         &prompts,
     )
-    .expect("verify_plan should succeed under no-drift mock");
+    .expect("verify_plan should succeed with no drift");
     assert!(report.passed, "report should pass: {report:?}");
     assert!(report.failing_layer.is_none());
     for p in &report.per_prompt {
@@ -40,17 +42,17 @@ fn verify_plan_passes_under_mock_reference_no_drift() {
     }
 }
 
-// Test 5 — fails when one layer exceeds its tolerance.
+// verify_plan fails when one layer's MSE exceeds its dtype tolerance.
 #[test]
 fn verify_plan_fails_when_layer_exceeds_tolerance() {
     let prompts = sample_prompts();
-    let reference = build_mock_reference(&prompts);
+    let reference = InMemoryReference::for_prompts(&prompts);
     // bf16 tolerance is 1e-3. Injecting an offset of 0.5 at layer 10 makes
     // the MSE = 0.25 (since each element is offset by 0.5 → squared = 0.25,
     // mean across the small hidden state is 0.25). 0.25 >> 1e-3.
     let mut offsets = vec![0.0_f32; NUM_BLOCKS];
     offsets[10] = 0.5;
-    let mut skein = PhaseAStub::new(reference.clone()).with_layer_offsets(offsets);
+    let mut skein = OffsetForward::new(reference.clone()).with_layer_offsets(offsets);
     let tolerances = load_tolerances();
     let plan = mk_plan(Dtype::Bf16, Dtype::Bf16, Dtype::Bf16);
     let workload = loose_slo();
@@ -77,47 +79,37 @@ fn verify_plan_fails_when_layer_exceeds_tolerance() {
     assert!(failing.measured_mse > failing.tolerance);
 }
 
-// Test 6 — fails when per-layer MSE is within tolerance but final KL
-// exceeds the SLO. We accomplish this by leaving the per-layer offsets at
-// zero (MSE = 0) and giving the final logits a small uniform offset (which
-// keeps log-softmax unchanged — KL still 0). To actually drive KL up we
-// inject a non-uniform per-block offset so the final-logit hooks diverge.
-//
-// Easier approach: inject a tiny per-layer offset whose MSE is below
-// every tolerance, but make the final logits *non-uniform-different* by
-// also varying per-layer (which the stub propagates to logits is not what
-// we have — logits and per-layer activations are separate fields in
-// ReferenceOutput). So instead: set per-layer offsets to zero (MSE 0,
-// passes the tolerance gate) AND override `final_logits` directly via a
-// custom stub.
+// verify_plan fails when per-layer MSE is within tolerance but the final-
+// logit KL divergence exceeds the SLO. Per-layer activations are left
+// identical (MSE = 0, so the tolerance gate passes); only the final logits
+// are tilted non-uniformly so log-softmax — and therefore KL — diverges.
 #[test]
 fn verify_plan_fails_when_kl_exceeds_slo() {
     let prompts = sample_prompts();
-    let reference = build_mock_reference(&prompts);
+    let reference = InMemoryReference::for_prompts(&prompts);
 
-    // Build a "tilted logits" stub by wrapping the reference output and
-    // perturbing only the final logits with a non-uniform shift. The
-    // per-layer activations remain identical.
-    struct TiltedStub {
-        reference: skein_parity::MockReference,
+    // A forward pass that copies the reference activations but tilts the
+    // final logits non-uniformly so KL > 0 while per-layer MSE stays 0.
+    struct TiltedForward {
+        reference: InMemoryReference,
     }
-    impl skein_parity::SkeinForward for TiltedStub {
+    impl skein_parity::SkeinForward for TiltedForward {
         fn forward_with_hooks(
             &mut self,
             tokens: &[u32],
         ) -> Result<skein_parity::SkeinOutput, skein_parity::ParityError> {
-            let mut out = self.reference.forward_with_hooks(tokens)?;
-            // Tilt the logits non-uniformly so KL > 0.
-            for (i, v) in out.final_logits.iter_mut().enumerate() {
+            let out = self.reference.lookup(tokens);
+            let mut final_logits = out.final_logits;
+            for (i, v) in final_logits.iter_mut().enumerate() {
                 *v += (i as f32) * 2.0;
             }
             Ok(skein_parity::SkeinOutput {
                 per_layer_activations: out.per_layer_activations,
-                final_logits: out.final_logits,
+                final_logits,
             })
         }
     }
-    let mut skein = TiltedStub {
+    let mut skein = TiltedForward {
         reference: reference.clone(),
     };
 
@@ -145,7 +137,7 @@ fn verify_plan_fails_when_kl_exceeds_slo() {
     assert!(report.avg_final_kl > report.slo_max_drift);
 }
 
-// Test 7 — drift-table monotonic update.
+// Drift-table monotonic (never-decrease) update protocol.
 #[test]
 fn drift_table_update_monotonic() {
     let tmpdir = std::env::temp_dir().join(format!(
@@ -223,7 +215,7 @@ int4 = 0.0
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
-// Test 9 — PythonSubprocessReference validates the independent reference dtype.
+// PythonSubprocessReference validates the independent reference dtype.
 #[test]
 fn python_subprocess_reference_validates_reference_dtype() {
     let r = PythonSubprocessReference::with_paths(

@@ -88,7 +88,7 @@ impl Cluster {
 
 /// Device placement helper: how `(tp, pp, ep)` map onto device indices.
 ///
-/// Phase A assumes a simple lexicographic layout: device `i` belongs to
+/// Assumes a lexicographic layout: device `i` belongs to
 ///   `stage = i / (tp × ep)`,
 ///   `tp_idx = (i % (tp × ep)) / ep`,
 ///   `ep_idx = i % ep`.

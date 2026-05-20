@@ -1,6 +1,6 @@
 //! Test 8 — end-to-end search on Mixtral 8x7B / 2× H100 / ShareGPT trace.
 //!
-//! The headline acceptance for Phase A Step 3: the full search returns a
+//! The headline acceptance: the full search returns a
 //! feasible Plan in under 5 seconds of wall time, the Plan is structurally
 //! valid (all 32 decoder blocks assigned a dtype combo), and ranks better
 //! than the all-bf16 baseline.

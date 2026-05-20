@@ -11,7 +11,7 @@
 //! stage boundaries).
 //!
 //! Determinism: same Plan + IR → byte-identical `Topology`. The artifact
-//! hashing path (`Plan::content_hash` in Phase A Step 6) depends on this.
+//! hashing path (`Plan::content_hash`) depends on this.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,8 @@ use skein_ir::types::Dtype;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Topology {
     pub collectives: Vec<TopologyEntry>,
-    /// Inter-pool KV transfer. `None` in Phase A (no P/D disaggregation);
-    /// Phase B fills this in when `Plan::disaggregation` is `Some(...)`.
+    /// Inter-pool KV transfer. `None` when there is no prefill/decode
+    /// disaggregation; populated when `Plan::disaggregation` is `Some(...)`.
     pub kv_transfer: Option<KvTransferProtocol>,
 }
 
@@ -43,7 +43,7 @@ pub struct TopologyEntry {
     pub after_node: String,
 }
 
-/// Inter-pool KV transfer for P/D disaggregation. Phase B.
+/// Inter-pool KV transfer for prefill/decode disaggregation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KvTransferProtocol {
@@ -81,10 +81,10 @@ pub fn emit_topology(plan: &Plan, _cluster: &Cluster, ir: &Graph) -> Topology {
         if placement.pp > 1 && stage > 0 {
             let first_on_stage = first_block_on_stage(stage, num_blocks, placement.pp);
             if block == first_on_stage {
-                // Pair the tp/ep coords across PP groups. For Phase A the
-                // simplest representation: one Send/Recv per (tp_idx, ep_idx)
-                // pair, enumerating every member of the PP group. We emit
-                // one TopologyEntry covering the canonical group leaders.
+                // Pair the tp/ep coords across PP groups: one Send/Recv per
+                // (tp_idx, ep_idx) pair, enumerating every member of the PP
+                // group. We emit one TopologyEntry covering the canonical
+                // group leaders.
                 let prev_leader = (stage - 1) * placement.tp * placement.ep;
                 let curr_leader = stage * placement.tp * placement.ep;
                 collectives.push(TopologyEntry {

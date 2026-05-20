@@ -1,13 +1,13 @@
 //! `HFReference` — the upstream "ground truth" forward pass.
 //!
-//! Phase A ships `MockReference` (reads pre-recorded activations from a
-//! JSON fixture). `PythonSubprocessReference` carries the subprocess
-//! configuration and validated reference dtype; Prompt 2 wires its
-//! `transformers` subprocess execution.
+//! [`PythonSubprocessReference`] drives a `transformers` subprocess: it
+//! carries the subprocess configuration and a validated reference dtype,
+//! caches outputs per token sequence, and executes the forward pass over a
+//! JSON-lines protocol on stdin/stdout.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,8 +24,8 @@ pub struct ReferenceOutput {
     pub final_logits: Vec<f32>,
 }
 
-/// Upstream reference. Phase A's `MockReference` reads fixtures; Phase B's
-/// `PythonSubprocessReference` invokes `transformers`.
+/// Upstream reference. [`PythonSubprocessReference`] invokes `transformers`
+/// to produce ground-truth activations and logits.
 pub trait HFReference: Send + Sync {
     fn forward_with_hooks(&self, tokens: &[u32]) -> Result<ReferenceOutput, ParityError>;
     fn forward_batch_with_hooks(
@@ -41,94 +41,7 @@ pub trait HFReference: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// MockReference — Phase A scaffolding.
-// ---------------------------------------------------------------------------
-
-/// Phase A reference. Carries a `HashMap<Vec<u32>, ReferenceOutput>` keyed
-/// by tokens; `forward_with_hooks` is a lookup. Tokenization is BLAKE3-
-/// based — deterministic, reproducible across machines, no model required.
-///
-/// **Not for production.** This exists purely to exercise the verification
-/// flow end-to-end on Mac.
-#[derive(Debug, Clone)]
-pub struct MockReference {
-    entries: HashMap<Vec<u32>, ReferenceOutput>,
-}
-
-impl MockReference {
-    /// Construct from an in-memory token→output map. Useful for tests that
-    /// want to control the activations directly.
-    pub fn from_entries(entries: HashMap<Vec<u32>, ReferenceOutput>) -> Self {
-        Self { entries }
-    }
-
-    /// Load from a JSON fixture file. The file's shape is
-    /// `{"entries": [{"tokens": [...], "output": {...}}, ...]}`.
-    pub fn from_json_file(path: &Path) -> Result<Self, ParityError> {
-        let bytes = std::fs::read(path).map_err(|source| ParityError::FixtureIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let raw: FixtureFile =
-            serde_json::from_slice(&bytes).map_err(|source| ParityError::FixtureParse {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let entries = raw
-            .entries
-            .into_iter()
-            .map(|e| (e.tokens, e.output))
-            .collect();
-        Ok(Self { entries })
-    }
-
-    /// Internal accessor — used by `PhaseAStub` to derive its drift-injected
-    /// output from the reference's activations.
-    pub(crate) fn lookup(&self, tokens: &[u32]) -> Result<ReferenceOutput, ParityError> {
-        self.entries
-            .get(tokens)
-            .cloned()
-            .ok_or(ParityError::NoFixtureMatch {
-                tokens: tokens.to_vec(),
-            })
-    }
-}
-
-impl HFReference for MockReference {
-    fn forward_with_hooks(&self, tokens: &[u32]) -> Result<ReferenceOutput, ParityError> {
-        self.lookup(tokens)
-    }
-
-    fn tokenize(&self, prompt: &str) -> Result<Vec<u32>, ParityError> {
-        // BLAKE3 → first four u32 words. Mod a fake "vocab size" of 32_000
-        // so the tokens look plausible. Deterministic across hosts and
-        // architectures — that's what tests need.
-        let h = blake3::hash(prompt.as_bytes());
-        let bytes = h.as_bytes();
-        let mut tokens = Vec::with_capacity(4);
-        for i in 0..4 {
-            let chunk = &bytes[i * 4..i * 4 + 4];
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(chunk);
-            tokens.push(u32::from_le_bytes(buf) % 32_000);
-        }
-        Ok(tokens)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct FixtureFile {
-    entries: Vec<FixtureEntry>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct FixtureEntry {
-    tokens: Vec<u32>,
-    output: ReferenceOutput,
-}
-
-// ---------------------------------------------------------------------------
-// PythonSubprocessReference — real reference configuration.
+// PythonSubprocessReference — `transformers` ground-truth reference.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

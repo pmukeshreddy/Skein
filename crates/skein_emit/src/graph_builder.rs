@@ -1,13 +1,13 @@
 //! Walks the IR for one device, declaring a `luminal::GraphTensor` per
 //! parameter the device owns. The declared shapes already reflect the
-//! Plan's TP/EP sharding — Luminal's compile pass (Phase B) operates on
-//! these shapes and does not need to know about Skein's sharding logic.
+//! Plan's TP/EP sharding — Luminal's compile pass operates on these shapes
+//! and does not need to know about Skein's sharding logic.
 //!
-//! Phase A scope: declare every weight tensor with the right sharded shape
-//! and dtype. We do not wire op edges (matmul, residual adds, etc.) yet —
-//! that's `skein_emit`'s Phase B extension, when `skein_compile` actually
-//! invokes `cx.build_search_space()` and the graph needs to be semantically
-//! complete. The Phase A test surface is "tensor shape matches the plan."
+//! This module owns the weight-declaration half of lowering (every weight
+//! tensor declared with the right sharded shape and dtype). The op edges —
+//! matmuls, residual adds, the per-block forward chain — are wired by
+//! [`crate::op_wiring`], which `build_device_graph` drives to produce the
+//! complete per-segment graphs.
 
 use luminal::prelude::{DType, NodeIndex};
 
@@ -25,8 +25,7 @@ use crate::shard_role::ShardRole;
 /// the segmentation algorithm.
 ///
 /// For `tp = ep = pp = 1` this collapses to one segment and zero
-/// collectives — the whole forward pass in a single Luminal graph,
-/// structurally equivalent to the Phase 1a `LoweredGraph`.
+/// collectives — the whole forward pass in a single Luminal graph.
 pub struct LoweredGraph {
     pub segments: Vec<crate::segment::Segment>,
     pub sequencing: Vec<crate::segment::SequenceStep>,

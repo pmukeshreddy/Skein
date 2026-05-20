@@ -1,6 +1,6 @@
 //! `RuntimeError` — one `thiserror` enum across kv / batcher / hotswap /
-//! observability / server. CUDA-specific helper modules keep explicit
-//! unavailable-path variants so direct misuse remains visible.
+//! observability / server. The CUDA helper modules surface `NotImplemented`
+//! for backends that are not yet wired so misuse stays visible.
 
 use std::path::PathBuf;
 
@@ -86,15 +86,6 @@ pub enum RuntimeError {
     #[error("server forward worker failed to initialize: {0}")]
     ServerInit(String),
 
-    #[error(
-        "{what} requires the Phase B CUDA build (rebuild with `--features \
-         cuda` on an H100 host); Mac/Phase A cannot run this code path"
-    )]
-    RequiresCuda { what: &'static str },
-
-    #[error(
-        "{what} is a Phase B implementation: the structure is in place but \
-         the real implementation lands in Phase B Step 11"
-    )]
-    PhaseBOnly { what: &'static str },
+    #[error("{what} is not yet implemented")]
+    NotImplemented { what: &'static str },
 }

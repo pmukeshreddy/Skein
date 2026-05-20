@@ -25,7 +25,7 @@ fn enumeration_size_bounded() {
     println!("raw = {raw}, survivors = {survivors}");
 
     // Sanity bound: the outer space stays under 10k entries on the
-    // canonical 2× H100 Mixtral setup after the Phase A enumeration prune
+    // canonical 2× H100 Mixtral setup after the enumeration prune
     // (see docs/search_algorithms.md). A regression past this would
     // immediately push extract_plan past its 5 s wall-time budget.
     assert!(raw <= 10_000, "raw enumeration too large: {raw}");

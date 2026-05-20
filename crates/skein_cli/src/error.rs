@@ -8,11 +8,12 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    /// A Phase B subcommand invoked on a Phase A (non-CUDA) build.
-    /// `what` names the subcommand, `reason` explains why CUDA is needed,
-    /// and `suggested_fix` gives the exact rebuild + invocation command.
+    /// A CUDA-only subcommand invoked on a CPU (`--no-default-features`)
+    /// build. `what` names the subcommand, `reason` explains why CUDA is
+    /// needed, and `suggested_fix` gives the exact rebuild + invocation
+    /// command.
     #[error(
-        "{what} requires the Phase B CUDA build.\n\
+        "{what} requires a CUDA build.\n\
          reason: {reason}\n\
          suggested fix: {suggested_fix}"
     )]
@@ -22,13 +23,12 @@ pub enum CliError {
         suggested_fix: &'static str,
     },
 
-    /// A Phase B subcommand invoked on a CUDA build before its Phase B
-    /// implementation has landed. The CUDA toolchain is present; the
-    /// subcommand just isn't wired yet.
-    #[error("{what} is not yet implemented (tracked: {tracking})")]
-    PhaseBOnly {
+    /// A subcommand whose implementation has not yet landed. `what` names the
+    /// subcommand and `detail` describes what is still missing.
+    #[error("{what} is not yet implemented: {detail}")]
+    NotImplemented {
         what: &'static str,
-        tracking: &'static str,
+        detail: &'static str,
     },
 
     /// User-visible argument-level failure.

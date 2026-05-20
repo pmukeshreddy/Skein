@@ -92,13 +92,13 @@ pub fn enumerate_kv_layouts() -> Vec<(KVLayout, bool)> {
 }
 
 pub fn enumerate_batch_policies() -> Vec<BatchPolicy> {
-    // Phase A prune: keep `Continuous(M)` for the standard `M` ladder, plus
-    // one representative `ContinuousChunked(M, 1024)` per `M`. The remaining
-    // chunk-size variants (256, 512, 2048) don't change Phase A's decode-step
-    // cost ranking — they affect prefill / mixed-batch scheduling, which the
-    // Phase B cost model will reintroduce. `Static` is dropped: decoder
-    // serving uses continuous batching as the default; static batching is a
-    // Phase B option once the runtime can prove it's safe.
+    // Prune: keep `Continuous(M)` for the standard `M` ladder, plus one
+    // representative `ContinuousChunked(M, 1024)` per `M`. The remaining
+    // chunk-size variants (256, 512, 2048) don't change the decode-step cost
+    // ranking — they affect prefill / mixed-batch scheduling.
+    // TODO(chunk-size-search): reintroduce them once the cost model accounts
+    // for prefill/mixed-batch scheduling. `Static` is dropped: decoder
+    // serving uses continuous batching as the default.
     let mut out = Vec::new();
     for m in [1u32, 2, 4, 8, 16, 32, 64] {
         out.push(BatchPolicy::Continuous { max_batch: m });
@@ -135,10 +135,10 @@ pub fn enumerate_spec_decode_configs() -> Vec<SpecDecodeConfig> {
 }
 
 pub fn enumerate_prefix_cache_configs() -> Vec<PrefixCacheConfig> {
-    // Phase A: cost-neutral in the analytic model, so only the enabled
-    // variant ships (the runtime always benefits from prefix caching). The
-    // policy axis (LRU vs LFU) re-enters in Phase B once the cost model
-    // accounts for hit rate.
+    // Prefix caching is cost-neutral in the analytic model, so only the
+    // enabled variant ships (the runtime always benefits from it).
+    // TODO(prefix-policy): re-introduce the LRU-vs-LFU policy axis once the
+    // cost model accounts for cache hit rate.
     vec![PrefixCacheConfig {
         enable: true,
         reuse_policy: RadixReusePolicy::LruByLastAccess,

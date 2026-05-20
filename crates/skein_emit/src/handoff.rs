@@ -3,17 +3,16 @@
 //! Two responsibilities:
 //!
 //! - **Naming.** Every cross-segment tensor has a single canonical
-//!   `logical_name`. These names are how the runtime (Prompt 2) routes
-//!   buffers between segments and collectives — get them wrong and the
-//!   runtime feeds the wrong data into the wrong segment.
+//!   `logical_name`. These names are how the runtime routes buffers between
+//!   segments and collectives — get them wrong and the runtime feeds the
+//!   wrong data into the wrong segment.
 //! - **Schedule.** Per-device list of [`CollectivePoint`]s, derived
 //!   from `(Plan, IR)` without going through cluster-wide
 //!   `emit_topology`. This is per-device by construction: every device
 //!   participating in the plan sees the same number of collectives per
-//!   block, regardless of which TP/EP shard it sits in. Phase A's
-//!   `emit_topology` emits only one representative group per stage; the
-//!   runtime needs the full per-device view, and this is where we
-//!   compute it.
+//!   block, regardless of which TP/EP shard it sits in. `emit_topology`
+//!   emits only one representative group per stage; the runtime needs the
+//!   full per-device view, and this is where we compute it.
 
 use skein_cost::collectives::CollectiveKind;
 use skein_ir::ir::{Graph, LayerKind};

@@ -11,9 +11,9 @@
 //!   state. Approximated by four hidden buffers (`batch × seq × hidden`).
 //!
 //! When the per-device peak exceeds the device cap, the overshoot is scaled
-//! by `overshoot_us_per_gb` and added as a huge synthetic time penalty.
-//! That makes memory fit a hard constraint via cost, keeping the cost model
-//! itself purely additive.
+//! by `overshoot_us_per_gb` and added as a large penalty term. That turns
+//! the memory-fit hard constraint into a cost, keeping the cost model itself
+//! purely additive.
 
 use skein_ir::ir::{Graph, LayerKind};
 use skein_ir::plan::Plan;

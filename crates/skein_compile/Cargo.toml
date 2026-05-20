@@ -6,10 +6,13 @@ rust-version = { workspace = true }
 license      = { workspace = true }
 
 [features]
+# Library default is empty so `--no-default-features` at the workspace/binary
+# level genuinely yields a CPU build. The production GPU default is set on the
+# `skein_cli` binary, which forwards `cuda` to this crate.
 default = []
-# Phase B CUDA build. Pulls in `luminal_cuda_lite` so `CudaComputeRuntime`
-# becomes available; without this feature the type doesn't exist and the
-# Mac/CPU `NativeComputeRuntime` is the only `ComputeRuntime` impl.
+# Production CUDA build. Pulls in `luminal_cuda_lite` so `CudaComputeRuntime`
+# becomes available; without this feature the CPU `NativeComputeRuntime` is
+# the only `ComputeRuntime` impl (used by CI and GPU-less development).
 cuda = ["dep:luminal_cuda_lite"]
 
 [lib]

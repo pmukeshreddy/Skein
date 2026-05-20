@@ -12,7 +12,7 @@
 //! across segments and emitting the right NCCL call in between.
 //!
 //! For tp=1 ep=1 pp=1 there are zero collective points, so each device
-//! has exactly one segment — identical to the 1a single-graph behavior.
+//! has exactly one segment containing the whole forward pass.
 //!
 //! ## Handoff
 //!
@@ -50,9 +50,8 @@ use crate::graph_builder::DeclaredTensor;
 /// `graph` is a complete `luminal::Graph`: `cx.build_search_space::<R>()`
 /// and `cx.search()` run on it independently of any other segment.
 /// `input_handoff` / `output_handoff` describe the data flow at the
-/// segment's boundaries; `declared` and `op_nodes` mirror the same
-/// metadata Phase 1a's single-graph `LoweredGraph` exposed, but
-/// scoped to this segment.
+/// segment's boundaries; `declared` and `op_nodes` carry the same per-tensor
+/// metadata the `LoweredGraph` exposes, scoped to this segment.
 pub struct Segment {
     pub idx: usize,
     pub graph: LuminalGraph,

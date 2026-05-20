@@ -87,7 +87,7 @@ fn radix_refcount_correctness() {
 
     // Release the third. The shared pages drop to refcount==0; with
     // prefix-cache on they go to cached_lru but the radix still maps
-    // them (until eviction). For Phase A the assertion we *can* make
+    // them (until eviction). The assertion we *can* make
     // cleanly: after the third release `in_use_pages` is zero.
     allocator.release(reqs[2].0).unwrap();
     assert_eq!(allocator.in_use_pages(), 0);

@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use skein_compile::{DynRuntime, DynRuntimeError};
 use skein_cost::collectives::CollectiveKind;
 use skein_runtime::{
-    CollectiveBackend, DispatchOutcome, EagerDispatcher, KernelDispatcher, MockCollective,
+    CollectiveBackend, DispatchOutcome, EagerDispatcher, InProcessCollective, KernelDispatcher,
     StepBatch,
 };
 
 #[test]
-fn mock_collective_ring_allreduce() {
+fn in_process_collective_ring_allreduce() {
     let mut runtimes = vec![
         MapRuntime::new("x", vec![1.0, 2.0, 3.0]),
         MapRuntime::new("x", vec![2.0, 3.0, 4.0]),
@@ -19,7 +19,7 @@ fn mock_collective_ring_allreduce() {
         .iter_mut()
         .map(|r| r as &mut dyn DynRuntime)
         .collect::<Vec<_>>();
-    MockCollective::new(4)
+    InProcessCollective::new(4)
         .execute(
             CollectiveKind::RingAllReduce,
             &[0, 1, 2, 3],
@@ -33,7 +33,7 @@ fn mock_collective_ring_allreduce() {
 }
 
 #[test]
-fn mock_collective_allgather() {
+fn in_process_collective_allgather() {
     let mut runtimes = vec![
         MapRuntime::new("x", vec![1.0, 2.0, 3.0]),
         MapRuntime::new("x", vec![4.0, 5.0, 6.0]),
@@ -42,7 +42,7 @@ fn mock_collective_allgather() {
         .iter_mut()
         .map(|r| r as &mut dyn DynRuntime)
         .collect::<Vec<_>>();
-    MockCollective::new(2)
+    InProcessCollective::new(2)
         .execute(CollectiveKind::AllGather, &[0, 1], "x", refs.as_mut_slice())
         .unwrap();
     for rt in runtimes {
@@ -54,7 +54,7 @@ fn mock_collective_allgather() {
 }
 
 #[test]
-fn mock_collective_alltoall() {
+fn in_process_collective_alltoall() {
     let mut runtimes = [
         MapRuntime::new("x", vec![1.0, 2.0, 3.0, 4.0]),
         MapRuntime::new("x", vec![5.0, 6.0, 7.0, 8.0]),
@@ -63,7 +63,7 @@ fn mock_collective_alltoall() {
         .iter_mut()
         .map(|r| r as &mut dyn DynRuntime)
         .collect::<Vec<_>>();
-    MockCollective::new(2)
+    InProcessCollective::new(2)
         .execute(CollectiveKind::AllToAll, &[0, 1], "x", refs.as_mut_slice())
         .unwrap();
     assert_eq!(

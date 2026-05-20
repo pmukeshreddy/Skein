@@ -6,8 +6,8 @@ use crate::types::RequestId;
 pub struct StepMetrics {
     pub step_idx: u64,
     pub compute_us: f64,
-    /// Phase B: real NCCL/comm time. Phase A: always 0 — the forward-pass
-    /// driver isn't running, so no comm happens.
+    /// NCCL/comm time per step. Zero on the CPU build (no GPU interconnect);
+    /// populated on the CUDA build.
     pub comm_us: f64,
     pub kv_pages_in_use: u32,
     pub batch_size: u32,

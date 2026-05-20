@@ -3,7 +3,7 @@
 //! Drives `op_wiring::wire_attention_math` directly with F32 weights and a
 //! controlled F32 input, compiles via Luminal's `NativeRuntime`, executes,
 //! and compares to a hand-computed reference. Math is inlined in Rust below
-//! (no synthetic fixture, no PyTorch import — see Rule 3).
+//! (math inlined in Rust — no external reference fixture).
 //!
 //! Config:
 //!   batch = 1, seq = 2, hidden = 4, num_attention_heads = 1,
@@ -33,7 +33,7 @@ use skein_emit::op_wiring::wire_attention_math;
 use skein_ir::ir::ModelMeta;
 
 /// Build a `ModelMeta` shaped for the tiny attention block under test. The
-/// non-attention fields are minimal placeholders — `wire_attention_math`
+/// non-attention fields are minimal — `wire_attention_math`
 /// reads only the heads / head_dim / hidden trio.
 fn meta_for_tiny_attention() -> ModelMeta {
     ModelMeta {

@@ -27,9 +27,9 @@ Five subsystems compose into the `Server`:
                           └────────────────┘
 ```
 
-Phase B keeps the original runtime surfaces and adds a real Mac-serving
-path: `Server::serve` now runs an axum completion endpoint backed by the
-shared topology executor and native in-process runtime pieces.
+`Server::serve` runs an axum completion endpoint backed by the shared
+topology executor and the in-process runtime pieces; the CUDA build swaps in
+the GPU compute runtime and CUDA-specific modules behind the same surfaces.
 
 ## Paged KV with refcount + LRU eviction
 
@@ -146,7 +146,7 @@ T = 2     LATEST -> new_artifact   (rename absorbed LATEST.new.123)
 |---------------------------------------|-----------|-------------------------------------------|
 | `skein_steps_total`                   | counter   | Forward steps executed                    |
 | `skein_step_compute_us_total`         | counter   | Cumulative compute time, microseconds     |
-| `skein_step_comm_us_total`            | counter   | Cumulative comm time (0 in Phase A)       |
+| `skein_step_comm_us_total`            | counter   | Cumulative comm time (0 on the CPU build) |
 | `skein_kv_pages_in_use`               | gauge     | Live KV pages                             |
 | `skein_batch_size_histogram`          | histogram | Per-step batch size distribution          |
 | `skein_requests_total{status}`        | counter   | Requests completed by status              |
@@ -159,63 +159,63 @@ binds the configured port; `serve_metrics_ephemeral` binds `:0` and
 returns the kernel-assigned port (used by tests).
 
 Trace emission uses `tracing::info_span!` so spans appear under any
-installed `tracing-subscriber`. The full OpenTelemetry-OTLP exporter
-wiring lands in Phase B Step 11.
+installed `tracing-subscriber`.
+TODO(otlp): wire the full OpenTelemetry-OTLP exporter.
 
-## Phase A vs Phase B feature matrix
+## CPU vs CUDA build
 
-| Concern                                | Phase A (Mac) | Phase B (`--features cuda`)         |
-|----------------------------------------|---------------|--------------------------------------|
-| `PagedKVAllocator` + `RadixPrefixTree` | ✅            | ✅                                  |
-| `ContinuousBatcher` (admission, queue, retire, chunking) | ✅ | ✅                       |
-| `HotSwap` (drain + atomic symlink swap) | ✅            | ✅                                  |
-| `ProfileHooks` + Prometheus exporter   | ✅            | ✅                                  |
-| `Server::new` + `submit`               | ✅            | ✅                                  |
-| `Server::serve` forward-pass driver    | ✅ axum + native worker | ✅ CUDA/NCCL composition |
-| NCCL between graph runs                | gated         | ✅                                  |
-| CUDA Graphs capture + dispatch         | gated         | ✅                                  |
-| RDMA for P/D KV handoff                | gated         | ✅                                  |
-| OpenTelemetry-OTLP exporter            | tracing spans only | ✅ (Phase B)                   |
+| Concern                                | CPU build (`--no-default-features`) | CUDA build (default)         |
+|----------------------------------------|-------------------------------------|------------------------------|
+| `PagedKVAllocator` + `RadixPrefixTree` | ✅                                  | ✅                          |
+| `ContinuousBatcher` (admission, queue, retire, chunking) | ✅                | ✅                          |
+| `HotSwap` (drain + atomic symlink swap) | ✅                                 | ✅                          |
+| `ProfileHooks` + Prometheus exporter   | ✅                                  | ✅                          |
+| `Server::new` + `submit`               | ✅                                  | ✅                          |
+| `Server::serve` forward-pass driver    | ✅ axum + in-process worker         | ✅ CUDA/NCCL composition    |
+| NCCL between graph runs                 | n/a                                 | ✅                          |
+| CUDA Graphs capture + dispatch         | eager dispatch                      | ✅                          |
+| RDMA for prefill/decode KV handoff     | local copy                          | ✅                          |
+| OpenTelemetry-OTLP exporter            | tracing spans only                  | tracing spans only (TODO)   |
 
 Everything under `src/cuda/` lives behind `#[cfg(feature = "cuda")]`; the
-non-CUDA build never compiles it. The Mac serving composition uses the same
-executor contract as CUDA serving, with native segment execution and
+CPU build never compiles it. The CPU serving composition uses the same
+executor contract as the CUDA path, with native segment execution and
 in-process collective math.
 
-## Prompt-2 Runtime Abstractions
+## Runtime abstractions
 
-Prompt 2 adds three runtime-facing abstractions:
+Three runtime-facing abstractions decouple the serving loop from the backend:
 
-| Abstraction | Mac composition | H100 composition |
+| Abstraction | CPU build | CUDA build |
 |---|---|---|
 | `CollectiveBackend` | In-process collective math over runtime tensors | NCCL-backed collectives |
 | `KernelDispatcher` | Eager segment execution | CUDA Graph capture/dispatch |
-| `KvTransport` | Local in-process page copy | RDMA transfer for P/D disaggregation |
+| `KvTransport` | Local in-process page copy | RDMA transfer for prefill/decode disaggregation |
 
-`MockCollective` is not a skip or a fake success path. It reads the named
-tensor from every participant, performs the collective math in Rust, and
-writes the correct per-rank result back. `RingAllReduce` sums
+`InProcessCollective` is not a skip or a fake success path. It reads the
+named tensor from every participant, performs the collective math in Rust,
+and writes the correct per-rank result back. `RingAllReduce` sums
 element-wise, `AllGather` concatenates shards, `ReduceScatter` sums then
 splits, and `AllToAll` redistributes equal rank chunks.
 
-`EagerDispatcher` is the production-shape non-CUDA dispatcher: warmup is a
-no-op, and dispatch calls `DynRuntime::execute_segment()` exactly once for
-the step. CUDA Graph capture can replace the dispatcher without changing the
-runtime segment API.
+`EagerDispatcher` is the production-shape CPU dispatcher: warmup is a no-op,
+and dispatch calls `DynRuntime::execute_segment()` exactly once for the step.
+The CUDA Graph dispatcher replaces it without changing the runtime segment
+API.
 
 `LocalKvTransport` gives the same transfer contract as RDMA for a
 single-process deployment. It validates the request shape and leaves actual
 page ownership with the KV allocator.
 
-The compile crate now also exposes a `DynRuntime` name-to-`NodeIndex` layer
-so collectives and dispatchers can address logical tensors without knowing
-the concrete `ComputeRuntime` type.
+The compile crate also exposes a `DynRuntime` name-to-`NodeIndex` layer so
+collectives and dispatchers can address logical tensors without knowing the
+concrete `ComputeRuntime` type.
 
 At the pinned Luminal rev, `luminal::Graph` is not `Send` or `Sync` because
 it owns non-thread-safe op trait objects. `DynRuntimeWrapper` therefore keeps
-graph execution single-threaded in Prompt 2a. If a later Luminal revision
-makes `Graph` thread-safe, the trait can regain `Send + Sync` without
-changing the logical tensor API.
+graph execution single-threaded. If a later Luminal revision makes `Graph`
+thread-safe, the trait can regain `Send + Sync` without changing the logical
+tensor API.
 
 ## Axum Server Path
 
@@ -227,6 +227,6 @@ already talking to the completion port.
 Because Luminal graphs are single-threaded at the pinned rev, axum state
 does not hold a `TopologyExecutor` directly. Instead, serve starts a forward
 worker thread, and that thread constructs the `SkeinArtifact`, native
-runtime segments, `MockCollective`, and `TopologyExecutor` locally. HTTP
+runtime segments, `InProcessCollective`, and `TopologyExecutor` locally. HTTP
 handlers tokenize/admit requests, send work to the worker, and stream SSE
 token events back to the client.

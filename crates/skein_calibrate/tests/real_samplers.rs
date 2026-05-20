@@ -1,4 +1,4 @@
-//! Real Mac sampler coverage.
+//! Real sampler coverage on the CPU `NativeComputeRuntime`.
 
 mod common;
 

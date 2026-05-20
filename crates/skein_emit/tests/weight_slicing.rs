@@ -1,9 +1,8 @@
-//! Test 7 — weight slicing byte ranges, with a synthetic safetensors fixture.
+//! Weight slicing byte ranges, exercised with a small in-test safetensors fixture.
 //!
-//! Generated data inside this test is the *only* place in skein_emit's tests
-//! where synthetic numbers appear. Their purpose is to exercise the slicing
-//! arithmetic — not to model real weights — and the scope is limited to the
-//! 4×4 fixture below.
+//! The data generated inside this test exists only to exercise the slicing
+//! arithmetic — it does not model real weights — and is limited to the small
+//! fixture below.
 
 mod common;
 
@@ -60,7 +59,7 @@ fn inner_axis_slice_byte_ranges_are_row_strided() {
 }
 
 #[test]
-fn write_weight_shard_end_to_end_with_synthetic_fixture() {
+fn write_weight_shard_end_to_end() {
     // Build a 4×4 i8 tensor with values 0..16 and serialize via safetensors.
     let source_dir = tempfile_dir("skein_emit_weight_test");
     let source_path = source_dir.join("weights.safetensors");

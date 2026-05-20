@@ -16,7 +16,7 @@ impl RequestId {
 }
 
 /// An incoming request as the runtime sees it. The token list has already
-/// been tokenized by the front door (Phase B's HTTP / gRPC server).
+/// been tokenized by the front door (the HTTP / gRPC server).
 #[derive(Debug, Clone)]
 pub struct IncomingRequest {
     pub id: RequestId,
@@ -28,7 +28,8 @@ pub struct IncomingRequest {
 }
 
 /// One unit of output the runtime streams back to the front door. Currently
-/// just the token id; Phase B may attach top-k scores, finish reason, etc.
+/// just the token id.
+/// TODO(output-metadata): attach top-k scores, finish reason, etc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenOutput {
     pub token: u32,

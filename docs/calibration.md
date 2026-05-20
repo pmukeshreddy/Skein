@@ -8,11 +8,13 @@ Offline tool that produces two files from a real measurement run:
 - `models/<model>_drift.toml` — calibrated per-`(layer, component, dtype)`
   drift table the DP in `skein_extract` uses.
 
-Phase A shipped the data plumbing: corpus loader, statistical aggregation,
-deterministic TOML writers, the `CalibrationReport` audit struct. Phase B
-adds real samplers that produce `KernelMeasurement` and `DriftMeasurement`
-rows on Mac via `NativeComputeRuntime`, and on H100 via the CUDA runtime.
-Mac measurements are valid pipeline checks, not production constants.
+The pipeline has two halves: the data plumbing (corpus loader, statistical
+aggregation, deterministic TOML writers, the `CalibrationReport` audit
+struct) and the samplers that produce `KernelMeasurement` and
+`DriftMeasurement` rows. The samplers are generic over the compute runtime:
+the CPU `NativeComputeRuntime` yields valid pipeline checks (not production
+constants), while `CudaComputeRuntime` on the target GPU yields the
+production numbers.
 
 ## Calibration philosophy
 
@@ -86,10 +88,10 @@ Determinism is part of the contract: same `(trace, n, strategy, seed)` →
 byte-identical sampled list. Drift calibration depends on this so
 re-runs don't introduce noise the parity gate then chases.
 
-**Prompt file location.** The Mixtral corpus still carries a
-`workload_trace_path` field for compatibility. The CLI can override it with
-`--drift-prompts-path`; if the shipped Mixtral corpus points at the old
-ShareGPT placeholder, the CLI substitutes the bundled public dev corpus.
+**Prompt file location.** The Mixtral corpus carries a `workload_trace_path`
+field. The CLI can override it with `--drift-prompts-path`; if the corpus
+points at the (non-bundled) ShareGPT trace, the CLI substitutes the bundled
+public-domain prompt corpus.
 
 **When to re-sample.** Drift behaviour is input-distribution-sensitive
 — a model that quantizes cleanly on short chat prompts can drift
@@ -140,8 +142,8 @@ The writer must leave `[efficiency.attention]` and
 
 - Re-running calibration with a partial corpus would *delete* prior
   measurements, regressing the DP's quality.
-- The on-disk file would contain zeros or default-derived placeholders
-  for cells that have known, calibrated values from a previous run.
+- The on-disk file would contain zeros or default-derived values for cells
+  that already have known, calibrated values from a previous run.
 
 The cost-constants writer reads `base: &CostConstants` and overlays
 fitted values from a `HashMap<(OpKind, Dtype), f64>`. Sections /
@@ -185,20 +187,20 @@ Byte stability matters because both files feed the content-addressed
 artifact hashing path. A calibration that drifts in formatting would
 inflate the cache invalidation rate without any actual change.
 
-## Phase A vs Phase B feature matrix
+## CPU vs CUDA build
 
-| Concern                                    | Phase A (Mac)             | Phase B (H100, `--features cuda`) |
-|--------------------------------------------|---------------------------|------------------------------------|
-| `CalibrationCorpus` loader + validation    | ✅                        | ✅                                |
-| `KernelMeasurement` / `DriftMeasurement`   | ✅                        | ✅                                |
-| `aggregate_kernel_measurements` (median)   | ✅                        | ✅                                |
-| `aggregate_drift_measurements` (p95)       | ✅                        | ✅                                |
-| `write_cost_constants` (preserve-unmeasured) | ✅                      | ✅                                |
-| `write_drift_table` (preserve-unmeasured)  | ✅                        | ✅                                |
-| `sampler::sample_kernel_runtimes`          | ✅ NativeRuntime timings  | ✅ CUDA timings                   |
-| `sampler::sample_drift`                    | ✅ Skein bf16 vs candidate | ✅ Skein bf16 vs candidate      |
-| Top-level `calibrate()`                    | ✅ non-production warning | ✅ production path               |
+| Concern                                    | CPU build (`--no-default-features`) | CUDA build (default)        |
+|--------------------------------------------|-------------------------------------|-----------------------------|
+| `CalibrationCorpus` loader + validation    | ✅                                  | ✅                          |
+| `KernelMeasurement` / `DriftMeasurement`   | ✅                                  | ✅                          |
+| `aggregate_kernel_measurements` (median)   | ✅                                  | ✅                          |
+| `aggregate_drift_measurements` (p95)       | ✅                                  | ✅                          |
+| `write_cost_constants` (preserve-unmeasured) | ✅                                | ✅                          |
+| `write_drift_table` (preserve-unmeasured)  | ✅                                  | ✅                          |
+| `sampler::sample_kernel_runtimes`          | ✅ NativeRuntime timings            | ✅ CUDA timings             |
+| `sampler::sample_drift`                    | ✅ Skein bf16 vs candidate          | ✅ Skein bf16 vs candidate  |
+| Top-level `calibrate()`                    | ✅ non-production warning            | ✅ production path           |
 
-`skein calibrate` on Mac prints a warning because CPU timings must not be
-committed as production constants. The value of the Mac path is exercising
-the same compile/execute/write flow before renting H100 time.
+`skein calibrate` on a CPU build prints a warning because CPU timings must
+not be committed as production constants. Its value is exercising the same
+compile/execute/write flow before renting GPU time.

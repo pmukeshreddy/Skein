@@ -1,4 +1,4 @@
-//! End-to-end Luminal compile tests on Mac via `NativeComputeRuntime`.
+//! End-to-end Luminal compile tests via the CPU `NativeComputeRuntime`.
 //!
 //! Test 1 — tiny matmul with hand-computed reference (validates the
 //!          ComputeRuntime trait + the full compile/execute round-trip).
@@ -123,7 +123,7 @@ fn search_budget_respected() {
 fn cuda_runtime_compiles() {
     // Compile-time only: reference `CudaComputeRuntime` so the type and its
     // `ComputeRuntime` impl are checked. Actual execution requires an H100;
-    // see Phase B Step N for the real GPU-execution test.
+    // The GPU-execution path runs the same code through `CudaComputeRuntime`.
     fn _check(
         segments: &mut [luminal::prelude::Graph],
         budget: usize,

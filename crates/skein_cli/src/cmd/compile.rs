@@ -1,4 +1,4 @@
-//! `skein compile` — full Mac-capable pipeline.
+//! `skein compile` — full extract → emit → compile → parity pipeline.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

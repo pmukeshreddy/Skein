@@ -43,9 +43,10 @@ further; on the canonical Mixtral 2× H100 setup the survivor count is
 ~50–200 (the exact figure is logged by `tracing::info!` at the end of every
 search and asserted in `enumeration.rs`'s test).
 
-**P/D disaggregation** is enumerated as a single value (`disaggregation =
-None`) in Phase A. The DriftTable, runtime, and transfer topology needed to
-score a true `(prefill, decode)` pair land in Phase B; pre-emitting the axis
+**Prefill/decode disaggregation** is currently enumerated as a single value
+(`disaggregation = None`). The DriftTable, runtime, and transfer topology
+needed to score a true `(prefill, decode)` pair are not yet wired (see
+`TODO(disaggregation)` in `skein_extract::candidate`); pre-emitting the axis
 now would only add dead Plan branches.
 
 ## Hard constraints
@@ -90,7 +91,7 @@ operations = num_blocks × (mem_buckets+1) × (drift_buckets+1) × combos
 
 With ~100 surviving outer candidates the total work is ~400M memory-bound
 floating-point comparisons. In practice the DP completes in ~3 s on a
-single Mac core; the end-to-end `extract_plan` budget is < 5 s.
+single CPU core; the end-to-end `extract_plan` budget is < 5 s.
 
 To tune for tighter Plans at the cost of search wall-time, raise
 `memory_buckets` and `drift_buckets` in `cluster/cost_constants.toml`.
@@ -132,8 +133,8 @@ table; the search picks the right point on it without tuning weights.
 ## Recalibration touch points
 
 - `cluster/cost_constants.toml` — peak FLOPS, efficiency, collective
-  bandwidth, launch overhead. Adjust on Phase B from real H100 measurements.
+  bandwidth, launch overhead. Recalibrate from real GPU measurements.
 - `models/<model>_drift.toml` — per-(layer, component, dtype) drift. The
-  Phase A file is a placeholder calibrated to relative ordering only; the
-  absolute numbers should be measured against the Skein-bf16 reference and
-  written back by `skein_calibrate` in Phase B.
+  shipped file is calibrated to relative ordering only; the absolute numbers
+  should be measured against the Skein-bf16 reference and written back by
+  `skein_calibrate` on the target GPU.

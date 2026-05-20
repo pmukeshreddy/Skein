@@ -55,9 +55,9 @@ weight / activation / KV choices (`bf16`, `fp16`, `fp8`, `int8`, `int4`)
 that feed cost, drift, and calibration tables.
 
 The external reference dtype answers a different question: what precision
-should the known-good external model use while validating Skein-bf16? Mac
-development can use `float32` for CPU-friendly GPT-2 checks; H100 integration
-usually uses `bfloat16` for Mixtral.
+should the known-good external model use while validating Skein-bf16? A
+CPU-only check can use `float32` for GPT-2; GPU integration usually uses
+`bfloat16` for Mixtral.
 
 ## Python subprocess protocol
 
@@ -100,12 +100,11 @@ device safetensors shard, and executes through
 executor inside its forward worker, so parity and live serving walk the same
 `SequenceStep` schedule.
 
-Mac workflow: use the tiny-artifact fixture for native Skein execution and
-Skein-bf16 parity. For the separate external verification workflow, install
-the reference requirements into a venv and use
-`PythonSubprocessReference::new("gpt2", "float32")`. H100 workflow: compile
-Mixtral through Skein at bf16 and the candidate dtype map, then compare those
-artifacts under the CUDA feature.
+For the external verification workflow, install the reference requirements
+into a venv and use `PythonSubprocessReference::new("gpt2", "float32")`. For
+the production parity gate, compile Mixtral through Skein at bf16 and at the
+candidate dtype map, then compare those two artifacts with
+`verify_skein_pair` (CUDA build on the target GPU).
 
 ## Drift-table update protocol — monotonic up
 
@@ -170,20 +169,19 @@ This is stable for logits in `[-1e6, 1e6]` (Skein's test bound). Tiny
 negative roundoff (e.g. `-1e-16`) is clamped to zero so callers never see
 `KL < 0`.
 
-## Phase A vs Phase B feature matrix
+## CPU vs CUDA build
 
-| Concern                              | Phase A (Mac)                                 | Phase B (H100, `--features cuda`) |
-|--------------------------------------|-----------------------------------------------|-----------------------------------|
-| `mse` / `kl_divergence` math         | ✅ pure f32/f64                                | ✅                                |
-| `ToleranceTable`                     | ✅ from `cost_constants.toml`                  | ✅                                |
-| `ParityReport` serde JSON            | ✅                                             | ✅                                |
-| `MockReference` (fixture loader)     | ✅                                             | ✅ (kept for unit tests)          |
-| `PhaseAStub` (drift simulator)       | ✅                                             | ✅ (kept for unit tests)          |
-| `PythonSubprocessReference::new`     | ✅ validates reference dtype + paths           | ✅                                |
-| `verify_reference.py` subprocess     | ✅ CPU/GPT-2 capable                           | ✅                                |
-| Real Skein forward via Luminal       | ✅ native tiny artifacts                       | ✅                                |
-| `drift_update` monotonic write       | ✅ (exercised against synthetic drift table)   | ✅                                |
+| Concern                              | CPU build (`--no-default-features`)  | CUDA build (default)              |
+|--------------------------------------|--------------------------------------|-----------------------------------|
+| `mse` / `kl_divergence` math         | ✅ pure f32/f64                       | ✅                                |
+| `ToleranceTable`                     | ✅ from `cost_constants.toml`         | ✅                                |
+| `ParityReport` serde JSON            | ✅                                    | ✅                                |
+| `PythonSubprocessReference::new`     | ✅ validates reference dtype + paths  | ✅                                |
+| `verify_reference.py` subprocess     | ✅ CPU/GPT-2 capable                  | ✅                                |
+| Real Skein forward via Luminal       | ✅ `NativeComputeRuntime`             | ✅ `CudaComputeRuntime`           |
+| `drift_update` monotonic write       | ✅                                    | ✅                                |
 
-New Prompt-2 code paths run real implementations on Mac where a native
-composition exists. CUDA-specific modules remain feature-gated; the Mac path
-does not fake CUDA-only hardware behavior.
+Both builds run real implementations. The CPU build uses
+`NativeComputeRuntime` + the in-process collective; the CUDA build adds the
+GPU compute runtime and CUDA-specific runtime modules. Neither build fakes
+hardware behavior.

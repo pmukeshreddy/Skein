@@ -1,8 +1,10 @@
 //! Runtime collective backends.
 //!
-//! `MockCollective` performs the same tensor transformations as the
+//! [`InProcessCollective`] performs the same tensor transformations as the
 //! distributed collective, but inside one process over `DynRuntime` tensor
-//! buffers. It is the Mac composition for Prompt 2.
+//! buffers. It is the execution backend for single-node serving and for
+//! CI/host runs without a GPU interconnect; the CUDA build adds an
+//! NCCL-backed collective for multi-GPU hosts.
 
 use skein_compile::{CollectiveExecutor, DynRuntime};
 use skein_cost::collectives::CollectiveKind;
@@ -38,17 +40,17 @@ pub enum CollectiveError {
     Runtime(#[from] skein_compile::DynRuntimeError),
 }
 
-pub struct MockCollective {
+pub struct InProcessCollective {
     num_devices: usize,
 }
 
-impl MockCollective {
+impl InProcessCollective {
     pub fn new(num_devices: usize) -> Self {
         Self { num_devices }
     }
 }
 
-impl CollectiveBackend for MockCollective {
+impl CollectiveBackend for InProcessCollective {
     fn execute(
         &self,
         kind: CollectiveKind,
@@ -124,7 +126,7 @@ impl CollectiveBackend for MockCollective {
     }
 }
 
-impl CollectiveExecutor for MockCollective {
+impl CollectiveExecutor for InProcessCollective {
     fn execute(
         &self,
         kind: CollectiveKind,

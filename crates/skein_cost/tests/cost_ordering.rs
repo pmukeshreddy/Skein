@@ -1,4 +1,4 @@
-//! Phase-A acceptance tests for `skein_cost`: the cost-function ordering
+//! Acceptance tests for `skein_cost`: the cost-function ordering
 //! invariants the search algorithm depends on.
 
 mod common;

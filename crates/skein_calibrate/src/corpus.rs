@@ -6,9 +6,9 @@
 //!   regardless of workload). Enumerated literally in TOML.
 //! - **Drift prompt source** — a reference to a JSONL trace file plus a
 //!   sampling configuration. Drift prompts are *not* enumerated in the
-//!   corpus (that would be synthetic data baked into a config file); the
-//!   Phase B drift sampler reads the trace and samples deterministically
-//!   via `prompt_sampling::sample_drift_prompts`.
+//!   corpus (that would bake fixed data into a config file); the drift
+//!   sampler reads the trace and samples deterministically via
+//!   `prompt_sampling::sample_drift_prompts`.
 //!
 //! The loader validates structure only — the trace file does not need to
 //! exist on the host parsing the corpus (it's user-provided at calibration

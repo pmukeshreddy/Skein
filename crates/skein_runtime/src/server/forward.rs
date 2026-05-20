@@ -18,7 +18,7 @@ use super::lifecycle::Server;
 use crate::error::RuntimeError;
 use crate::observability::metrics::RequestMetrics;
 use crate::types::{RequestId, TokenOutput};
-use crate::{MockCollective, observability};
+use crate::{InProcessCollective, observability};
 use skein_compile::{
     SkeinArtifact, TopologyExecutor, TopologyStepBatch, load_native_runtime_segments,
 };
@@ -65,7 +65,7 @@ impl ServerState {
                 let sequencing = artifact.sequencing.clone();
                 let runtimes =
                     load_native_runtime_segments(&artifact).map_err(|e| e.to_string())?;
-                let collectives = MockCollective::new(artifact.devices.len());
+                let collectives = InProcessCollective::new(artifact.devices.len());
                 Ok(WorkerState {
                     runtimes,
                     collectives,
@@ -104,7 +104,7 @@ impl ServerState {
 
 struct WorkerState {
     runtimes: Vec<Vec<skein_compile::RuntimeSegment>>,
-    collectives: MockCollective,
+    collectives: InProcessCollective,
     sequencing: Vec<skein_emit::SequenceStep>,
     vocab: u32,
 }

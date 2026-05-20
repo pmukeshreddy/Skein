@@ -1,16 +1,13 @@
 //! Op wiring + multi-segment lowering.
 //!
-//! ## Phase 1b scope
+//! Lowers a device's forward pass into `Vec<Segment>` + `Vec<SequenceStep>`,
+//! driven by [`crate::handoff::device_collective_points`]. Every collective
+//! the device participates in becomes a segment boundary; the segments on
+//! either side carry the matching [`HandoffTensor`] entries so the runtime
+//! can route buffers across them.
 //!
-//! Produces `Vec<Segment>` + `Vec<SequenceStep>` driven by
-//! [`crate::handoff::device_collective_points`]. Every collective the
-//! device participates in becomes a segment boundary; the segments on
-//! either side carry the matching [`HandoffTensor`] entries so the
-//! runtime (Prompt 2) can route buffers across them.
-//!
-//! `tp = ep = pp = 1` produces exactly one segment per device, byte-
-//! equivalent to the Phase 1a single-graph behavior modulo the wrapping
-//! type change.
+//! `tp = ep = pp = 1` produces exactly one segment per device containing the
+//! whole forward pass.
 //!
 //! ## Per-block wiring at tp=2 ep=1
 //!
@@ -40,18 +37,28 @@
 //! - `carry_post_attn_block_N` — the post-attn residual sum, needed for
 //!   the residual after `block_N_ffn_out`.
 //!
-//! ## Known 1a gaps still deferred
+//! ## Deferred lowering (TODO)
 //!
-//! RoPE, causal mask, and top-k routing are still absent (see the 1a
-//! gap inventory in `docs/luminal_integration.md`). 1b is purely the
-//! structural restructure — the per-segment op set inside each segment
-//! is the same simplified Mixtral as 1a.
+//! The structural lowering — segment boundaries, collective ordering,
+//! handoff naming, weight sharding — is complete and tested. The following
+//! per-op semantics are intentionally not yet lowered; each needs work that
+//! is best validated against a GPU reference (see `docs/lowering.md`):
 //!
-//! For `ep > 1`, dispatch/combine collectives produce structurally-
-//! valid placeholder handoff tensors via `ShapeTracker` re-views — the
-//! segment count and handoff naming are correct, but the semantic
-//! ep-aware token routing is deferred to the prompt that wires real
-//! top-k expert routing.
+//! - **TODO(rope):** rotary position embeddings on Q/K. Requires plumbing a
+//!   position-id input through segment 0 and the IO manifest, then applying
+//!   the rotation in [`wire_attention_math`].
+//! - **TODO(causal-mask):** additive causal mask before the attention
+//!   softmax. A no-op for the current static `seq = 1` decode-mode lowering
+//!   (a single query attends to all cached keys); required once prefill
+//!   (`seq > 1`) graphs are emitted.
+//! - **TODO(moe-topk):** top-k expert sparsification. [`DeviceWiring::wire_block_moe`]
+//!   currently computes a *dense* mixture (every owned expert weighted by its
+//!   full-softmax gate probability). Mixtral routes to the top-k experts and
+//!   renormalizes their gate weights.
+//! - **TODO(ep-routing):** expert-parallel token routing. At `ep > 1` the
+//!   dispatch/combine collectives are wired with the correct shapes and
+//!   handoff names via [`DeviceWiring::reshape_for_handoff`], but the actual
+//!   per-token scatter to / gather from remote experts is not yet emitted.
 
 use std::collections::HashMap;
 
@@ -61,10 +68,8 @@ use luminal::prelude::{
 };
 
 use skein_cost::Cluster;
-use skein_cost::collectives::CollectiveKind;
 use skein_ir::ir::{Graph, LayerKind, ModelMeta, Param};
 use skein_ir::plan::Plan;
-use skein_ir::types::Dim;
 
 use crate::error::EmitError;
 use crate::graph_builder::{DeclaredTensor, shard_param_dims, to_luminal_dtype};
@@ -85,8 +90,7 @@ use crate::shard_role::{ShardRole, shard_role_for_param};
 /// `N + 1` segments and `2N + 1` sequencing steps.
 ///
 /// For `tp = ep = pp = 1` returns exactly one segment per device,
-/// containing the whole forward pass — structurally equivalent to
-/// Phase 1a.
+/// containing the whole forward pass.
 pub fn wire_segments(
     plan: &Plan,
     cluster: &Cluster,
@@ -419,10 +423,11 @@ impl<'a> DeviceWiring<'a> {
                 .next()
                 .expect("ep dispatch point not present in iter");
             assert_eq!(point.tensor, collective_moe_dispatch(block));
-            // Placeholder: produce a tensor with `point.shape` from `hidden`
-            // via shape re-view (see file docstring). Wire compiles; the
-            // semantic ep-routing is the deferred sub-prompt.
-            let dispatch_tensor = self.placeholder_reshape(hidden, &point.shape);
+            // Structural handoff only: re-view `hidden` to the dispatch
+            // collective's shape so the segment graph is complete and the
+            // collective has a typed input. TODO(ep-routing): emit the real
+            // per-token scatter to remote experts (see module docstring).
+            let dispatch_tensor = self.reshape_for_handoff(hidden, &point.shape);
             self.live.insert(
                 point.tensor.clone(),
                 LiveTensor {
@@ -507,9 +512,10 @@ impl<'a> DeviceWiring<'a> {
                 .next()
                 .expect("ep combine point not present in iter");
             assert_eq!(point.tensor, collective_moe_combine(block));
-            // Same placeholder pattern as dispatch — re-view ffn_out into
+            // Same structural handoff as dispatch — re-view ffn_out into
             // [batch, top_k, hidden] for the collective tensor.
-            let combine_tensor = self.placeholder_reshape(ffn_out, &point.shape);
+            // TODO(ep-routing): emit the real gather of expert outputs.
+            let combine_tensor = self.reshape_for_handoff(ffn_out, &point.shape);
             self.live.insert(
                 point.tensor.clone(),
                 LiveTensor {
@@ -527,7 +533,7 @@ impl<'a> DeviceWiring<'a> {
                 .get(&point.tensor)
                 .expect("combined missing")
                 .tensor;
-            let folded = self.placeholder_reshape(combined, &[self.batch, self.seq, self.hidden]);
+            let folded = self.reshape_for_handoff(combined, &[self.batch, self.seq, self.hidden]);
             self.live.insert(
                 ffn_name.clone(),
                 LiveTensor {
@@ -604,6 +610,14 @@ impl<'a> DeviceWiring<'a> {
         ))
     }
 
+    /// MoE feed-forward for one block.
+    ///
+    /// TODO(moe-topk): this lowers a *dense* mixture — every expert the
+    /// device owns is evaluated and weighted by its full-softmax gate
+    /// probability. Mixtral selects the top-k experts per token and
+    /// renormalizes their gate weights over the selected set. Implementing
+    /// the top-k selection needs a top-k / masked-softmax op and should be
+    /// validated against a GPU reference before it replaces the dense path.
     fn wire_block_moe(
         &mut self,
         block: usize,
@@ -743,9 +757,11 @@ impl<'a> DeviceWiring<'a> {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Re-view `t` under `target_shape` using direct ShapeTracker
-    /// assignment. Same no-op reshape pattern as `embedding_lookup`.
-    fn placeholder_reshape(&self, mut t: GraphTensor, target_shape: &[usize]) -> GraphTensor {
+    /// Re-view `t` under `target_shape` via direct `ShapeTracker`
+    /// assignment, producing a typed input/output for a collective handoff.
+    /// Used only on the EP dispatch/combine boundaries — see the
+    /// `TODO(ep-routing)` note in the module docstring.
+    fn reshape_for_handoff(&self, mut t: GraphTensor, target_shape: &[usize]) -> GraphTensor {
         let dims: Vec<Expression> = target_shape.iter().copied().map(Expression::from).collect();
         t.shape = ShapeTracker::new(dims);
         t
@@ -761,9 +777,8 @@ struct HandoffSpec {
 }
 
 // ---------------------------------------------------------------------------
-// Per-op helpers — same as 1a except `embedding_lookup` no longer infers
-// dims from the GraphTensor (the tokens tensor has dynamic shape only when
-// the caller chose 'b'/'s'; we want static shapes for segments).
+// Per-op helpers. `embedding_lookup` takes explicit static dims rather than
+// inferring them from the GraphTensor, because segments use static shapes.
 // ---------------------------------------------------------------------------
 
 /// `x / sqrt(mean(x²) + eps) * weight` — i.e. RmsNorm.
@@ -775,9 +790,9 @@ fn rms_norm(input: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     normed * weight.expand_lhs(&dims[..n - 1])
 }
 
-/// Token-id `[batch, seq]` → embedded `[batch, seq, hidden]`. Same
-/// `ShapeTracker` re-view trick as 1a; explicit static dims passed in
-/// because we no longer rely on dynamic 'b' / 's' for segments.
+/// Token-id `[batch, seq]` → embedded `[batch, seq, hidden]`. Static dims
+/// are passed in explicitly because segments use static shapes rather than
+/// dynamic `'b'` / `'s'` dimensions.
 fn embedding_lookup(
     tokens: GraphTensor,
     embed_weight: GraphTensor,
@@ -793,11 +808,14 @@ fn embedding_lookup(
     embed_weight.gather((tokens * hidden).expand_dim(2, hidden) + cols)
 }
 
-/// Self-attention with GQA expansion. No RoPE / no causal mask (1a gap
-/// inventory). Looks up weights from a `declared` map; in 1b the
-/// orchestrator drives this via [`wire_attention_math`] directly with
-/// per-segment handles, but the function is preserved for the Phase 1a
-/// hand-computed attention test which still drives it.
+/// Self-attention with GQA expansion. Looks up Q/K/V/O weights from a
+/// `declared` map and delegates the op graph to [`wire_attention_math`].
+/// The segment orchestrator normally calls [`wire_attention_math`] directly
+/// with per-segment handles; this map-driven entry point is kept for the
+/// hand-computed attention test.
+///
+/// TODO(rope) / TODO(causal-mask): rotary embeddings and the causal mask
+/// are not yet applied here — see the module docstring.
 pub fn wire_attention(
     cx: &mut LuminalGraph,
     declared: &HashMap<String, DeclaredTensor>,
@@ -866,10 +884,16 @@ pub fn wire_attention_math(
     let k = k.split_dims(2, head_dim).permute((0, 2, 3, 1));
     let v = v.split_dims(2, head_dim).permute((0, 2, 1, 3));
 
+    // TODO(rope): apply rotary position embeddings to `q` and `k` here,
+    // before the score matmul, once position ids are plumbed through.
+
     let k = k.expand_dim(2, kv_groups);
     let v = v.expand_dim(2, kv_groups);
 
     let scores = q.matmul(k) * scale;
+    // TODO(causal-mask): add an additive causal mask to `scores` before the
+    // softmax for prefill (`seq > 1`). It is a no-op for the current
+    // `seq = 1` decode-mode lowering.
     let weights = scores.softmax(4);
     let attn = weights.matmul(v);
 
@@ -925,7 +949,6 @@ fn declare_param_into(
     let tensor = cx.named_tensor(param.name.clone(), dims_expr);
     let id = tensor.id;
     cx.get_op_mut::<Input>(id).dtype = dtype_lum;
-    let _ = Dim::Fixed(0); // suppress unused-import lint when no symbolic dim paths fire
     Ok(DeclaredTensor {
         id,
         shape: dims_usize,
@@ -933,8 +956,3 @@ fn declare_param_into(
         role: *role,
     })
 }
-
-/// Suppress `CollectiveKind` unused-import warning when only some paths
-/// reference it through `crate::handoff::CollectivePoint`. The constant
-/// keeps the import live.
-const _COLLECTIVE_KIND_LIVE: CollectiveKind = CollectiveKind::RingAllReduce;

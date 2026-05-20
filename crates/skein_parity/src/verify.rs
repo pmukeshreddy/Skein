@@ -14,9 +14,12 @@ use crate::report::{FailingLayerReport, ParityReport, PerPromptReport};
 use crate::skein_forward::SkeinForward;
 use crate::tolerance::{ToleranceTable, dominant_dtype_at_layer, tolerance_for_layer};
 
-/// Tokenize text for the current Skein-native runtime path. Prompt 2's
-/// server uses the same byte-mod-vocab tokenizer because artifacts do not
-/// yet carry tokenizer assets.
+/// Tokenize text for the Skein-native runtime path. The serving runtime
+/// uses this same byte-mod-vocab tokenizer because artifacts do not yet
+/// carry tokenizer assets.
+///
+/// TODO(tokenizer): bundle the model's real tokenizer in the artifact and
+/// switch both this path and the server to it.
 pub fn tokenize_prompt_bytes(prompt: &str, vocab: u32) -> Vec<u32> {
     let modulo = vocab.max(1);
     let mut tokens = prompt
@@ -41,8 +44,8 @@ pub fn tokenize_prompt_bytes(prompt: &str, vocab: u32) -> Vec<u32> {
 ///   `workload.slo.max_accuracy_drift`.
 ///
 /// The function takes the reference + Skein implementations as trait
-/// objects so Phase A's mock + Phase B's real subprocess share the same
-/// orchestration code.
+/// objects so any `HFReference` (e.g. the `transformers` subprocess) and
+/// any `SkeinForward` share the same orchestration code.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_plan(
     reference: &dyn HFReference,

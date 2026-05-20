@@ -60,12 +60,13 @@ which compile writes during advisory parity.
 - Parity failures update the drift table and only become hard failures when
   `--enforce-parity` or `skein verify --enforce` is used.
 
-## Mac And H100
+## CPU and GPU builds
 
-On Mac, compile and verify use `NativeComputeRuntime`. This exercises the
-same pipeline with CPU timings and native Luminal execution. On H100,
-`--features cuda` selects `CudaComputeRuntime` for compile/verify/calibrate.
+The default build selects `CudaComputeRuntime` for compile / verify /
+calibrate on an NVIDIA host. Building with `--no-default-features` selects
+`NativeComputeRuntime`, which exercises the same pipeline with CPU timings
+and native Luminal execution.
 
-Mac artifacts are useful for pipeline correctness and fixture tests. H100
-artifacts are the production target for calibrated cost constants and final
-numeric validation.
+The CPU build is for pipeline correctness and CI; the GPU build is the
+production target for calibrated cost constants and final numeric
+validation.
