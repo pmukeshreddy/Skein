@@ -1585,7 +1585,6 @@ dependencies = [
 [[package]]
 name = "luminal"
 version = "0.2.0"
-source = "git+https://github.com/luminal-ai/luminal?rev=e558ce68498df842107ccb32e316efff4801ccc1#e558ce68498df842107ccb32e316efff4801ccc1"
 dependencies = [
  "anyhow",
  "as-any",
@@ -1619,7 +1618,6 @@ dependencies = [
 [[package]]
 name = "luminal_cuda_lite"
 version = "0.2.0"
-source = "git+https://github.com/luminal-ai/luminal?rev=e558ce68498df842107ccb32e316efff4801ccc1#e558ce68498df842107ccb32e316efff4801ccc1"
 dependencies = [
  "anyhow",
  "as-any",
@@ -1644,7 +1642,6 @@ dependencies = [
 [[package]]
 name = "luminal_tracing"
 version = "0.1.0"
-source = "git+https://github.com/luminal-ai/luminal?rev=e558ce68498df842107ccb32e316efff4801ccc1#e558ce68498df842107ccb32e316efff4801ccc1"
 dependencies = [
  "prost 0.13.5",
  "tracing-appender",

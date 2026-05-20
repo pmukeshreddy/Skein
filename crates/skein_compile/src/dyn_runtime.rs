@@ -122,6 +122,12 @@ pub trait DynRuntime {
     fn set_tensor_i32_by_name(&mut self, name: &str, data: Vec<i32>)
     -> Result<(), DynRuntimeError>;
 
+    /// Set a dynamic-shape dimension (e.g. the cached-decode `past` length `'p'`)
+    /// on the segment's graph before the next [`execute_segment`]. The default
+    /// is a no-op (segments with only static shapes ignore it); the graph-owning
+    /// wrapper overrides it to update the graph's dyn-dim map.
+    fn set_dyn_dim(&mut self, _dim: char, _val: usize) {}
+
     /// Load a weight tensor from its raw little-endian safetensors bytes.
     /// The default decodes to `f32` (correct for the CPU runtime); a GPU
     /// runtime can override this to upload the low-precision bytes directly.
@@ -214,6 +220,13 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             if name == "input_tokens" {
                 return Err(DynRuntimeError::ExpectedI32(name.to_string()));
             }
+            // A 0-length input (the empty KV cache at decode position 0) becomes
+            // a 0-byte device allocation whose pointer is null, which the CUDA
+            // backend rejects as a "missing input buffer". Stage a 1-element
+            // placeholder so the buffer is non-null; the dynamic `past` dim is 0
+            // for that step, so the concat's pad reads nothing from it (the
+            // cached-decode output reduces to just the current token — correct).
+            let data = if data.is_empty() { vec![0.0] } else { data };
             self.staged_f32.insert(node, data);
         } else {
             self.external_f32.insert(node, data);
@@ -234,5 +247,9 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
                 .insert(node, data.into_iter().map(|v| v as f32).collect());
         }
         Ok(())
+    }
+
+    fn set_dyn_dim(&mut self, dim: char, val: usize) {
+        self.graph.dyn_map.insert(dim, val);
     }
 }

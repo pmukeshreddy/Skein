@@ -128,6 +128,36 @@ impl DeviceArtifactLoaded {
     }
 }
 
+/// Merge the per-device sequencings into one global schedule the rank executor
+/// walks: at each step **every** device runs its own segment, then the shared
+/// collective fires **once**. The per-device sequencings are structurally
+/// aligned for tp/ep (the same collective sequence, differing only in each
+/// `ExecuteSegment`'s `device_idx`), so we walk by position. Concatenating them
+/// instead (`flat_map`) made each collective appear before the later-listed
+/// devices had run their producing segment — so a rank reached, e.g., the
+/// `embed_out` all-reduce and read a handoff it had not yet produced. NOTE:
+/// pipeline parallelism (pp > 1) has device-specific collectives and would need
+/// a topological merge; the planner targeted here is tp/ep only.
+fn interleave_sequencing(per_device: &[&[SequenceStep]]) -> Vec<SequenceStep> {
+    let Some(first) = per_device.first() else {
+        return Vec::new();
+    };
+    let mut merged = Vec::with_capacity(first.len() * per_device.len());
+    for (i, step) in first.iter().enumerate() {
+        match step {
+            SequenceStep::ExecuteSegment { .. } => {
+                for dev in per_device {
+                    if let Some(s) = dev.get(i) {
+                        merged.push(s.clone());
+                    }
+                }
+            }
+            SequenceStep::Collective { .. } => merged.push(step.clone()),
+        }
+    }
+    merged
+}
+
 impl SkeinArtifact {
     #[allow(clippy::too_many_arguments)]
     pub fn write(
@@ -157,10 +187,11 @@ impl SkeinArtifact {
         let plan_path = out_dir.join("plan.json");
         write_json(&plan_path, plan)?;
 
-        let sequencing: Vec<SequenceStep> = lowered_per_device
+        let per_device_seq: Vec<&[SequenceStep]> = lowered_per_device
             .iter()
-            .flat_map(|d| d.graph.sequencing.iter().cloned())
+            .map(|d| d.graph.sequencing.as_slice())
             .collect();
+        let sequencing = interleave_sequencing(&per_device_seq);
         let topology_path = out_dir.join("topology.json");
         write_json(&topology_path, &sequencing)?;
 

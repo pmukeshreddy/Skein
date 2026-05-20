@@ -46,6 +46,24 @@ fp8_e5m2 = 1979.0
 int8     = 1979.0
 int4     = 3958.0
 
+# NVIDIA RTX PRO 6000 Blackwell (GB202, sm_120, 96 GB GDDR7). Dense tensor-core
+# peaks derived from NVIDIA's RTX PRO 6000 Blackwell datasheet. The headline
+# marketing figure is ~4029 TFLOPS FP4 *with sparsity*; the dense numbers below
+# are that halved for sparsity and then halved per precision step (the standard
+# 5th-gen Blackwell tensor ratio):
+#   - FP4  dense  = 2014.8 TFLOPS  (4029.7 sparse / 2)
+#   - FP8/INT8    = 1007.4 TFLOPS  (FP4 dense / 2)
+#   - BF16/FP16   =  503.8 TFLOPS  (FP8 dense / 2)
+# These are *peak* numbers; sustained efficiency comes from the [efficiency.*]
+# tables. Recalibrate against the real cards with `skein calibrate`.
+[peak_tflops.rtx_pro_6000_blackwell]
+bf16     = 503.8
+fp16     = 503.8
+fp8_e4m3 = 1007.4
+fp8_e5m2 = 1007.4
+int8     = 1007.4
+int4     = 2014.8
+
 # -----------------------------------------------------------------------------
 # Sustained efficiency: fraction of peak achievable by a well-tuned kernel.
 # Three op kinds:

@@ -1,0 +1,30 @@
+# Two-RTX-PRO-6000-Blackwell single-node cluster connected by PCIe Gen5.
+# This box has NO NVLink between the two cards (confirmed via
+# `nvidia-smi topo -m`: the GPU0<->GPU1 path is "PHB" — traversing the PCIe
+# host bridge, not a bonded NVLink set). So the only GPU-to-GPU link is PCIe.
+#
+# Hardware:
+#   - NVIDIA RTX PRO 6000 Blackwell, 96 GB GDDR7 per card (97887 MiB usable
+#     per `nvidia-smi`), compute capability sm_120 (GB202).
+#   - PCIe Gen5 x16 host bridge between the two cards.
+#
+# Link numbers (PCIe 5.0 x16):
+#   - Per-direction theoretical: ~63 GB/s (32 GT/s * 16 lanes, 128b/130b).
+#     Listed here as a single sustained-effective figure; recalibrate against
+#     measured P2P bandwidth with `skein calibrate`.
+#   - Host-bridge P2P latency: ~1.5 microseconds (order-of-magnitude; the
+#     real value is dominated by the driver memcpy path on a no-NVLink box).
+
+num_devices = 2
+
+[[node]]
+id               = "node0"
+devices          = ["d0", "d1"]
+device_kind      = "rtx_pro_6000_blackwell"
+device_memory_gb = 96
+
+[[link]]
+endpoints      = ["d0", "d1"]
+kind           = "pcie5"
+bandwidth_gbps = 64.0
+latency_us     = 1.5

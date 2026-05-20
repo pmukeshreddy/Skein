@@ -96,6 +96,20 @@ use crate::handoff::{
 use crate::segment::{HandoffTensor, Segment, SequenceStep};
 use crate::shard_role::{ShardRole, shard_role_for_param};
 
+/// Logical name of the runtime-fed absolute-position scalar (`[1]`, f32) the
+/// cached-decode attention reads each step (for RoPE of the current token).
+const POSITION_INPUT: &str = "position";
+/// Dynamic-dim character for the KV cache's growing `past` length. The serving
+/// runtime sets it per step (`past == the current token's absolute index`); the
+/// Luminal search uses [`SEARCH_PAST`] as a representative value to compile the
+/// dynamic-`past` kernels. Cache handoffs are named `kvcache_{k|v}_{block}` so
+/// `skein_runtime::kv_cache::parse_kvcache_name` routes them to the per-layer
+/// cache (fed the accumulated past, new step appended).
+const PAST_DIM: char = 'p';
+/// Representative `past` length baked into the graph for the compile-time
+/// search only; overridden at runtime via the dynamic-dim map each step.
+const SEARCH_PAST: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Public entry: wire_segments
 // ---------------------------------------------------------------------------
@@ -160,6 +174,13 @@ struct DeviceWiring<'a> {
     cur_declared: HashMap<String, DeclaredTensor>,
     cur_op_nodes: HashMap<String, NodeIndex>,
     cur_input_handoff: Vec<HandoffTensor>,
+    // Cached-decode KV outputs (the new token's K/V) produced inside the
+    // current segment; merged into its `output_handoff` when the segment closes
+    // so the runtime appends them to the per-layer cache.
+    cur_extra_outputs: Vec<HandoffTensor>,
+    // The current segment's `position` Input, declared lazily on first use and
+    // shared by every attention block in the segment (reset per segment).
+    cur_position: Option<GraphTensor>,
     live: HashMap<String, LiveTensor>,
 
     // Static shape dimensions baked into every tensor — matches
@@ -205,6 +226,8 @@ impl<'a> DeviceWiring<'a> {
             cur_declared: HashMap::new(),
             cur_op_nodes: HashMap::new(),
             cur_input_handoff: Vec::new(),
+            cur_extra_outputs: Vec::new(),
+            cur_position: None,
             live: HashMap::new(),
             batch,
             seq,
@@ -219,11 +242,15 @@ impl<'a> DeviceWiring<'a> {
 
     /// Close the current segment with `output_handoff` and start a fresh
     /// one. Pushes an `ExecuteSegment` step into `sequencing`.
-    fn close_current_segment(&mut self, output_handoff: Vec<HandoffTensor>) {
+    fn close_current_segment(&mut self, mut output_handoff: Vec<HandoffTensor>) {
         let cx = std::mem::replace(&mut self.cur_cx, LuminalGraph::new());
         let declared = std::mem::take(&mut self.cur_declared);
         let op_nodes = std::mem::take(&mut self.cur_op_nodes);
         let input_handoff = std::mem::take(&mut self.cur_input_handoff);
+        // Cached-decode K/V the runtime appends to the per-layer cache. These are
+        // outputs of this segment regardless of where the segment boundary fell.
+        output_handoff.append(&mut self.cur_extra_outputs);
+        self.cur_position = None;
 
         self.sequencing.push(SequenceStep::ExecuteSegment {
             device_idx: self.device_idx,
@@ -689,21 +716,125 @@ impl<'a> DeviceWiring<'a> {
             .expect("k_proj just declared");
         let n_heads_local = q_decl.shape[0] / head_dim;
         let n_kv_heads_local = k_decl.shape[0] / head_dim;
-        // This lowering emits one decode step from position 0 (stateless,
-        // `seq = 1`). The KV-cache decode loop supplies the running position
-        // offset per step; see `rope_tables`.
-        Ok(wire_attention_math(
+        let kv_dim = n_kv_heads_local * head_dim;
+        let batch = self.batch;
+        let act = self.activation_dtype;
+        let lum_act = to_luminal_dtype(act);
+        let rope_theta = self.ir.meta.rope_theta;
+
+        // Cached decode: project the current token's q/k/v (seq = 1) and attend
+        // over the runtime-fed past K/V plus the current token. RoPE/scores/
+        // softmax/Attn·V run in fp32 — q/k/v, the cache, and `position` are all
+        // f32 — both for numerical parity with HF's fp32 softmax and so the
+        // cache round-trips losslessly through the runtime's f32 `KvCache`. Only
+        // the final attention output is cast back to the activation dtype for
+        // `o_proj`. This replaces the old stateless `seq=1`, position-0 lowering.
+        let q = normed.matmul(q_w.permute((1, 0))).cast(DType::F32);
+        let k_new = normed.matmul(k_w.permute((1, 0))).cast(DType::F32);
+        let v_new = normed.matmul(v_w.permute((1, 0))).cast(DType::F32);
+
+        // Runtime-fed accumulated past (dynamic `past` length) + absolute
+        // position. `SegmentRunner` feeds these by name each step.
+        let dims = || {
+            vec![
+                Expression::from(batch),
+                Expression::from(PAST_DIM),
+                Expression::from(kv_dim),
+            ]
+        };
+        let k_cache = self.runtime_input(
+            &format!("kvcache_k_{block}"),
+            dims(),
+            vec![batch, SEARCH_PAST, kv_dim],
+            DType::F32,
+        );
+        let v_cache = self.runtime_input(
+            &format!("kvcache_v_{block}"),
+            dims(),
+            vec![batch, SEARCH_PAST, kv_dim],
+            DType::F32,
+        );
+        let position = self.position_input();
+        // Representative dynamic `past` for the compile-time search; the runtime
+        // overrides it each step via the dynamic-dim map.
+        self.cur_cx.set_dim(PAST_DIM, SEARCH_PAST);
+
+        let (attn, k_store, v_store) = attention_decode_step(
+            q,
+            k_new,
+            v_new,
+            k_cache,
+            v_cache,
+            position,
             n_heads_local,
             n_kv_heads_local,
             head_dim,
-            self.ir.meta.rope_theta,
-            0,
-            normed,
-            q_w,
-            k_w,
-            v_w,
-            o_w,
-        ))
+            rope_theta,
+        );
+
+        // Hand the new (rotated) key + value back to the runtime to append to
+        // this layer's cache for the next step.
+        let k_out = k_store.output();
+        let v_out = v_store.output();
+        self.cur_extra_outputs.push(HandoffTensor {
+            logical_name: format!("kvcache_k_{block}"),
+            luminal_id: k_out.id,
+            shape: vec![batch, 1, kv_dim],
+            dtype: act,
+        });
+        self.cur_extra_outputs.push(HandoffTensor {
+            logical_name: format!("kvcache_v_{block}"),
+            luminal_id: v_out.id,
+            shape: vec![batch, 1, kv_dim],
+            dtype: act,
+        });
+
+        let attn = attn.cast(lum_act);
+        Ok(attn.matmul(o_w.permute((1, 0))))
+    }
+
+    /// Declare a runtime-fed Input in the current segment: registers it as an
+    /// `input_handoff` (so `SegmentRunner` feeds it by logical name) and in
+    /// `op_nodes`. `dims` may carry a dynamic-dim char; `shape_repr` is the
+    /// concrete representative shape used for the compile-time search staging.
+    fn runtime_input(
+        &mut self,
+        name: &str,
+        dims: Vec<Expression>,
+        shape_repr: Vec<usize>,
+        dtype: DType,
+    ) -> GraphTensor {
+        let t = self
+            .cur_cx
+            .named_tensor(name.to_string(), dims)
+            .as_dtype(dtype);
+        self.cur_cx.get_op_mut::<Input>(t.id).dtype = dtype;
+        self.cur_input_handoff.push(HandoffTensor {
+            logical_name: name.to_string(),
+            luminal_id: t.id,
+            shape: shape_repr,
+            // Marker only: the runtime feeds KV cache + position as raw f32, and
+            // `segment_input_zero_bytes` sizes their search buffers by name.
+            dtype: self.activation_dtype,
+        });
+        self.cur_op_nodes.insert(name.to_string(), t.id);
+        t
+    }
+
+    /// The current segment's `position` scalar Input (`[1]`, f32), declared once
+    /// and reused by every attention block in the same segment.
+    fn position_input(&mut self) -> GraphTensor {
+        if let Some(p) = self.cur_position {
+            return p;
+        }
+        let p = self.runtime_input(
+            POSITION_INPUT,
+            vec![Expression::from(1usize)],
+            vec![1],
+            DType::F32,
+        );
+        self.cur_position = Some(p);
+        p
     }
 
     /// MoE feed-forward for one block, with top-k expert routing.

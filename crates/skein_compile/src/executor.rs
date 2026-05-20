@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
+use luminal::prelude::NodeIndex;
 use safetensors::{Dtype as SafeDtype, SafeTensors};
 use skein_cost::collectives::CollectiveKind;
 use skein_emit::segment::{Segment, SequenceStep};
@@ -15,8 +16,38 @@ use skein_emit::segment::{Segment, SequenceStep};
 use crate::dyn_runtime::WeightDtype;
 use crate::{
     CompileError, DynRuntime, DynRuntimeError, DynRuntimeWrapper, NativeComputeRuntime,
-    SkeinArtifact, compile_with_luminal,
+    SkeinArtifact,
 };
+
+/// Zero-buffer staging list for a segment's `Input` ops: `(node, num_bytes)`
+/// for every declared weight plus every input handoff. Luminal's search
+/// executes the graph and the CUDA backend needs a buffer for each `Input`;
+/// these zeros are placeholders (real data is loaded after compile). The
+/// `input_tokens` handoff is an i32 index tensor (4 bytes/elem) regardless of
+/// its marker dtype.
+pub fn segment_input_zero_bytes(segment: &Segment) -> Vec<(NodeIndex, usize)> {
+    let mut out = Vec::with_capacity(segment.declared.len() + segment.input_handoff.len());
+    for d in segment.declared.values() {
+        let n: usize = d.shape.iter().product();
+        out.push((d.id, d.dtype.bytes_for(n as u64) as usize));
+    }
+    for h in &segment.input_handoff {
+        let n: usize = h.shape.iter().product();
+        // `input_tokens` is i32; `position` and the `kvcache_*` past tensors are
+        // fed as raw f32 — all 4 bytes/element, regardless of the marker dtype
+        // recorded on the handoff. Everything else uses its real dtype width.
+        let four_byte = h.logical_name == "input_tokens"
+            || h.logical_name == "position"
+            || h.logical_name.starts_with("kvcache_");
+        let bytes = if four_byte {
+            n * 4
+        } else {
+            h.dtype.bytes_for(n as u64) as usize
+        };
+        out.push((h.luminal_id, bytes));
+    }
+    out
+}
 
 pub const DEFAULT_SEARCH_BUDGET: usize = 1;
 
@@ -115,91 +146,124 @@ impl<'a> TopologyExecutor<'a> {
         tokens: &[u32],
         mut captures: Option<&mut BTreeMap<usize, Vec<f32>>>,
     ) -> Result<Vec<f32>, CompileError> {
-        let mut handoffs: HashMap<(usize, String), Vec<f32>> = HashMap::new();
-        let mut handoff_i32: HashMap<(usize, String), Vec<i32>> = HashMap::new();
-        let token_i32: Vec<i32> = vec![tokens.last().copied().unwrap_or(0) as i32];
-        handoff_i32.insert((0, "input_tokens".to_string()), token_i32);
+        // Cached-decode prefill: feed the prompt one token at a time, walking the
+        // full collective schedule per token while accumulating the per-(device,
+        // layer) KV cache, so attention attends over the real prompt history.
+        // The logits after the *last* token are returned (compared to HF). This
+        // mirrors the serving `SegmentRunner` loop, single-process here. (The KV
+        // cache type lives in `skein_runtime`, which depends on this crate, so a
+        // small inline f32 accumulator + name parser is used instead.)
+        let prompt: Vec<u32> = if tokens.is_empty() {
+            vec![0]
+        } else {
+            tokens.to_vec()
+        };
 
-        let mut last_segment_for_device: HashMap<usize, usize> = HashMap::new();
+        // Per-(device, kvcache-name) accumulated past, grown by one token/step.
+        let mut kv: HashMap<(usize, String), Vec<f32>> = HashMap::new();
         let mut final_logits = Vec::new();
+        let last_pos = prompt.len() - 1;
 
-        for step in self.sequencing {
-            match step {
-                SequenceStep::ExecuteSegment {
-                    device_idx,
-                    segment_idx,
-                } => {
-                    let device_idx = *device_idx as usize;
-                    let segment_idx = *segment_idx;
-                    let segment = self
-                        .runtimes
-                        .get_mut(device_idx)
-                        .and_then(|d| d.get_mut(segment_idx))
-                        .ok_or(CompileError::MissingSegment {
-                            device_idx,
-                            segment_idx,
-                        })?;
+        for (position, &tok) in prompt.iter().enumerate() {
+            let mut handoffs: HashMap<(usize, String), Vec<f32>> = HashMap::new();
+            let mut handoff_i32: HashMap<(usize, String), Vec<i32>> = HashMap::new();
+            handoff_i32.insert((0, "input_tokens".to_string()), vec![tok as i32]);
 
-                    for name in &segment.input_names {
-                        let key = (device_idx, name.clone());
-                        if let Some(data) = handoff_i32.get(&key) {
-                            segment.runtime.set_tensor_i32_by_name(name, data.clone())?;
-                        } else if let Some(data) = handoffs.get(&key) {
-                            segment.runtime.set_tensor_by_name(name, data.clone())?;
+            for step in self.sequencing {
+                match step {
+                    SequenceStep::ExecuteSegment {
+                        device_idx,
+                        segment_idx,
+                    } => {
+                        let device_idx = *device_idx as usize;
+                        let segment_idx = *segment_idx;
+                        let segment = self
+                            .runtimes
+                            .get_mut(device_idx)
+                            .and_then(|d| d.get_mut(segment_idx))
+                            .ok_or(CompileError::MissingSegment {
+                                device_idx,
+                                segment_idx,
+                            })?;
+
+                        for name in &segment.input_names {
+                            let key = (device_idx, name.clone());
+                            if is_kvcache_name(name) {
+                                let past = kv.get(&key).cloned().unwrap_or_default();
+                                segment.runtime.set_tensor_by_name(name, past)?;
+                            } else if name == "position" {
+                                segment
+                                    .runtime
+                                    .set_tensor_by_name(name, vec![position as f32])?;
+                            } else if let Some(data) = handoff_i32.get(&key) {
+                                segment.runtime.set_tensor_i32_by_name(name, data.clone())?;
+                            } else if let Some(data) = handoffs.get(&key) {
+                                segment.runtime.set_tensor_by_name(name, data.clone())?;
+                            }
                         }
-                    }
 
-                    segment.runtime.execute_segment()?;
-                    last_segment_for_device.insert(device_idx, segment_idx);
+                        // This step's dynamic `past` length (= position).
+                        segment.runtime.set_dyn_dim('p', position);
+                        segment.runtime.execute_segment()?;
 
-                    for name in &segment.output_names {
-                        let data = segment.runtime.get_tensor_by_name(name)?;
-                        if name == "logits" {
-                            final_logits = data.clone();
+                        for name in &segment.output_names {
+                            let data = segment.runtime.get_tensor_by_name(name)?;
+                            if is_kvcache_name(name) {
+                                // The new token's K/V — append to this layer's cache.
+                                kv.entry((device_idx, name.clone()))
+                                    .or_default()
+                                    .extend_from_slice(&data);
+                            } else {
+                                if name == "logits" {
+                                    final_logits = data.clone();
+                                }
+                                handoffs.insert((device_idx, name.clone()), data);
+                            }
                         }
-                        handoffs.insert((device_idx, name.clone()), data);
-                    }
 
-                    if let Some(captures) = captures.as_deref_mut() {
-                        for name in &segment.capture_names {
-                            if let Some(layer_idx) = parse_hidden_after_block(name) {
-                                let data = segment.runtime.get_tensor_by_name(name)?;
-                                captures.insert(layer_idx, data);
+                        // Capture per-layer activations only on the last token.
+                        if position == last_pos {
+                            if let Some(captures) = captures.as_deref_mut() {
+                                for name in &segment.capture_names {
+                                    if let Some(layer_idx) = parse_hidden_after_block(name) {
+                                        let data = segment.runtime.get_tensor_by_name(name)?;
+                                        captures.insert(layer_idx, data);
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                SequenceStep::Collective {
-                    collective,
-                    participants,
-                    tensor,
-                    ..
-                } => {
-                    let participants: Vec<usize> =
-                        participants.iter().map(|p| *p as usize).collect();
-                    let mut adapters = Vec::with_capacity(participants.len());
-                    for &p in &participants {
-                        let data = handoffs
-                            .get(&(p, tensor.clone()))
-                            .cloned()
-                            .unwrap_or_default();
-                        let _ = last_segment_for_device.get(&p);
-                        adapters.push(HandoffRuntime::new(tensor, data));
-                    }
-                    let mut refs: Vec<&mut dyn DynRuntime> = adapters
-                        .iter_mut()
-                        .map(|r| r as &mut dyn DynRuntime)
-                        .collect();
-                    let local_participants: Vec<usize> = (0..participants.len()).collect();
-                    self.collectives.execute(
-                        *collective,
-                        &local_participants,
+                    SequenceStep::Collective {
+                        collective,
+                        participants,
                         tensor,
-                        refs.as_mut_slice(),
-                    )?;
-                    for (rank, &device) in participants.iter().enumerate() {
-                        let data = refs[rank].get_tensor_by_name(tensor)?;
-                        handoffs.insert((device, tensor.clone()), data);
+                        ..
+                    } => {
+                        let participants: Vec<usize> =
+                            participants.iter().map(|p| *p as usize).collect();
+                        let mut adapters = Vec::with_capacity(participants.len());
+                        for &p in &participants {
+                            let data = handoffs
+                                .get(&(p, tensor.clone()))
+                                .cloned()
+                                .unwrap_or_default();
+                            adapters.push(HandoffRuntime::new(tensor, data));
+                        }
+                        let mut refs: Vec<&mut dyn DynRuntime> = adapters
+                            .iter_mut()
+                            .map(|r| r as &mut dyn DynRuntime)
+                            .collect();
+                        let local_participants: Vec<usize> = (0..participants.len()).collect();
+                        self.collectives.execute(
+                            *collective,
+                            &local_participants,
+                            tensor,
+                            refs.as_mut_slice(),
+                        )?;
+                        for (rank, &device) in participants.iter().enumerate() {
+                            let data = refs[rank].get_tensor_by_name(tensor)?;
+                            handoffs.insert((device, tensor.clone()), data);
+                        }
                     }
                 }
             }
@@ -207,6 +271,13 @@ impl<'a> TopologyExecutor<'a> {
 
         Ok(final_logits)
     }
+}
+
+/// A handoff named `kvcache_{k|v}_{layer}` carries per-layer KV cache, not a
+/// cross-segment activation — the executor feeds it the accumulated past and
+/// appends its step output rather than routing it as a normal handoff.
+fn is_kvcache_name(name: &str) -> bool {
+    name.starts_with("kvcache_")
 }
 
 pub fn load_native_runtime_segments(
@@ -305,12 +376,9 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
             .map(|h| (h.logical_name.clone(), h.luminal_id)),
     );
 
-    let mut runtimes =
-        compile_with_luminal::<R>(std::slice::from_mut(&mut segment.graph), search_budget)?;
-    let runtime = runtimes.pop().ok_or(CompileError::MissingSegment {
-        device_idx: 0,
-        segment_idx: segment.idx,
-    })?;
+    let input_zeros = segment_input_zero_bytes(&segment);
+    let runtime =
+        R::build_and_search_with_input_zeros(&mut segment.graph, search_budget, &input_zeros)?;
     let wrapped = DynRuntimeWrapper::new(runtime, segment.graph, name_to_node);
     Ok(RuntimeSegment {
         runtime: Box::new(wrapped),

@@ -44,7 +44,38 @@ pub fn run_compile_inner<R: ComputeRuntime + 'static>(
     let cluster = Cluster::from_spec(cluster_spec.clone());
 
     tracing::info!("skein compile: running plan search");
-    let plan = extract_plan(&ir, &cluster, &workload, &drift_table, &cost_model)?;
+    let mut plan = extract_plan(&ir, &cluster, &workload, &drift_table, &cost_model)?;
+
+    // Runtime capability clamp: the weight-load path (`skein_compile::WeightDtype`)
+    // only supports F32/F16/Bf16, and the CUDA compute kernels run in bf16. The
+    // planner can choose sub-bf16 dtypes (fp8/int) for cost, but those weights
+    // cannot be uploaded or executed end-to-end yet (no bf16->fp8 quantizer in
+    // the shard writer, no fp8 variant in `WeightDtype`). Clamp any sub-bf16
+    // dtype up to bf16 so the emitted artifact is actually runnable. This is a
+    // documented limitation, not a tolerance change: bf16 is the correct full-
+    // precision serving config and exactly what the HF parity gate compares to.
+    let clamp = |d: Dtype| match d {
+        Dtype::Fp8E4m3 | Dtype::Fp8E5m2 | Dtype::Int8 | Dtype::Int4 => Dtype::Bf16,
+        other => other,
+    };
+    let mut clamped_layers = 0usize;
+    for layer in &mut plan.dtype_map.per_layer {
+        let before = (layer.weight, layer.activation, layer.kv_cache);
+        layer.weight = clamp(layer.weight);
+        layer.activation = clamp(layer.activation);
+        layer.kv_cache = clamp(layer.kv_cache);
+        if (layer.weight, layer.activation, layer.kv_cache) != before {
+            clamped_layers += 1;
+        }
+    }
+    if clamped_layers > 0 {
+        tracing::warn!(
+            clamped_layers,
+            "clamped sub-bf16 layer dtypes to bf16 (runtime weight-load path \
+             supports only F32/F16/Bf16)"
+        );
+    }
+    let plan = plan;
     let artifact_dir = args.out.join(plan.content_hash()?.to_hex().to_string());
 
     let candidate = build_artifact::<R>(
@@ -141,9 +172,11 @@ fn build_artifact<R: ComputeRuntime>(
         let mut artifact =
             skein_emit::lower_per_device(plan, cluster, ir, device_idx, weights_dir)?;
         for segment in &mut artifact.graph.segments {
-            let _ = skein_compile::compile_with_luminal::<R>(
-                std::slice::from_mut(&mut segment.graph),
+            let input_zeros = skein_compile::segment_input_zero_bytes(segment);
+            let _ = R::build_and_search_with_input_zeros(
+                &mut segment.graph,
                 search_budget,
+                &input_zeros,
             )?;
         }
         let shard_path = staging.join(format!("device_{device_idx}.weights.safetensors"));

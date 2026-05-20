@@ -34,6 +34,10 @@ pub struct SegmentRunner {
     /// attends to all prior tokens (cached decode) while each segment stays
     /// fixed-shape per step.
     kv_cache: KvCache,
+    /// Current decode position = number of tokens already in the cache = the
+    /// dynamic `past` length the attention segments read. Set per step via
+    /// [`set_position`](Self::set_position).
+    position: usize,
 }
 
 impl SegmentRunner {
@@ -43,6 +47,7 @@ impl SegmentRunner {
             handoffs: HashMap::new(),
             handoffs_i32: HashMap::new(),
             kv_cache: KvCache::new(0),
+            position: 0,
         }
     }
 
@@ -54,6 +59,17 @@ impl SegmentRunner {
     /// Clear the KV cache between requests (reuses the allocation).
     pub fn reset_kv_cache(&mut self) {
         self.kv_cache.reset();
+        self.position = 0;
+    }
+
+    /// Set the current decode position for this step: the absolute index of the
+    /// token being processed, which equals the number of tokens already in the
+    /// cache (the dynamic `past` length). Feeds the `position` graph input and is
+    /// applied to each segment's dynamic-dim map in [`run_segment`].
+    pub fn set_position(&mut self, position: usize) {
+        self.position = position;
+        self.handoffs
+            .insert("position".to_string(), vec![position as f32]);
     }
 
     /// Seed the integer input handoff the first segment consumes (the runtime
@@ -112,6 +128,12 @@ impl LocalSegments for SegmentRunner {
             // A missing input is left to the segment's own defaults (e.g. a
             // weight already loaded into the runtime); not an error here.
         }
+
+        // Cached decode: set this step's dynamic `past` length (= position) on
+        // the segment graph. A no-op for static-shape segments.
+        self.segments[segment_idx]
+            .runtime
+            .set_dyn_dim('p', self.position);
 
         self.segments[segment_idx]
             .runtime

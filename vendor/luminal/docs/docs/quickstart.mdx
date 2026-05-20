@@ -1,0 +1,37 @@
+---
+title: "Quickstart"
+description: "Start running ML models in minutes."
+icon: "bolt"
+---
+
+## Clone the repo
+
+Clone the codebase locally by running the following:
+
+```bash
+git clone https://github.com/luminal-ai/luminal
+cd luminal
+```
+
+## Hello World
+
+Simple examples demonstrate how a library works without diving in too deep. Run your first Luminal code like so:
+
+```bash
+cd ./examples/simple
+cargo run --release
+```
+
+Great! You've ran your first Luminal model!
+
+## Run Llama 3
+
+Run the following to start generating text with Llama 3 8B on a CUDA device:
+
+```bash
+cd ./examples/llama
+# Download the model
+uv run --script ./setup/setup.py
+# Run the model
+cargo run --release
+```

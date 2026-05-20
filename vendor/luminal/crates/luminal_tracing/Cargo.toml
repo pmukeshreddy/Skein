@@ -1,0 +1,10 @@
+[package]
+name = "luminal_tracing"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tracing-perfetto = "0.1.5"
+tracing-appender = "0.2.4"
+tracing-subscriber = "0.3"
+prost = "0.13"

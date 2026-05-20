@@ -13,6 +13,9 @@ members = [
     "crates/skein_cli",
     "crates/skein_calibrate",
 ]
+# Vendored, patched copy of Luminal (see `[patch]` at the bottom). It is its own
+# Cargo workspace, so exclude it from this one.
+exclude = ["vendor/luminal"]
 
 [workspace.package]
 version = "0.1.0"
@@ -84,3 +87,14 @@ cudarc = { version = "=0.16.6", default-features = false, features = [
 opt-level     = 3
 lto           = "thin"
 codegen-units = 1
+
+# Use a local, patched checkout of Luminal (same git rev as the pin above).
+# The patch fixes `luminal_cuda_lite`'s bf16 reduction codegen: the max/sum
+# reduction kernels accumulated in the element dtype, which (a) emitted an
+# ambiguous `bf16 ? : float` ternary that NVRTC rejects on sm_120 and (b) is
+# numerically poor. The vendored copy reduces in fp32 and casts at the store.
+# See vendor/luminal/crates/luminal_cuda_lite/src/kernel/hlir.rs.
+[patch."https://github.com/luminal-ai/luminal"]
+luminal          = { path = "vendor/luminal" }
+luminal_cuda_lite = { path = "vendor/luminal/crates/luminal_cuda_lite" }
+luminal_tracing  = { path = "vendor/luminal/crates/luminal_tracing" }

@@ -1,0 +1,85 @@
+use std::fmt::Display;
+
+/// Supported dtypes
+/// This is undergoing development. Our goal is to be as explicit as possible about dtype behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum DType {
+    /// 32-bit float (8e23m)
+    #[default]
+    F32,
+    /// 64-bit float (11e52m)
+    F64,
+
+    /// 16-bit float (5e10m)
+    F16,
+    /// 16-bit float (8e7m)
+    Bf16,
+
+    /// 19-bit float (8e,10m)
+    TF32,
+
+    /// 32-bit signed integer
+    Int,
+    /// 4-bit signed integer
+    I4,
+    /// 4-bit unsigned integer
+    U4,
+    /// 8-bit signed integer
+    I8,
+    /// 8-bit unsigned integer
+    U8,
+    /// 16-bit signed integer
+    I16,
+    /// 16-bit unsigned integer
+    U16,
+
+    /// UNSTABLE WARNING
+    /// Boolean (stored as u8, 0 or 1)
+    /// Storage as a byte is subject to change
+    Bool,
+
+    /// 8-bit unsigned float (e8m0)
+    F8UE8M0,
+    /// 8-bit float (e4m3)
+    F8E4M3,
+    /// 8-bit float (e5m2)
+    F8E5M2,
+
+    /// 6-bit float (e2m3)
+    F6E2M3,
+    /// 6-bit float (e3m2)
+    F6E3M2,
+
+    /// 4-bit float (e2m1)
+    F4E2M1,
+}
+
+impl Display for DType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl DType {
+    /// Returns the number of bits per element for this dtype.
+    ///
+    /// This operates in bits (not bytes) so that sub-byte types like F4E2M1, I4, U4
+    /// and 6-bit types like F6E2M3, F6E3M2 can be represented cleanly.
+    /// Use `ShapeTracker::required_total_bytes()` to compute byte sizes for a tensor.
+    pub fn bits(&self) -> usize {
+        match self {
+            DType::F64 => 64,
+            DType::F32 | DType::Int => 32,
+            DType::TF32 => 19,
+            DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 16,
+            DType::Bool
+            | DType::I8
+            | DType::U8
+            | DType::F8UE8M0
+            | DType::F8E4M3
+            | DType::F8E5M2 => 8,
+            DType::F6E2M3 | DType::F6E3M2 => 6,
+            DType::F4E2M1 | DType::I4 | DType::U4 => 4,
+        }
+    }
+}

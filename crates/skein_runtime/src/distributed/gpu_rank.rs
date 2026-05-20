@@ -20,7 +20,7 @@
 //! it is built and validated on the GPU host.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use skein_compile::{
     CudaComputeRuntime, DEFAULT_SEARCH_BUDGET, SkeinArtifact, load_device_runtime_segments,
@@ -120,14 +120,15 @@ impl RankServer {
         Ok(tok_buf.into_iter().map(|f| f as u32).collect())
     }
 
-    /// Run one forward step for `tokens` (feeds the last token id), driving this
-    /// rank's segments + NCCL collectives over the schedule. Returns this rank's
-    /// logits — full vocab on TP/last-stage ranks after the logits all-gather.
-    pub fn forward_step(&mut self, tokens: &[u32]) -> Result<Vec<f32>, RuntimeError> {
-        let last = *tokens.last().unwrap_or(&0) as i32;
-        self.executor
-            .runner_mut()
-            .set_input_tokens(INPUT_TOKENS, vec![last]);
+    /// Run one cached-decode step: feed the single current `token` at absolute
+    /// `position`, driving this rank's segments + NCCL collectives over the
+    /// schedule. The attention segments read the accumulated KV cache (past =
+    /// `position` tokens) and append this token's K/V. Returns this rank's logits
+    /// — full vocab on TP ranks after the logits all-gather.
+    pub fn forward_step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, RuntimeError> {
+        let runner = self.executor.runner_mut();
+        runner.set_input_tokens(INPUT_TOKENS, vec![token as i32]);
+        runner.set_position(position);
         self.executor
             .run(&self.schedule, &self.collective)
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
@@ -137,22 +138,88 @@ impl RankServer {
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))
     }
 
-    /// Greedy lockstep decode of `max_new_tokens` from `prompt_tokens`. Every
-    /// rank runs this identically (same prompt → same logits → same argmax), so
-    /// the ranks stay in step without per-token communication. Returns the
-    /// generated token ids (identical on every rank).
+    /// Compute next-token logits for an entire `seq` from scratch: resets the KV
+    /// cache and prefills `seq` token-by-token, returning the logits after its
+    /// last token. Used by the speculative loop, which probes arbitrary candidate
+    /// sequences and so cannot reuse the running cache.
+    pub fn forward_full(&mut self, seq: &[u32]) -> Result<Vec<f32>, RuntimeError> {
+        self.executor.runner_mut().reset_kv_cache();
+        let mut logits = Vec::new();
+        for (pos, &tok) in seq.iter().enumerate() {
+            logits = self.forward_step(tok, pos)?;
+        }
+        Ok(logits)
+    }
+
+    /// Greedy lockstep cached decode of `max_new_tokens` from `prompt_tokens`.
+    /// First prefills the prompt token-by-token (positions `0..prompt_len`,
+    /// building the KV cache); the logits after the last prompt token predict the
+    /// first generated token. Then decodes one token per step, feeding only the
+    /// newest token (the cache supplies the history). Every rank runs this
+    /// identically (same prompt → same logits → same argmax), so the ranks stay
+    /// in step without per-token communication.
     pub fn generate(
         &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
     ) -> Result<Vec<u32>, RuntimeError> {
-        let mut tokens = prompt_tokens.to_vec();
+        self.executor.runner_mut().reset_kv_cache();
+        if prompt_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Prefill: feed each prompt token in turn, accumulating the cache.
+        // Time it as TTFT (prompt seen -> first token's logits ready).
+        let mut position = 0usize;
+        let mut logits = Vec::new();
+        let prefill_start = Instant::now();
+        for &tok in prompt_tokens {
+            logits = self.forward_step(tok, position)?;
+            position += 1;
+        }
+        let ttft = prefill_start.elapsed();
+
+        // Decode: argmax the current logits, emit, and feed it back as the next
+        // token at the running position. Time each decode step (TPOT).
         let mut generated = Vec::with_capacity(max_new_tokens);
-        for _ in 0..max_new_tokens {
-            let logits = self.forward_step(&tokens)?;
+        let mut step_times: Vec<Duration> = Vec::new();
+        for i in 0..max_new_tokens {
             let next = argmax(&logits);
-            tokens.push(next);
             generated.push(next);
+            if i + 1 < max_new_tokens {
+                let t = Instant::now();
+                logits = self.forward_step(next, position)?;
+                step_times.push(t.elapsed());
+                position += 1;
+            }
+        }
+
+        if self.layout.is_leader() {
+            let mut ms: Vec<f64> = step_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |p: f64| -> f64 {
+                if ms.is_empty() {
+                    0.0
+                } else {
+                    ms[((p * (ms.len() as f64 - 1.0)).round() as usize).min(ms.len() - 1)]
+                }
+            };
+            let decode_total: f64 = ms.iter().sum::<f64>() / 1e3;
+            let decode_toks = step_times.len() as f64;
+            let tput = if decode_total > 0.0 {
+                decode_toks / decode_total
+            } else {
+                0.0
+            };
+            tracing::info!(
+                prompt_tokens = prompt_tokens.len(),
+                ttft_ms = ttft.as_secs_f64() * 1e3,
+                decode_steps = step_times.len(),
+                tpot_p50_ms = pct(0.50),
+                tpot_p95_ms = pct(0.95),
+                decode_tokens_per_s = tput,
+                "SKEIN_PERF: cached-decode timing (single in-flight request, greedy)"
+            );
         }
         Ok(generated)
     }
@@ -243,16 +310,20 @@ pub fn run_speculative_generation(
         None
     })?;
 
-    // Forwards: running sequence -> next-token logits. Errors degrade to an
-    // empty distribution (logged) so the loop's signature stays infallible.
-    let mut target_fwd = |seq: &[u32]| match target.forward_step(seq) {
+    // Forwards: running sequence -> next-token logits. Cached decode needs a
+    // position per token and a per-request cache; the speculative loop probes
+    // arbitrary candidate sequences, so each call recomputes from scratch
+    // (`forward_full` resets the cache and prefills the whole seq). Correct but
+    // O(n) per call — a cache-rollback fast path is a follow-up. Errors degrade
+    // to an empty distribution (logged) so the loop's signature stays infallible.
+    let mut target_fwd = |seq: &[u32]| match target.forward_full(seq) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(%e, "target forward failed");
             Vec::new()
         }
     };
-    let mut draft_fwd = |seq: &[u32]| match draft.forward_step(seq) {
+    let mut draft_fwd = |seq: &[u32]| match draft.forward_full(seq) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(%e, "draft forward failed");

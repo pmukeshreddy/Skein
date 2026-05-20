@@ -34,7 +34,7 @@ pub use error::CompileError;
 pub use executor::{
     CollectiveExecutor, DEFAULT_SEARCH_BUDGET, RuntimeSegment, StepOutput, TopologyExecutor,
     TopologyStepBatch, load_device_runtime_segments, load_native_runtime_segments,
-    load_runtime_segments,
+    load_runtime_segments, segment_input_zero_bytes,
 };
 
 /// Backend abstraction. Two concrete impls: `CudaComputeRuntime` (Luminal's
@@ -45,6 +45,23 @@ pub trait ComputeRuntime: Sized {
     /// Run Luminal's search-based compile against `cx` with the given
     /// budget, then return the resulting runtime ready to execute.
     fn build_and_search(cx: &mut Graph, budget: usize) -> Result<Self, CompileError>;
+
+    /// Like [`build_and_search`](Self::build_and_search), but first stage a
+    /// zero-filled buffer for every graph `Input` (weights, handoffs, token
+    /// ids). Luminal's search *executes* candidate graphs to measure them, and
+    /// the CUDA backend hard-errors on an `Input` that has no buffer (the CPU
+    /// backend tolerates it). The real weights/activations are loaded after
+    /// compile; these zeros exist only so the search can run. `input_zeros` is
+    /// `(node, num_bytes)` for each `Input`. The default ignores them (correct
+    /// for the CPU backend); the CUDA backend overrides it.
+    fn build_and_search_with_input_zeros(
+        cx: &mut Graph,
+        budget: usize,
+        input_zeros: &[(NodeIndex, usize)],
+    ) -> Result<Self, CompileError> {
+        let _ = input_zeros;
+        Self::build_and_search(cx, budget)
+    }
 
     /// Stage `data` into the runtime's buffer for the given input tensor.
     fn set_data_f32(&mut self, id: NodeIndex, data: Vec<f32>);
@@ -135,10 +152,23 @@ mod cuda_impl {
 
     impl ComputeRuntime for CudaComputeRuntime {
         fn build_and_search(cx: &mut Graph, budget: usize) -> Result<Self, CompileError> {
+            Self::build_and_search_with_input_zeros(cx, budget, &[])
+        }
+
+        fn build_and_search_with_input_zeros(
+            cx: &mut Graph,
+            budget: usize,
+            input_zeros: &[(NodeIndex, usize)],
+        ) -> Result<Self, CompileError> {
             cx.build_search_space::<CudaRuntime>();
-            let runtime = CudaRuntime::new().map_err(|source| CompileError::CudaRuntimeInit {
+            let mut runtime = CudaRuntime::new().map_err(|source| CompileError::CudaRuntimeInit {
                 source: Box::new(source),
             })?;
+            // Stage zero buffers for every Input so the search's graph
+            // executions have something to read (real data is loaded later).
+            for (id, num_bytes) in input_zeros {
+                runtime.set_zeros(*id, *num_bytes);
+            }
             let inner = cx.search(runtime, budget);
             Ok(Self { inner })
         }
