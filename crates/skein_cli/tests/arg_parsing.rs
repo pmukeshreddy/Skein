@@ -92,10 +92,22 @@ fn verify_parses_required_args() {
 
 #[test]
 fn serve_parses_required_args() {
-    let cli = Cli::try_parse_from(["skein", "serve", "--artifact", "/a"]).expect("serve parse");
+    let cli = Cli::try_parse_from([
+        "skein",
+        "serve",
+        "--artifact",
+        "/a",
+        "--workload",
+        "/w.jsonl",
+        "--cost",
+        "/c.toml",
+    ])
+    .expect("serve parse");
     if let Command::Serve(args) = cli.command {
         assert_eq!(args.port, 8080);
         assert!(!args.enable_hot_swap);
+        assert_eq!(args.total_kv_bytes, 268_435_456);
+        assert_eq!(args.bytes_per_token, 524_288);
     } else {
         panic!("expected Serve");
     }

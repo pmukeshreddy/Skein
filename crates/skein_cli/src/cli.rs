@@ -33,17 +33,15 @@ pub enum Command {
     Extract(ExtractArgs),
 
     /// Full compile: search + lower + Luminal compile + parity + artifact write.
-    /// Phase B (requires `--features cuda` on an NVIDIA host).
     Compile(CompileArgs),
 
-    /// Parity check on an existing artifact against the HF bf16 reference.
-    /// Phase B.
+    /// Parity check on an existing artifact against a bf16 Skein reference.
     Verify(VerifyArgs),
 
-    /// Launch the runtime server. Phase B.
+    /// Launch the runtime server.
     Serve(ServeArgs),
 
-    /// Calibrate cost constants + drift table from GPU measurements. Phase B.
+    /// Calibrate cost constants + drift table from runtime measurements.
     Calibrate(CalibrateArgs),
 
     /// Three validation metrics vs vLLM. Phase B.
@@ -134,12 +132,32 @@ pub struct VerifyArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct ServeArgs {
+    /// Path to the Skein artifact directory, or the LATEST symlink.
     #[arg(long)]
     pub artifact: PathBuf,
+
+    /// Workload trace JSONL for batcher tuning.
+    #[arg(long)]
+    pub workload: PathBuf,
+
+    /// Cost constants TOML, usually the same file passed to `skein compile`.
+    #[arg(long)]
+    pub cost: PathBuf,
+
+    /// HTTP port to bind.
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
+
     #[arg(long)]
     pub enable_hot_swap: bool,
+
+    /// Total bytes available for KV cache across all devices.
+    #[arg(long, default_value_t = 268_435_456)]
+    pub total_kv_bytes: u64,
+
+    /// Bytes consumed by each cached token.
+    #[arg(long, default_value_t = 524_288)]
+    pub bytes_per_token: u64,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -1,13 +1,18 @@
-//! Slow Mac CLI integration: compile then verify a tiny Mixtral-shaped model.
+//! Slow Mac CLI integrations over a tiny Mixtral-shaped model.
 
 #[allow(dead_code)]
 #[path = "../../skein_parity/tests/fixtures/build_tiny_artifact.rs"]
 mod tiny_artifact;
 
+use std::io;
+use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use skein_cli::cli::{CompileArgs, OutputFormat, VerifyArgs};
+use skein_cli::cli::{CompileArgs, OutputFormat, ServeArgs, VerifyArgs};
 use skein_cli::cmd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 #[test]
 #[ignore = "runs Luminal compile for a tiny end-to-end artifact"]
@@ -56,6 +61,47 @@ fn skein_compile_verify_tiny_mac() {
         OutputFormat::Json,
     )
     .expect("verify tiny artifact");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs native Luminal compile for the tiny serving artifact"]
+async fn skein_serve_cli_tiny_mac() {
+    let root = unique_temp_dir("skein-cli-serve");
+    let tiny = tiny_artifact::build_tiny_artifact(&root.join("seed"));
+    let inputs = write_inputs(&root, &tiny.root.join("tiny.weights.safetensors"));
+    let port = unused_port();
+
+    let handle = tokio::spawn({
+        let artifact = tiny.artifact_dir.clone();
+        let workload = inputs.trace.clone();
+        let cost = inputs.cost.clone();
+        async move {
+            cmd::serve::run(
+                ServeArgs {
+                    artifact,
+                    workload,
+                    cost,
+                    port,
+                    enable_hot_swap: false,
+                    total_kv_bytes: 1024 * 1024,
+                    bytes_per_token: 128,
+                },
+                OutputFormat::Text,
+            )
+            .await
+        }
+    });
+
+    wait_for_metrics(port).await;
+    let response = post_completion(port, r#"{"prompt":"Hello","max_tokens":1,"stream":true}"#)
+        .await
+        .expect("completion request");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("event: token"), "{response}");
+
+    handle.abort();
+    let _ = handle.await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 struct Inputs {
@@ -178,4 +224,59 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+async fn wait_for_metrics(port: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let request =
+            "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_string();
+        if let Ok(response) = http_exchange(port, request).await
+            && response.starts_with("HTTP/1.1 200 OK")
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not become ready on port {port}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn post_completion(port: u16, body: &str) -> io::Result<String> {
+    let request = format!(
+        "POST /v1/completions HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: text/event-stream\r\n\
+         Connection: close\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    http_exchange(port, request).await
+}
+
+async fn http_exchange(port: u16, request: String) -> io::Result<String> {
+    let fut = async move {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response).into_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP exchange timed out"))?
+}
+
+fn unused_port() -> u16 {
+    StdTcpListener::bind(("127.0.0.1", 0))
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("ephemeral local addr")
+        .port()
 }

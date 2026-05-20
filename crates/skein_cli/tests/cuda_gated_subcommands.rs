@@ -1,11 +1,10 @@
-//! Test 3 — every Phase B subcommand on Phase A returns
-//! `CliError::RequiresCuda` with a message that names the subcommand and
-//! suggests the rebuild fix.
+//! Remaining CUDA-gated subcommands return `CliError::RequiresCuda` with a
+//! message that names the subcommand and suggests the rebuild fix.
 
 use std::path::PathBuf;
 
 use skein_cli::CliError;
-use skein_cli::cli::{BenchArgs, BenchMetric, OutputFormat, ServeArgs};
+use skein_cli::cli::{BenchArgs, BenchMetric, OutputFormat};
 use skein_cli::cmd;
 
 fn assert_requires_cuda_for(err: CliError, expected_what: &str) {
@@ -34,21 +33,6 @@ fn assert_requires_cuda_for(err: CliError, expected_what: &str) {
         }
         other => panic!("expected RequiresCuda, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn serve_returns_requires_cuda_on_phase_a() {
-    let err = cmd::serve::run(
-        ServeArgs {
-            artifact: PathBuf::from("/tmp/a"),
-            port: 8080,
-            enable_hot_swap: false,
-        },
-        OutputFormat::Text,
-    )
-    .await
-    .unwrap_err();
-    assert_requires_cuda_for(err, "skein serve");
 }
 
 #[test]

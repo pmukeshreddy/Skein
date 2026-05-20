@@ -60,6 +60,9 @@ pub enum CliError {
     #[error("calibration: {0}")]
     Calibration(#[from] skein_calibrate::CalibrationError),
 
+    #[error("runtime: {0}")]
+    Runtime(#[from] skein_runtime::RuntimeError),
+
     #[error("plan hash: {0}")]
     PlanHash(#[from] skein_ir::error::PlanError),
 

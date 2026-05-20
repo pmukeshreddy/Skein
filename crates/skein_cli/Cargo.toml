@@ -7,9 +7,8 @@ license      = { workspace = true }
 
 [features]
 default = []
-# Phase B (`skein compile`, `serve`, `verify`, `calibrate`, `bench`) requires
-# CUDA. On Phase A every Phase B subcommand returns `CliError::RequiresCuda`
-# with an actionable suggestion to rebuild with this feature on an H100 host.
+# Enables CUDA-backed compile/runtime internals on NVIDIA hosts. The Mac
+# native paths stay real for compile, serve, verify, and calibrate.
 cuda = ["skein_compile/cuda"]
 
 # Hybrid layout: integration tests need to call into the command runners

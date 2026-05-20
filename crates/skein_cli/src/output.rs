@@ -141,6 +141,7 @@ fn err_kind(e: &CliError) -> &'static str {
         CliError::Compile(_) => "compile",
         CliError::Parity(_) => "parity",
         CliError::Calibration(_) => "calibration",
+        CliError::Runtime(_) => "runtime",
         CliError::PlanHash(_) => "plan_hash",
         CliError::ParityFailed { .. } => "parity_failed",
         CliError::Other(_) => "other",
