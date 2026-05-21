@@ -436,14 +436,28 @@ pub fn load_runtime_segments<R: crate::ComputeRuntime + 'static>(
     // and later boots of this artifact load instead of re-searching + re-NVRTC.
     let cache_dir = crate::search_cache::search_cache_dir(&artifact.root);
     crate::search_cache::enable_cubin_cache(&artifact.root);
+    let timing = std::env::var_os("SKEIN_TIMING").is_some();
     let mut all_devices = Vec::with_capacity(artifact.devices.len());
     for device in &artifact.devices {
+        let t_emit = std::time::Instant::now();
         let lowered = device.rebuild_graphs()?;
+        let emit_ms = t_emit.elapsed().as_secs_f64() * 1e3;
+        let t_replay = std::time::Instant::now();
         let mut runtime_segments = Vec::with_capacity(lowered.len());
+        let n_seg = lowered.len();
         for segment in lowered {
             runtime_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
         }
+        let replay_ms = t_replay.elapsed().as_secs_f64() * 1e3;
+        let t_w = std::time::Instant::now();
         load_weights_into_segments(&device.weights_path, runtime_segments.as_mut_slice())?;
+        let weight_ms = t_w.elapsed().as_secs_f64() * 1e3;
+        if timing {
+            eprintln!(
+                "SKEIN_TIMING device {} ({n_seg} segs): emit {emit_ms:.0}ms | graph-replay(cache) {replay_ms:.0}ms | weight-load+convert {weight_ms:.0}ms",
+                device.device_idx
+            );
+        }
         all_devices.push(runtime_segments);
     }
     Ok(all_devices)

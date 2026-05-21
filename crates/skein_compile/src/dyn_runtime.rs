@@ -276,4 +276,32 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     fn set_dyn_dim(&mut self, dim: char, val: usize) {
         self.graph.dyn_map.insert(dim, val);
     }
+
+    fn set_tensor_bytes_by_name(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        dtype: WeightDtype,
+    ) -> Result<(), DynRuntimeError> {
+        let node = self.input_node_for(name)?;
+        let input_dtype = self
+            .graph
+            .input_meta
+            .get(&node)
+            .map(|(_, dt)| *dt)
+            .unwrap_or(DType::F32);
+        // Fast path: bf16 weight bytes into a bf16 input slot — reinterpret and
+        // upload the bf16 directly, skipping the bf16->f32->bf16 round-trip and
+        // the 2x host RAM. Weights are set once before execute, so bypassing the
+        // f32 staging (which only the per-step handoffs need) is safe.
+        if dtype == WeightDtype::Bf16
+            && input_dtype == DType::Bf16
+            && self.input_nodes.contains(&node)
+        {
+            self.inner.set_data_bf16_bytes(node, bytes);
+            return Ok(());
+        }
+        let data = decode_weight_bytes(name, bytes, dtype)?;
+        self.set_tensor_by_name(name, data)
+    }
 }

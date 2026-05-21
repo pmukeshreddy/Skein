@@ -54,16 +54,27 @@ pub fn run_verify_inner<R: ComputeRuntime + 'static>(
         // against the CUDA dump: if they match, a divergence from HF is a
         // wiring/lowering bug; if they differ, it is CUDA codegen of the
         // composed graph.
+        let timing = std::env::var_os("SKEIN_TIMING").is_some();
         let out = if std::env::var_os("SKEIN_DUMP_NATIVE").is_some() {
             eprintln!("dump-only: using NativeComputeRuntime (CPU)");
             let mut candidate = RealSkeinForward::load_native(&args.artifact)?;
             candidate.forward_with_hooks(&tokens)?
         } else {
+            let t_load = std::time::Instant::now();
             let mut candidate = RealSkeinForward::load_with_runtime::<R>(
                 &args.artifact,
                 skein_compile::DEFAULT_SEARCH_BUDGET,
             )?;
-            candidate.forward_with_hooks(&tokens)?
+            let load_s = t_load.elapsed().as_secs_f64();
+            let t_fwd = std::time::Instant::now();
+            let out = candidate.forward_with_hooks(&tokens)?;
+            let fwd_s = t_fwd.elapsed().as_secs_f64();
+            if timing {
+                eprintln!(
+                    "SKEIN_TIMING TOTAL: load(graph+weights) {load_s:.1}s | forward {fwd_s:.1}s",
+                );
+            }
+            out
         };
         let argmax = out
             .final_logits

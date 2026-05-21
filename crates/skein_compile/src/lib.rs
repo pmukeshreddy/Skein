@@ -96,6 +96,19 @@ pub trait ComputeRuntime: Sized {
         self.set_data_f32(id, data);
     }
 
+    /// Upload raw bf16 weight bytes straight into a bf16 input buffer, skipping
+    /// the bf16->f32->bf16 round-trip the f32 path forces (which, on ~90 GB of
+    /// weights, costs tens of seconds of CPU and 2x host RAM). Default decodes to
+    /// f32 then narrows (correct for any backend, e.g. the CPU runtime); the CUDA
+    /// backend overrides it to reinterpret the bytes as bf16 and upload directly.
+    fn set_data_bf16_bytes(&mut self, id: NodeIndex, bytes: &[u8]) {
+        let data: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect();
+        self.set_data_f32_as(id, data, DType::Bf16);
+    }
+
     /// Stage integer token/index data into the runtime's buffer.
     fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>);
 
@@ -259,6 +272,16 @@ mod cuda_impl {
                 }
                 _ => self.inner.set_data(id, data),
             }
+        }
+
+        fn set_data_bf16_bytes(&mut self, id: NodeIndex, bytes: &[u8]) {
+            // Reinterpret the bf16 bytes directly as bf16 (the safetensors bytes
+            // ARE the bf16 bits) and upload — no f32 round-trip, no 2x host RAM.
+            let bf: Vec<half::bf16> = bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            self.inner.set_data(id, bf);
         }
 
         fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>) {
