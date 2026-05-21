@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use luminal::hlir::Input;
-use luminal::prelude::{Graph, NodeIndex};
+use luminal::prelude::{DType, Graph, NodeIndex};
 
 use crate::ComputeRuntime;
 
@@ -212,7 +212,16 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
         self.external_f32.clear();
         for (node, data) in self.staged_f32.clone() {
-            self.inner.set_data_f32(node, data);
+            // Narrow to the input's declared dtype (bf16/f16) so a bf16 input
+            // slot receives bf16, not raw f32 bytes. input_meta carries the
+            // graph's per-Input dtype; default f32 when absent.
+            let dtype = self
+                .graph
+                .input_meta
+                .get(&node)
+                .map(|(_, dt)| *dt)
+                .unwrap_or(DType::F32);
+            self.inner.set_data_f32_as(node, data, dtype);
         }
         for (node, data) in self.staged_i32.clone() {
             self.inner.set_data_i32(node, data);

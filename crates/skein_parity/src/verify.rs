@@ -104,13 +104,25 @@ pub fn verify_plan(
             });
         }
 
+        // The reference may return activations/logits for every prompt position
+        // ([seq, hidden] / [seq, vocab]); Skein's cached-decode returns only the
+        // last token. Compare the last position by slicing the reference's final
+        // row (a no-op when both sides are already last-token-only).
+        let last_row = |r: &[f32], n: usize| -> Vec<f32> {
+            if n > 0 && r.len() >= n && r.len() % n == 0 {
+                r[r.len() - n..].to_vec()
+            } else {
+                r.to_vec()
+            }
+        };
         let per_layer_mse: Vec<f64> = ref_out
             .per_layer_activations
             .iter()
             .zip(skein_out.per_layer_activations.iter())
-            .map(|(r, s)| mse(r, s))
+            .map(|(r, s)| mse(&last_row(r, s.len()), s))
             .collect::<Result<_, _>>()?;
-        let final_kl = kl_divergence(&ref_out.final_logits, &skein_out.final_logits)?;
+        let ref_logits_last = last_row(&ref_out.final_logits, skein_out.final_logits.len());
+        let final_kl = kl_divergence(&ref_logits_last, &skein_out.final_logits)?;
 
         for (layer_idx, &measured) in per_layer_mse.iter().enumerate() {
             let tol = tolerance_for_layer(layer_idx, plan, tolerances);
@@ -222,13 +234,25 @@ pub fn verify_skein_pair(
             });
         }
 
+        // The reference may return activations/logits for every prompt position
+        // ([seq, hidden] / [seq, vocab]); Skein's cached-decode returns only the
+        // last token. Compare the last position by slicing the reference's final
+        // row (a no-op when both sides are already last-token-only).
+        let last_row = |r: &[f32], n: usize| -> Vec<f32> {
+            if n > 0 && r.len() >= n && r.len() % n == 0 {
+                r[r.len() - n..].to_vec()
+            } else {
+                r.to_vec()
+            }
+        };
         let per_layer_mse: Vec<f64> = ref_out
             .per_layer_activations
             .iter()
             .zip(skein_out.per_layer_activations.iter())
-            .map(|(r, s)| mse(r, s))
+            .map(|(r, s)| mse(&last_row(r, s.len()), s))
             .collect::<Result<_, _>>()?;
-        let final_kl = kl_divergence(&ref_out.final_logits, &skein_out.final_logits)?;
+        let ref_logits_last = last_row(&ref_out.final_logits, skein_out.final_logits.len());
+        let final_kl = kl_divergence(&ref_logits_last, &skein_out.final_logits)?;
 
         for (layer_idx, &measured) in per_layer_mse.iter().enumerate() {
             let tol = tolerance_for_layer(layer_idx, plan, tolerances);

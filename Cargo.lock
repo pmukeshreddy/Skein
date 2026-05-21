@@ -2678,6 +2678,7 @@ name = "skein_compile"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "half",
  "luminal",
  "luminal_cuda_lite",
  "safetensors 0.4.5",

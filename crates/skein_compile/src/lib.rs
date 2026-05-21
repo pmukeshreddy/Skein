@@ -16,7 +16,7 @@
 //!   exercises a real Luminal compile-and-execute path without a GPU.
 
 use luminal::op::Runtime;
-use luminal::prelude::{Graph, NativeRuntime, NodeIndex};
+use luminal::prelude::{DType, Graph, NativeRuntime, NodeIndex};
 
 pub mod artifact;
 pub mod dyn_runtime;
@@ -65,6 +65,17 @@ pub trait ComputeRuntime: Sized {
 
     /// Stage `data` into the runtime's buffer for the given input tensor.
     fn set_data_f32(&mut self, id: NodeIndex, data: Vec<f32>);
+
+    /// Stage f32 `data` into an input the graph types as `dtype`, narrowing to
+    /// bf16/f16 when needed. Host handoffs/KV are carried as `Vec<f32>`, but the
+    /// graph's input buffers are bf16; uploading raw f32 bytes into a bf16 slot
+    /// (or reading bf16 back as f32 — see `get_f32`) silently halves and
+    /// corrupts the data. The default keeps f32 (correct for the all-f32 CPU
+    /// backend); the CUDA backend overrides it.
+    fn set_data_f32_as(&mut self, id: NodeIndex, data: Vec<f32>, dtype: DType) {
+        let _ = dtype;
+        self.set_data_f32(id, data);
+    }
 
     /// Stage integer token/index data into the runtime's buffer.
     fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>);
@@ -175,6 +186,24 @@ mod cuda_impl {
 
         fn set_data_f32(&mut self, id: NodeIndex, data: Vec<f32>) {
             self.inner.set_data(id, data);
+        }
+
+        fn set_data_f32_as(&mut self, id: NodeIndex, data: Vec<f32>, dtype: DType) {
+            // Narrow to the input's real dtype so a bf16 input slot receives
+            // bf16 (matching get_f32's bf16->f32 widening on the read side).
+            match dtype {
+                DType::Bf16 => {
+                    let bf: Vec<half::bf16> =
+                        data.into_iter().map(half::bf16::from_f32).collect();
+                    self.inner.set_data(id, bf);
+                }
+                DType::F16 => {
+                    let h: Vec<half::f16> =
+                        data.into_iter().map(half::f16::from_f32).collect();
+                    self.inner.set_data(id, h);
+                }
+                _ => self.inner.set_data(id, data),
+            }
         }
 
         fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>) {

@@ -101,6 +101,12 @@ impl<S: LocalSegments> RankExecutor<S> {
         schedule: &[SequenceStep],
         collective: &C,
     ) -> Result<(), RankExecError> {
+        // --- profiling: total time in local segment execution vs in NCCL
+        // collectives (host read -> NCCL -> host write), summed over one forward
+        // pass. Tests whether the bottleneck is compute/host staging (segments)
+        // or the collective/communication path.
+        let mut seg_us: u128 = 0;
+        let mut comm_us: u128 = 0;
         for step in schedule {
             match step {
                 SequenceStep::ExecuteSegment {
@@ -108,7 +114,9 @@ impl<S: LocalSegments> RankExecutor<S> {
                     segment_idx,
                 } => {
                     if *device_idx as usize == self.rank {
+                        let t = std::time::Instant::now();
                         self.runner.run_segment(*segment_idx)?;
+                        seg_us += t.elapsed().as_micros();
                     }
                 }
                 SequenceStep::Collective {
@@ -118,13 +126,20 @@ impl<S: LocalSegments> RankExecutor<S> {
                     ..
                 } => {
                     if participants.iter().any(|p| *p as usize == self.rank) {
+                        let t = std::time::Instant::now();
                         let mut buf = self.runner.read(tensor)?;
                         apply_collective(collective, *kind, participants, &mut buf)?;
                         self.runner.write(tensor, buf)?;
+                        comm_us += t.elapsed().as_micros();
                     }
                 }
             }
         }
+        tracing::info!(
+            seg_us,
+            comm_us,
+            "SKEIN_PERF_STEP: segment-exec vs collective time for one forward pass"
+        );
         Ok(())
     }
 }

@@ -29,6 +29,7 @@ bincode    = { workspace = true }
 safetensors = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
+half       = { version = "2.7.1", features = ["num-traits"] }
 
 # `luminal_cuda_lite` is a sibling crate inside the Luminal repo (at
 # `crates/luminal_cuda_lite`). Cargo resolves it from the same git rev as

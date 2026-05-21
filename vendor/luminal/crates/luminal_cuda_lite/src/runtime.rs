@@ -549,13 +549,42 @@ impl CudaRuntime {
         }
     }
 
+    /// Dtype of the buffer backing output tensor `id`, if the compiled bucket
+    /// recorded a spec for it. Mirrors the spec lookup `get_output_data` uses.
+    fn output_dtype(&self, id: impl ToId) -> Option<DType> {
+        let data_id = self.resolve_data_node(id);
+        self.active()
+            .buffer_specs
+            .get(&data_id)
+            .map(|spec| spec.dtype)
+    }
+
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
+        let id = id.to_id();
+        // bf16/f16 outputs must be *widened* to f32, not byte-reinterpreted: a
+        // raw `as *mut f32` cast halves the element count (2 bytes -> 4) and
+        // turns pairs of half-precision values into garbage f32s. (This was the
+        // root cause of 32000-vocab logits read as 16000 and 4096-hidden
+        // activations read as 2048 -> incoherent decode + parity shape mismatch.)
+        let dtype = self.output_dtype(id);
         let bytes = self.get_output_data(id);
-        let n = bytes.len() / 4;
-        let cap = bytes.capacity() / 4;
-        let ptr = bytes.as_ptr() as *mut f32;
-        std::mem::forget(bytes);
-        unsafe { Vec::from_raw_parts(ptr, n, cap) }
+        match dtype {
+            Some(DType::Bf16) => bytes
+                .chunks_exact(2)
+                .map(|c| bf16::from_bits(u16::from_ne_bytes([c[0], c[1]])).to_f32())
+                .collect(),
+            Some(DType::F16) => bytes
+                .chunks_exact(2)
+                .map(|c| f16::from_bits(u16::from_ne_bytes([c[0], c[1]])).to_f32())
+                .collect(),
+            _ => {
+                let n = bytes.len() / 4;
+                let cap = bytes.capacity() / 4;
+                let ptr = bytes.as_ptr() as *mut f32;
+                std::mem::forget(bytes);
+                unsafe { Vec::from_raw_parts(ptr, n, cap) }
+            }
+        }
     }
 
     /// Take a GPU buffer handle for an output tensor. This removes the buffer from

@@ -104,6 +104,11 @@ impl LocalSegments for SegmentRunner {
         };
         let err = Self::segment_err(segment_idx);
 
+        // --- profiling: time host-input staging vs GPU launch vs host-output
+        // capture (the dtoh in capture forces a sync, so host_out_us absorbs the
+        // actual GPU compute wait). Logged per segment for the profiling pass.
+        let t_in = std::time::Instant::now();
+
         // Feed inputs. A `kvcache_*` input is fed the whole fixed-capacity cache
         // buffer for its layer (slots 0..position valid); otherwise from the
         // handoff store (i32 wins when both exist — only `input_tokens` is i32
@@ -135,11 +140,16 @@ impl LocalSegments for SegmentRunner {
             // weight already loaded into the runtime); not an error here.
         }
 
+        let host_in_us = t_in.elapsed().as_micros();
+
+        let t_gpu = std::time::Instant::now();
         self.segments[segment_idx]
             .runtime
             .execute_segment()
             .map_err(&err)?;
+        let gpu_launch_us = t_gpu.elapsed().as_micros();
 
+        let t_out = std::time::Instant::now();
         // Capture named outputs. A `kvcache_*` output is the new token's K/V —
         // written into slot `position` of the fixed cache so the next step
         // attends over it; everything else goes to the handoff store for
@@ -155,6 +165,14 @@ impl LocalSegments for SegmentRunner {
                 self.handoffs.insert(name.clone(), data);
             }
         }
+        let host_out_us = t_out.elapsed().as_micros();
+        tracing::info!(
+            segment_idx,
+            host_in_us,
+            gpu_launch_us,
+            host_out_us,
+            "SKEIN_SEG"
+        );
         Ok(())
     }
 
