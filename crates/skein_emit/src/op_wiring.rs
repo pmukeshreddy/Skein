@@ -374,10 +374,14 @@ impl<'a> DeviceWiring<'a> {
         // buffer the collective produced (point.dtype is the planner's original
         // activation dtype and can disagree).
         let coll_dtype = coll_live.dtype;
+        // Real handoff shape (carries the actual seq, e.g. seq=N for prefill),
+        // used for the re-introduction below — `point.shape` is the planner's
+        // decode-time shape (seq=1) and would mismatch the seq=N tensor.
+        let coll_shape = coll_live.shape.clone();
         output_handoff.push(HandoffTensor {
             logical_name: collective_tensor.to_string(),
             luminal_id: coll_output.id,
-            shape: coll_live.shape.clone(),
+            shape: coll_shape.clone(),
             dtype: coll_dtype,
         });
         let mut carry_specs: Vec<HandoffSpec> = Vec::new();
@@ -417,7 +421,7 @@ impl<'a> DeviceWiring<'a> {
         let mut next_inputs = Vec::new();
         next_inputs.push(HandoffSpec {
             logical_name: point.tensor.clone(),
-            shape: point.shape.clone(),
+            shape: coll_shape,
             dtype: coll_dtype,
         });
         next_inputs.extend(carry_specs);
@@ -532,19 +536,31 @@ impl<'a> DeviceWiring<'a> {
             .live
             .remove(&last_carry_name)
             .expect("last carry tensor missing from live");
-        let final_hidden = final_hidden_live.tensor;
+        // Prefill (seq>1): only the LAST token's logits are needed (the
+        // next-token prediction). Slice to the final position before the norm +
+        // LM head — cheaper than computing logits for every position, and it
+        // keeps the logits a single row so the vocab AllGather is the same
+        // [.,1,vocab] layout decode uses (a per-position gather would interleave
+        // wrong). out_seq is the logits sequence length (always 1 here).
+        let final_hidden = if self.seq > 1 {
+            final_hidden_live
+                .tensor
+                .slice((.., self.seq - 1.., ..))
+        } else {
+            final_hidden_live.tensor
+        };
+        let out_seq = 1usize;
 
         let final_norm_w = self.weight("model.norm.weight")?;
         let normed = rms_norm(final_hidden, final_norm_w, self.ir.meta.rms_norm_eps);
 
         let placement = skein_cost::cluster::Placement::from_plan(self.plan);
         let lm_head_w = self.weight("lm_head.weight")?;
-        // With a vocab-sharded LM head this produces `[batch, seq, vocab/tp]`;
-        // replicated, it produces the full `[batch, seq, vocab]`. The bf16
-        // cublasLt output reads back at full width now that the runtime records
-        // the op's real output dtype (luminal HostOp::output_dtype).
+        // Vocab-sharded LM head → `[batch, out_seq, vocab/tp]`; replicated → full
+        // `[batch, out_seq, vocab]`. cublasLt bf16 output reads back full-width
+        // (luminal HostOp::output_dtype records the real dtype).
         let logits_local = normed.matmul(lm_head_w.permute((1, 0)));
-        let full_shape = vec![self.batch, self.seq, self.ir.meta.vocab];
+        let full_shape = vec![self.batch, out_seq, self.ir.meta.vocab];
 
         if placement.tp > 1 {
             let vocab_local = self
@@ -556,7 +572,7 @@ impl<'a> DeviceWiring<'a> {
                 LOGITS.to_string(),
                 LiveTensor {
                     tensor: logits_local,
-                    shape: vec![self.batch, self.seq, vocab_local],
+                    shape: vec![self.batch, out_seq, vocab_local],
                     dtype: self.activation_dtype,
                 },
             );

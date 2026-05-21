@@ -268,12 +268,9 @@ impl<'a> TopologyExecutor<'a> {
                     }
                 }
             }
-            // final_logits is [n, vocab] over all prompt positions; return the
-            // last token's row (the next-token prediction), matching decode.
-            if n > 1 && !final_logits.is_empty() && final_logits.len() % n == 0 {
-                let vocab = final_logits.len() / n;
-                return Ok(final_logits[(n - 1) * vocab..].to_vec());
-            }
+            // The prefill graph slices to the last token before the LM head, so
+            // final_logits is already the [vocab] next-token prediction.
+            let _ = n;
             return Ok(final_logits);
         }
 
