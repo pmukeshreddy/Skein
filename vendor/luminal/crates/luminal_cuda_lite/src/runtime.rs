@@ -337,6 +337,17 @@ impl CudaRuntime {
         self.changed_hlir.insert(id);
     }
 
+    /// Device pointer of an already-resident input/weight buffer, if any. Used to
+    /// share one graph's resident weights with another graph (e.g. a decode graph
+    /// and a seq=N prefill graph) via `set_device_ptr`, instead of loading a
+    /// second copy. Returns None if the node has no buffer yet.
+    pub fn hlir_device_ptr(&self, id: impl ToId) -> Option<u64> {
+        match self.hlir_buffers.get(&id.to_id())? {
+            CudaInput::Buffer(buf) => Some(buf.device_ptr(&self.cuda_stream).0),
+            CudaInput::Ptr(p) => Some(*p),
+        }
+    }
+
     /// Set an external CUDA device pointer as input data. Zero-copy.
     /// The caller must ensure the pointer remains valid for the runtime's lifetime.
     ///

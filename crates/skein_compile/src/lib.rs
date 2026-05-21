@@ -105,6 +105,24 @@ pub trait ComputeRuntime: Sized {
         self.set_data_f32_as(id, data, dtype);
     }
 
+    /// Device pointer of an already-resident input buffer (e.g. a loaded weight),
+    /// for sharing it with another graph instead of loading a second copy. CUDA
+    /// only — returns None on backends without device pointers.
+    fn input_device_ptr(&self, id: NodeIndex) -> Option<u64> {
+        let _ = id;
+        None
+    }
+
+    /// Point an input at an external device buffer owned elsewhere (zero-copy
+    /// shared weights). CUDA only; a no-op default. `n_bytes` is the buffer size.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of at least `n_bytes` on this
+    /// runtime's device, kept alive for the runtime's lifetime.
+    unsafe fn set_input_device_ptr(&mut self, id: NodeIndex, ptr: u64, n_bytes: usize) {
+        let _ = (id, ptr, n_bytes);
+    }
+
     /// Upload raw bf16 weight bytes straight into a bf16 input buffer, skipping
     /// the bf16->f32->bf16 round-trip the f32 path forces (which, on ~90 GB of
     /// weights, costs tens of seconds of CPU and 2x host RAM). Default decodes to
@@ -298,6 +316,17 @@ mod cuda_impl {
             // keeps the buffer across forwards instead of consuming it — weights
             // are uploaded once, not re-fed every step.
             self.set_data_f32_as(id, data, dtype);
+            self.inner.mark_hlir_persistent(id);
+        }
+
+        fn input_device_ptr(&self, id: NodeIndex) -> Option<u64> {
+            self.inner.hlir_device_ptr(id)
+        }
+
+        unsafe fn set_input_device_ptr(&mut self, id: NodeIndex, ptr: u64, n_bytes: usize) {
+            // Zero-copy: point this input at a weight buffer owned by another
+            // (decode) graph, and mark it persistent so it is never consumed.
+            unsafe { self.inner.set_device_ptr(id, ptr, n_bytes) };
             self.inner.mark_hlir_persistent(id);
         }
 
