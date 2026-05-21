@@ -138,6 +138,15 @@ impl SegmentRunner {
         &self.segments
     }
 
+    /// Free every segment's intermediate-buffer arena (re-allocated lazily on
+    /// next execute). Frees the search/compile arenas so two graphs' arenas
+    /// (decode + prefill) aren't resident simultaneously.
+    pub fn clear_intermediates(&mut self) {
+        for seg in &mut self.segments {
+            seg.runtime.clear_intermediates();
+        }
+    }
+
     /// Borrow the paged KV cache (e.g. to inspect page utilisation).
     pub fn kv(&self) -> &PagedKvCache {
         &self.kv

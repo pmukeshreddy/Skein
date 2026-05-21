@@ -328,6 +328,18 @@ impl CudaRuntime {
         self.persistent_hlir_inputs.insert(id.to_id());
     }
 
+    /// Free every bucket's intermediate-buffer arena (re-allocated lazily on the
+    /// next execute). Persistent inputs/weights are untouched. Lets a caller
+    /// reclaim a graph's arena between forwards so two graphs' arenas aren't
+    /// resident at once. Public inherent twin of the `Runtime` trait method.
+    pub fn free_intermediate_arenas(&mut self) {
+        let _ = self.cuda_stream.synchronize();
+        for bucket in &mut self.compiled_buckets {
+            bucket.arena = None;
+            bucket.cached_buffer_ptrs.clear();
+        }
+    }
+
     /// Allocate a zeroed GPU buffer for the given node. This is more efficient than
     /// `set_data` with a host-side zero vector since it avoids the host allocation and H2D copy.
     pub fn set_zeros(&mut self, id: impl ToId, num_bytes: usize) {

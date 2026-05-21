@@ -113,6 +113,12 @@ pub trait ComputeRuntime: Sized {
         None
     }
 
+    /// Free this runtime's intermediate-buffer arena (re-allocated lazily on the
+    /// next execute). Persistent inputs/weights are untouched. Called after
+    /// load/search and between the prefill and decode graphs so two graphs'
+    /// arenas aren't resident at once (they alternate). CUDA only; no-op default.
+    fn clear_intermediates(&mut self) {}
+
     /// Point an input at an external device buffer owned elsewhere (zero-copy
     /// shared weights). CUDA only; a no-op default. `n_bytes` is the buffer size.
     ///
@@ -321,6 +327,10 @@ mod cuda_impl {
 
         fn input_device_ptr(&self, id: NodeIndex) -> Option<u64> {
             self.inner.hlir_device_ptr(id)
+        }
+
+        fn clear_intermediates(&mut self) {
+            self.inner.free_intermediate_arenas();
         }
 
         unsafe fn set_input_device_ptr(&mut self, id: NodeIndex, ptr: u64, n_bytes: usize) {

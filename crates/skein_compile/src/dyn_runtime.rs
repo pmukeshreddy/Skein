@@ -146,6 +146,10 @@ pub trait DynRuntime {
     /// a sibling prefill graph shares them by pointer. Default: no-op.
     fn materialize_weights(&mut self) {}
 
+    /// Free the intermediate-buffer arena (re-allocated lazily next execute);
+    /// persistent weights untouched. Default: no-op.
+    fn clear_intermediates(&mut self) {}
+
     /// Device pointer of a resident weight buffer, by tensor name (CUDA only).
     fn weight_device_ptr_by_name(&self, _name: &str) -> Option<u64> {
         None
@@ -338,6 +342,10 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             self.inner.set_data_persistent_f32_as(node, data, dtype);
         }
         self.weights_loaded = true;
+    }
+
+    fn clear_intermediates(&mut self) {
+        self.inner.clear_intermediates();
     }
 
     fn weight_device_ptr_by_name(&self, name: &str) -> Option<u64> {

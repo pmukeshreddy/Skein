@@ -113,13 +113,19 @@ impl RankServer {
                 executor.runner().segments(),
             )
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-            Some(RankExecutor::new(
-                layout.rank,
-                SegmentRunner::new(prefill_segs),
-            ))
+            let mut pe = RankExecutor::new(layout.rank, SegmentRunner::new(prefill_segs));
+            pe.runner_mut().clear_intermediates(); // free prefill search arenas
+            Some(pe)
         } else {
             None
         };
+
+        // Free the per-segment search/compile arenas now (re-allocated lazily on
+        // execute). Otherwise both graphs' ~15 GB of arenas stay resident on top
+        // of the 47 GB weights and the first prefill execute OOMs the 96 GB card.
+        if prefill.is_some() {
+            executor.runner_mut().clear_intermediates();
+        }
 
         Ok(Self {
             layout,
@@ -235,6 +241,9 @@ impl RankServer {
             }
         }
         let logits = prefill.runner().read_handoff(LOGITS);
+        // Free the prefill arena before decode so it isn't resident alongside the
+        // decode arena + the 47 GB weights.
+        prefill.runner_mut().clear_intermediates();
         self.prefill = Some(prefill);
         logits.ok_or_else(|| RuntimeError::ServerInit("prefill produced no logits".into()))
     }
