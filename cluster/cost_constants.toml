@@ -53,12 +53,14 @@ int4     = 3958.0
 # 5th-gen Blackwell tensor ratio):
 #   - FP4  dense  = 2014.8 TFLOPS  (4029.7 sparse / 2)
 #   - FP8/INT8    = 1007.4 TFLOPS  (FP4 dense / 2)
-#   - BF16/FP16   =  503.8 TFLOPS  (FP8 dense / 2)
+#   - BF16/FP16   = 1008.0 TFLOPS  (FP16-accumulate tensor path; 2x the
+#                  503.8 FP32-accumulate rate). LLM GEMMs here run the
+#                  FP16-accumulate path, so this is the right ceiling.
 # These are *peak* numbers; sustained efficiency comes from the [efficiency.*]
 # tables. Recalibrate against the real cards with `skein calibrate`.
 [peak_tflops.rtx_pro_6000_blackwell]
-bf16     = 503.8
-fp16     = 503.8
+bf16     = 1008.0
+fp16     = 1008.0
 fp8_e4m3 = 1007.4
 fp8_e5m2 = 1007.4
 int8     = 1007.4
