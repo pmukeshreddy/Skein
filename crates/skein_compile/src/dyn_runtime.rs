@@ -140,6 +140,24 @@ pub trait DynRuntime {
         let data = decode_weight_bytes(name, bytes, dtype)?;
         self.set_tensor_by_name(name, data)
     }
+
+    /// Upload any staged weights now (as persistent inputs) instead of lazily on
+    /// the first execute. Used so a decode graph's weights are GPU-resident before
+    /// a sibling prefill graph shares them by pointer. Default: no-op.
+    fn materialize_weights(&mut self) {}
+
+    /// Device pointer of a resident weight buffer, by tensor name (CUDA only).
+    fn weight_device_ptr_by_name(&self, _name: &str) -> Option<u64> {
+        None
+    }
+
+    /// Point a weight input at an external device buffer (shared weights), by
+    /// tensor name. `n_bytes` is the buffer size. CUDA only; default no-op.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `n_bytes` kept alive for this
+    /// runtime's lifetime.
+    unsafe fn set_weight_device_ptr_by_name(&mut self, _name: &str, _ptr: u64, _n_bytes: usize) {}
 }
 
 pub struct DynRuntimeWrapper<R: ComputeRuntime> {
@@ -220,21 +238,9 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
         self.external_f32.clear();
         // Weights: upload exactly once, as PERSISTENT inputs (kept across
-        // forwards), then drop the host copies. This is the difference between
-        // re-uploading ~90 GB every forward (~78s) and uploading it once.
-        if !self.weights_loaded {
-            let weights = std::mem::take(&mut self.staged_weights);
-            for (node, data) in weights {
-                let dtype = self
-                    .graph
-                    .input_meta
-                    .get(&node)
-                    .map(|(_, dt)| *dt)
-                    .unwrap_or(DType::F32);
-                self.inner.set_data_persistent_f32_as(node, data, dtype);
-            }
-            self.weights_loaded = true;
-        }
+        // forwards). This is the difference between re-uploading ~90 GB every
+        // forward (~78s) and uploading it once.
+        self.materialize_weights();
         for (node, data) in self.staged_f32.clone() {
             // Narrow to the input's declared dtype (bf16/f16) so a bf16 input
             // slot receives bf16, not raw f32 bytes. input_meta carries the
@@ -315,5 +321,38 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
         let data = decode_weight_bytes(name, bytes, dtype)?;
         self.staged_weights.insert(node, data);
         Ok(())
+    }
+
+    fn materialize_weights(&mut self) {
+        if self.weights_loaded {
+            return;
+        }
+        let weights = std::mem::take(&mut self.staged_weights);
+        for (node, data) in weights {
+            let dtype = self
+                .graph
+                .input_meta
+                .get(&node)
+                .map(|(_, dt)| *dt)
+                .unwrap_or(DType::F32);
+            self.inner.set_data_persistent_f32_as(node, data, dtype);
+        }
+        self.weights_loaded = true;
+    }
+
+    fn weight_device_ptr_by_name(&self, name: &str) -> Option<u64> {
+        // Weights are declared tensors → name_to_node (not input_handoff).
+        let node = self.name_to_node.get(name).copied()?;
+        self.inner.input_device_ptr(node)
+    }
+
+    unsafe fn set_weight_device_ptr_by_name(&mut self, name: &str, ptr: u64, n_bytes: usize) {
+        if let Some(node) = self.name_to_node.get(name).copied() {
+            unsafe { self.inner.set_input_device_ptr(node, ptr, n_bytes) };
+            // It is now resident via the shared pointer; don't also try to load
+            // it from staged_weights on first execute.
+            self.staged_weights.remove(&node);
+            self.weights_loaded = true;
+        }
     }
 }

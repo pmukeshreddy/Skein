@@ -98,6 +98,20 @@ pub struct DeviceArtifactLoaded {
 impl DeviceArtifactLoaded {
     /// Materialize live Luminal graphs from the serialized recipe.
     pub fn rebuild_graphs(&self) -> Result<Vec<LoweredSegment>, CompileError> {
+        self.rebuild_graphs_inner(None)
+    }
+
+    /// Rebuild this device's graph at an explicit sequence length (`seq > 1` =
+    /// batched-prefill graph). The serve uses this to build a prefill graph
+    /// alongside the seq=1 decode graph from the same artifact.
+    pub fn rebuild_graphs_with_seq(&self, seq: usize) -> Result<Vec<LoweredSegment>, CompileError> {
+        self.rebuild_graphs_inner(Some(seq))
+    }
+
+    fn rebuild_graphs_inner(
+        &self,
+        seq: Option<usize>,
+    ) -> Result<Vec<LoweredSegment>, CompileError> {
         let recipe = self
             .segments
             .first()
@@ -120,8 +134,16 @@ impl DeviceArtifactLoaded {
                 let ir: Graph = serde_json::from_slice(&ir_json)
                     .map_err(|source| CompileError::RecipeJson { what: "ir", source })?;
                 let cluster = Cluster::from_spec(cluster);
-                let lowered =
-                    skein_emit::build_device_graph(&self.plan, &cluster, &ir, device_idx)?;
+                let lowered = match seq {
+                    Some(s) => skein_emit::build_device_graph_with_seq(
+                        &self.plan,
+                        &cluster,
+                        &ir,
+                        device_idx,
+                        s,
+                    )?,
+                    None => skein_emit::build_device_graph(&self.plan, &cluster, &ir, device_idx)?,
+                };
                 Ok(lowered.segments)
             }
         }

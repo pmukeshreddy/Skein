@@ -32,7 +32,9 @@ pub mod topology;
 pub mod weights;
 
 pub use error::EmitError;
-pub use graph_builder::{DeclaredTensor, LoweredGraph, build_device_graph};
+pub use graph_builder::{
+    DeclaredTensor, LoweredGraph, build_device_graph, build_device_graph_with_seq,
+};
 pub use handoff::{CollectivePoint, device_collective_points};
 pub use io_manifest::{IoManifest, IoTensor, IoTensorKind};
 pub use segment::{HandoffTensor, Segment, SequenceStep};

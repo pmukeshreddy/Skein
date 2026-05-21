@@ -491,6 +491,62 @@ pub fn load_device_runtime_segments<R: crate::ComputeRuntime + 'static>(
     Ok(runtime_segments)
 }
 
+/// Build this device's **batched-prefill** graph (seq=N) and wire its weight
+/// inputs to the already-resident weights of the decode graph by device pointer,
+/// instead of loading a second ~47 GB/device copy (which would OOM a 96 GB card).
+///
+/// `decode_segments` must already have their weights materialized on the GPU
+/// (call [`DynRuntime::materialize_weights`] on each first). Weights are bf16 in
+/// the runtime weight-load path, so byte sizes are computed as `elems * 2`.
+pub fn load_device_prefill_segments<R: crate::ComputeRuntime + 'static>(
+    artifact: &SkeinArtifact,
+    device_idx: usize,
+    search_budget: usize,
+    seq: usize,
+    decode_segments: &[RuntimeSegment],
+) -> Result<Vec<RuntimeSegment>, CompileError> {
+    let device = artifact
+        .devices
+        .iter()
+        .find(|d| d.device_idx == device_idx)
+        .ok_or(CompileError::MissingSegment {
+            device_idx,
+            segment_idx: 0,
+        })?;
+    let cache_dir = crate::search_cache::search_cache_dir(&artifact.root);
+    crate::search_cache::enable_cubin_cache(&artifact.root);
+
+    // Map weight name -> (device_ptr, n_bytes) from the resident decode weights.
+    let mut weight_ptrs: HashMap<String, (u64, usize)> = HashMap::new();
+    for seg in decode_segments {
+        for (name, shape) in &seg.weight_names {
+            if let Some(ptr) = seg.runtime.weight_device_ptr_by_name(name) {
+                let n_bytes = shape.iter().product::<usize>() * 2; // bf16
+                weight_ptrs.insert(name.clone(), (ptr, n_bytes));
+            }
+        }
+    }
+
+    let lowered = device.rebuild_graphs_with_seq(seq)?;
+    let mut prefill_segments = Vec::with_capacity(lowered.len());
+    for segment in lowered {
+        prefill_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
+    }
+    // Share weights into the prefill graph (no second copy loaded).
+    for seg in &mut prefill_segments {
+        let names: Vec<String> = seg.weight_names.iter().map(|(n, _)| n.clone()).collect();
+        for name in names {
+            if let Some((ptr, n_bytes)) = weight_ptrs.get(&name).copied() {
+                unsafe {
+                    seg.runtime
+                        .set_weight_device_ptr_by_name(&name, ptr, n_bytes)
+                };
+            }
+        }
+    }
+    Ok(prefill_segments)
+}
+
 fn compile_segment<R: crate::ComputeRuntime + 'static>(
     mut segment: Segment,
     search_budget: usize,

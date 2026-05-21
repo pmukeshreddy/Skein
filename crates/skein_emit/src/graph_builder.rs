@@ -58,6 +58,19 @@ pub fn build_device_graph(
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(1);
+    build_device_graph_with_seq(plan, cluster, ir, device_idx, seq)
+}
+
+/// Build the per-device graph at an explicit sequence length. `seq == 1` is the
+/// cached-decode graph; `seq > 1` is the batched-prefill graph. The serve uses
+/// this to build a prefill graph alongside the seq=1 decode graph.
+pub fn build_device_graph_with_seq(
+    plan: &Plan,
+    cluster: &Cluster,
+    ir: &Graph,
+    device_idx: u32,
+    seq: usize,
+) -> Result<LoweredGraph, EmitError> {
     let (segments, sequencing) =
         crate::op_wiring::wire_segments_with_seq(plan, cluster, ir, device_idx, seq)?;
     Ok(LoweredGraph {
