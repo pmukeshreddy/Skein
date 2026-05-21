@@ -310,12 +310,16 @@ pub fn load_runtime_segments<R: crate::ComputeRuntime + 'static>(
     artifact: &SkeinArtifact,
     search_budget: usize,
 ) -> Result<Vec<Vec<RuntimeSegment>>, CompileError> {
+    // Serve from / write to the artifact's on-disk compile cache so the second
+    // and later boots of this artifact load instead of re-searching + re-NVRTC.
+    let cache_dir = crate::search_cache::search_cache_dir(&artifact.root);
+    crate::search_cache::enable_cubin_cache(&artifact.root);
     let mut all_devices = Vec::with_capacity(artifact.devices.len());
     for device in &artifact.devices {
         let lowered = device.rebuild_graphs()?;
         let mut runtime_segments = Vec::with_capacity(lowered.len());
         for segment in lowered {
-            runtime_segments.push(compile_segment::<R>(segment, search_budget)?);
+            runtime_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
         }
         load_weights_into_segments(&device.weights_path, runtime_segments.as_mut_slice())?;
         all_devices.push(runtime_segments);
@@ -340,10 +344,12 @@ pub fn load_device_runtime_segments<R: crate::ComputeRuntime + 'static>(
             device_idx,
             segment_idx: 0,
         })?;
+    let cache_dir = crate::search_cache::search_cache_dir(&artifact.root);
+    crate::search_cache::enable_cubin_cache(&artifact.root);
     let lowered = device.rebuild_graphs()?;
     let mut runtime_segments = Vec::with_capacity(lowered.len());
     for segment in lowered {
-        runtime_segments.push(compile_segment::<R>(segment, search_budget)?);
+        runtime_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
     }
     load_weights_into_segments(&device.weights_path, runtime_segments.as_mut_slice())?;
     Ok(runtime_segments)
@@ -352,6 +358,7 @@ pub fn load_device_runtime_segments<R: crate::ComputeRuntime + 'static>(
 fn compile_segment<R: crate::ComputeRuntime + 'static>(
     mut segment: Segment,
     search_budget: usize,
+    cache_dir: Option<&Path>,
 ) -> Result<RuntimeSegment, CompileError> {
     let input_names = segment
         .input_handoff
@@ -409,7 +416,7 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
 
     let input_zeros = segment_input_zero_bytes(&segment);
     let runtime =
-        R::build_and_search_with_input_zeros(&mut segment.graph, search_budget, &input_zeros)?;
+        R::build_and_search_cached(&mut segment.graph, search_budget, &input_zeros, cache_dir)?;
     let wrapped = DynRuntimeWrapper::new(runtime, segment.graph, name_to_node, input_name_to_node);
     Ok(RuntimeSegment {
         runtime: Box::new(wrapped),

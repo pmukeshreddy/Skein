@@ -325,9 +325,13 @@ use crate::{
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egglog_reports::ReportLevel;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
+///
+///  The serde derives let the search space be persisted to disk and reloaded,
+///  so serve/verify can skip re-running egglog for an already-compiled segment
+///  (see `Graph::build_and_search_cached`).
 pub struct SerializedEGraph {
     pub enodes: FxHashMap<NodeId, (String, Vec<ClassId>)>,
     pub eclasses: FxHashMap<ClassId, (String, Vec<NodeId>)>,

@@ -230,6 +230,23 @@ pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
         )
     })?;
     let target_arch = format!("sm_{major}{minor}");
+
+    // On-disk cubin cache. NVRTC compilation is the dominant serve/verify boot
+    // cost (the artifact stores the IR recipe, not compiled kernels, so every
+    // launch re-runs NVRTC). The key is a content hash of (source, target arch,
+    // driver version), so a hit is byte-identical to a fresh compile — same
+    // kernel, just loaded. Active only when `SKEIN_KERNEL_CACHE` points at a
+    // directory (skein sets it to the artifact's cache dir); otherwise the path
+    // below is unchanged.
+    let cache_path = cubin_cache_path(src.as_ref(), &target_arch, driver_version);
+    if let Some(path) = &cache_path {
+        if let Ok(cubin) = std::fs::read(path) {
+            if !cubin.is_empty() {
+                return Ok(Ptx::from_binary(cubin));
+            }
+        }
+    }
+
     let nvrtc_options = cuda_nvrtc_compile_options(&target_arch);
 
     let source = CString::new(src.as_ref().as_bytes())
@@ -308,7 +325,57 @@ pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
         ));
     }
 
+    if let Some(path) = &cache_path {
+        write_cubin_atomically(path, &cubin);
+    }
+
     Ok(Ptx::from_binary(cubin))
+}
+
+/// Cache directory for compiled cubins, taken from `SKEIN_KERNEL_CACHE`.
+/// Returns `None` (caching disabled) when the variable is unset or empty.
+fn cubin_cache_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("SKEIN_KERNEL_CACHE")?;
+    let dir = std::path::PathBuf::from(dir);
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// Content-addressed path for a kernel's cubin, or `None` if caching is off.
+/// The hash binds the CUDA source, the target arch (`sm_120` etc.), and the
+/// driver version so a toolkit upgrade or arch change can never serve a stale
+/// or incompatible cubin.
+fn cubin_cache_path(
+    src: &str,
+    target_arch: &str,
+    driver_version: Option<i32>,
+) -> Option<std::path::PathBuf> {
+    let dir = cubin_cache_dir()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"skein-cubin-v1\0");
+    hasher.update(target_arch.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&driver_version.unwrap_or(0).to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(src.as_bytes());
+    let hash = hasher.finalize().to_hex();
+    Some(dir.join(format!("{target_arch}-{hash}.cubin")))
+}
+
+/// Write a cubin to its content-addressed path atomically. The name is derived
+/// from the content, so concurrent rank processes compiling the same kernel
+/// write identical bytes; a unique temp file plus rename makes the publish
+/// atomic and last-writer-wins safe.
+fn write_cubin_atomically(path: &std::path::Path, cubin: &[u8]) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, cubin).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Returns the bandwidth of the device in GB/s

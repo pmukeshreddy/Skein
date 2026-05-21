@@ -15,6 +15,8 @@
 //!   unconditionally and is the backend used by CI and by every test that
 //!   exercises a real Luminal compile-and-execute path without a GPU.
 
+use std::path::Path;
+
 use luminal::op::Runtime;
 use luminal::prelude::{DType, Graph, NativeRuntime, NodeIndex};
 
@@ -22,6 +24,7 @@ pub mod artifact;
 pub mod dyn_runtime;
 pub mod error;
 pub mod executor;
+pub mod search_cache;
 
 pub use artifact::{
     ArtifactMetadata, DeclaredTensorMeta, DeviceArtifactLoaded, LoweredSegment, OpRecipe,
@@ -61,6 +64,22 @@ pub trait ComputeRuntime: Sized {
     ) -> Result<Self, CompileError> {
         let _ = input_zeros;
         Self::build_and_search(cx, budget)
+    }
+
+    /// Like [`build_and_search_with_input_zeros`](Self::build_and_search_with_input_zeros),
+    /// but served from / written to the on-disk compile cache when `cache_dir`
+    /// is `Some`. On a cache hit the segment's recorded egglog search result is
+    /// replayed — reproducing the same kernels — instead of re-running egglog +
+    /// NVRTC. The default ignores the cache (correct, just not accelerated); the
+    /// Native and CUDA backends override it. See [`crate::search_cache`].
+    fn build_and_search_cached(
+        cx: &mut Graph,
+        budget: usize,
+        input_zeros: &[(NodeIndex, usize)],
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, CompileError> {
+        let _ = cache_dir;
+        Self::build_and_search_with_input_zeros(cx, budget, input_zeros)
     }
 
     /// Stage `data` into the runtime's buffer for the given input tensor.
@@ -128,6 +147,23 @@ impl ComputeRuntime for NativeComputeRuntime {
         Ok(Self { inner })
     }
 
+    fn build_and_search_cached(
+        cx: &mut Graph,
+        budget: usize,
+        _input_zeros: &[(NodeIndex, usize)],
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, CompileError> {
+        let inner = crate::search_cache::cached_search::<NativeRuntime>(
+            cx,
+            budget,
+            cache_dir,
+            "native",
+            || Ok(NativeRuntime::default()),
+            |_rt| {},
+        )?;
+        Ok(Self { inner })
+    }
+
     fn set_data_f32(&mut self, id: NodeIndex, data: Vec<f32>) {
         self.inner.set_data(id, data);
     }
@@ -171,16 +207,35 @@ mod cuda_impl {
             budget: usize,
             input_zeros: &[(NodeIndex, usize)],
         ) -> Result<Self, CompileError> {
-            cx.build_search_space::<CudaRuntime>();
-            let mut runtime = CudaRuntime::new().map_err(|source| CompileError::CudaRuntimeInit {
-                source: Box::new(source),
-            })?;
-            // Stage zero buffers for every Input so the search's graph
-            // executions have something to read (real data is loaded later).
-            for (id, num_bytes) in input_zeros {
-                runtime.set_zeros(*id, *num_bytes);
-            }
-            let inner = cx.search(runtime, budget);
+            Self::build_and_search_cached(cx, budget, input_zeros, None)
+        }
+
+        fn build_and_search_cached(
+            cx: &mut Graph,
+            budget: usize,
+            input_zeros: &[(NodeIndex, usize)],
+            cache_dir: Option<&Path>,
+        ) -> Result<Self, CompileError> {
+            let inner = crate::search_cache::cached_search::<CudaRuntime>(
+                cx,
+                budget,
+                cache_dir,
+                "cuda",
+                || {
+                    CudaRuntime::new().map_err(|source| CompileError::CudaRuntimeInit {
+                        source: Box::new(source),
+                    })
+                },
+                // Stage zero buffers for every Input so the search's graph
+                // executions have something to read (real data is loaded
+                // after compile). Only the miss path profiles, so this runs
+                // only when a real search happens.
+                |runtime| {
+                    for (id, num_bytes) in input_zeros {
+                        runtime.set_zeros(*id, *num_bytes);
+                    }
+                },
+            )?;
             Ok(Self { inner })
         }
 

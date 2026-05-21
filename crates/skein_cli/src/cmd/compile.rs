@@ -166,6 +166,13 @@ fn build_artifact<R: ComputeRuntime>(
     ));
     std::fs::create_dir_all(&staging)?;
 
+    // Persist the per-segment compile cache (egglog search result + NVRTC
+    // cubins) into the artifact so serve/verify load instead of re-searching.
+    // `build_and_search_cached` writes the egraph/genome to `cache_dir`; the
+    // cubins land in the env-pointed cubin dir under the same artifact.
+    let cache_dir = skein_compile::search_cache::search_cache_dir(artifact_dir);
+    skein_compile::search_cache::enable_cubin_cache(artifact_dir);
+
     let mut lowered = Vec::new();
     let mut shard_paths = Vec::new();
     for device_idx in 0..cluster.num_devices() {
@@ -173,10 +180,11 @@ fn build_artifact<R: ComputeRuntime>(
             skein_emit::lower_per_device(plan, cluster, ir, device_idx, weights_dir)?;
         for segment in &mut artifact.graph.segments {
             let input_zeros = skein_compile::segment_input_zero_bytes(segment);
-            let _ = R::build_and_search_with_input_zeros(
+            let _ = R::build_and_search_cached(
                 &mut segment.graph,
                 search_budget,
                 &input_zeros,
+                Some(&cache_dir),
             )?;
         }
         let shard_path = staging.join(format!("device_{device_idx}.weights.safetensors"));

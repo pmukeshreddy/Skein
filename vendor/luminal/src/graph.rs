@@ -1,6 +1,6 @@
 use crate::egglog_utils::{
-    count_choice_sets_up_to, egglog_to_llir, extract_generation, hash_choice_set, hlir_to_egglog,
-    random_initial_choice, run_egglog_with_late_passes,
+    ClassId, NodeId, count_choice_sets_up_to, egglog_to_llir, extract_generation, hash_choice_set,
+    hlir_to_egglog, random_initial_choice, run_egglog_with_late_passes,
 };
 use crate::{
     egglog_utils::SerializedEGraph,
@@ -1184,7 +1184,7 @@ impl Graph {
     ) -> R {
         if self.dim_buckets.is_empty() {
             // No buckets: existing single-search path
-            let stitched =
+            let (stitched, _genome) =
                 self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None);
 
             runtime.clear_intermediate_buffers();
@@ -1208,7 +1208,7 @@ impl Graph {
                     bucket_label,
                 );
 
-                let stitched = self.search_single(
+                let (stitched, _genome) = self.search_single(
                     &mut runtime,
                     &options,
                     rng,
@@ -1222,6 +1222,79 @@ impl Graph {
             runtime.load_llir_buckets(&self.dim_buckets, &bucket_llirs);
             runtime
         }
+    }
+
+    /// Like [`search`](Self::search), but also returns the winning genome in an
+    /// owned, serializable form so the caller can persist it and later replay
+    /// the exact selection via [`load_search_result`](Self::load_search_result)
+    /// without re-running the search. Only the non-bucketed path is supported;
+    /// callers must check `dim_buckets.is_empty()` and fall back to `search`
+    /// otherwise. Requires `build_search_space` to have run first.
+    #[tracing::instrument(skip_all)]
+    pub fn search_capture<R: Runtime + 'static>(
+        &mut self,
+        mut runtime: R,
+        limit: usize,
+    ) -> (R, Vec<(ClassId, NodeId)>) {
+        assert!(
+            self.dim_buckets.is_empty(),
+            "search_capture does not support bucketed search; use search()"
+        );
+        let mut rng = rand::rng();
+        let (stitched, genome) = self.search_single(
+            &mut runtime,
+            &SearchOptions::new(limit),
+            &mut rng,
+            &self.dyn_map.clone(),
+            None,
+        );
+        runtime.clear_intermediate_buffers();
+        runtime.load_llir(&stitched);
+        (runtime, genome)
+    }
+
+    /// Rebuild a runtime from a previously-captured search result, skipping both
+    /// egglog (`build_search_space`) and the search loop. `egraph` and `genome`
+    /// must come from a prior `build_search_space` + [`search_capture`] of an
+    /// identical graph (same `hlir_to_egglog` program). Returns `None` if the
+    /// genome does not resolve against the e-graph (e.g. a stale cache), so the
+    /// caller can fall back to a full search.
+    ///
+    /// This is the load half of the on-disk compile cache: replaying the same
+    /// choices against the same e-graph deterministically reproduces the same
+    /// LLIR — and therefore the same kernels — that `search_capture` selected.
+    pub fn load_search_result<R: Runtime + 'static>(
+        &self,
+        mut runtime: R,
+        egraph: &SerializedEGraph,
+        genome: &[(ClassId, NodeId)],
+    ) -> Option<R> {
+        // Reconstruct the op set exactly as `build_search_space` does.
+        let mut ops = R::Ops::into_vec();
+        ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
+
+        // Re-borrow each choice as references into the loaded e-graph, which is
+        // what `egglog_to_llir` expects (`EGraphChoiceSet<'a>`).
+        let mut choices: crate::egglog_utils::EGraphChoiceSet = FxHashMap::default();
+        for (class, node) in genome {
+            let class_ref = egraph.eclasses.get_key_value(class)?.0;
+            let node_ref = egraph.enodes.get_key_value(node)?.0;
+            choices.insert(class_ref, node_ref);
+        }
+
+        let mut stitched = egglog_to_llir(
+            egraph,
+            choices,
+            &ops,
+            &self.custom_ops,
+            &mut FxHashMap::default(),
+            &mut FxHashMap::default(),
+            None,
+        );
+        unroll_loops_in_llir(&mut stitched);
+        runtime.clear_intermediate_buffers();
+        runtime.load_llir(&stitched);
+        Some(runtime)
     }
 
     /// Compute cartesian product of all bucket combinations.
@@ -1286,6 +1359,10 @@ impl Graph {
     /// Run the genetic search and return the unrolled LLIR for the winning
     /// genome. `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`
     /// adds a second "Bucket" progress bar.
+    /// Returns the stitched LLIR for the winning genome, plus that genome in an
+    /// owned form (`(ClassId, NodeId)` choice pairs). The owned genome lets the
+    /// caller persist the exact selection so it can be replayed later without
+    /// re-searching — see [`Graph::build_and_search_cached`].
     fn search_single<R: Runtime + 'static, G: rand::Rng>(
         &mut self,
         runtime: &mut R,
@@ -1293,7 +1370,7 @@ impl Graph {
         rng: &mut G,
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
-    ) -> LLIRGraph {
+    ) -> (LLIRGraph, Vec<(ClassId, NodeId)>) {
         let mut profile_dyn_map = dyn_map.clone();
         for (&dim, &value) in &options.profile_dims {
             profile_dyn_map.insert(dim, value);
@@ -1593,6 +1670,15 @@ impl Graph {
         print!("\r");
         std::io::stdout().flush().unwrap();
 
+        // Snapshot the winning genome in an owned, serializable form before it
+        // is consumed by extraction. Replaying these exact choices against the
+        // same e-graph reproduces this same LLIR (and therefore the same
+        // kernels) — that is what the on-disk compile cache stores.
+        let owned_genome: Vec<(ClassId, NodeId)> = best_genome
+            .iter()
+            .map(|(class, node)| ((*class).clone(), (*node).clone()))
+            .collect();
+
         // Re-extract the winning genome WITHOUT the per-candidate
         // single-iteration collapse, then run the real loop unroll. The
         // resulting LLIR is the full N-iteration graph the runtime executes;
@@ -1621,7 +1707,7 @@ impl Graph {
             .unwrap_or_else(|| "single".to_string());
         maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
 
-        stitched
+        (stitched, owned_genome)
     }
 
     fn candidate_memory_bytes<'a, R: Runtime + 'static>(
