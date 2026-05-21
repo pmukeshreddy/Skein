@@ -93,6 +93,12 @@ pub(crate) struct CompiledBucket {
     pub(crate) logical_buffer_bytes: FxHashMap<NodeIndex, usize>,
     pub(crate) cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     pub(crate) buffer_specs: FxHashMap<NodeIndex, BufferSpec>,
+    /// Dtype of each graph Input (llir node), recorded at build. Lets
+    /// `output_dtype` resolve a passed-through Input (an Input wired straight to
+    /// an Output, e.g. a residual carry) whose data buffer has no `buffer_specs`
+    /// entry — so the bf16->f32 widening read path knows it is reading bf16, not
+    /// raw f32 (which would halve it).
+    pub(crate) input_dtypes: FxHashMap<NodeIndex, DType>,
     pub(crate) llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) output_producers: FxHashMap<NodeIndex, NodeIndex>,
@@ -119,6 +125,7 @@ impl CompiledBucket {
             logical_buffer_bytes: FxHashMap::default(),
             cached_buffer_ptrs: FxHashMap::default(),
             buffer_specs: FxHashMap::default(),
+            input_dtypes: FxHashMap::default(),
             llir_to_hlir: FxHashMap::default(),
             hlir_to_llir: FxHashMap::default(),
             output_producers: FxHashMap::default(),
@@ -553,10 +560,14 @@ impl CudaRuntime {
     /// recorded a spec for it. Mirrors the spec lookup `get_output_data` uses.
     fn output_dtype(&self, id: impl ToId) -> Option<DType> {
         let data_id = self.resolve_data_node(id);
-        self.active()
+        let bucket = self.active();
+        bucket
             .buffer_specs
             .get(&data_id)
             .map(|spec| spec.dtype)
+            // Passed-through Inputs (e.g. residual carries) have no buffer_spec;
+            // fall back to the recorded Input dtype so the read widens correctly.
+            .or_else(|| bucket.input_dtypes.get(&data_id).copied())
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
@@ -1664,11 +1675,16 @@ impl CudaRuntime {
         // at execution time. After this point the LLIR is compile-time only.
         for node in llir_graph.node_indices() {
             if let Some(Input {
-                node: hlir_node, ..
+                node: hlir_node,
+                dtype,
+                ..
             }) = llir_graph[node].to_op::<Input>()
             {
                 bucket.llir_to_hlir.insert(node, NodeIndex::new(*hlir_node));
                 bucket.hlir_to_llir.insert(NodeIndex::new(*hlir_node), node);
+                // Record the input's dtype so a passed-through Input read back to
+                // host (residual carries) is widened per its real dtype.
+                bucket.input_dtypes.insert(node, *dtype);
                 continue;
             }
 
@@ -1769,7 +1785,10 @@ impl CudaRuntime {
                     node,
                     BufferSpec {
                         bytes: host_op.output_bytes(),
-                        dtype: DType::F32,
+                        // Real output dtype (e.g. cublasLt writes its `d_dtype`,
+                        // typically bf16) so the host read-back widens correctly
+                        // instead of byte-reinterpreting bf16 as f32 (halving it).
+                        dtype: host_op.output_dtype(),
                     },
                 );
             }

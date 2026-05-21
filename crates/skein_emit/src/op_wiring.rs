@@ -370,24 +370,20 @@ impl<'a> DeviceWiring<'a> {
                 .live
                 .get(*c)
                 .unwrap_or_else(|| panic!("carry {c} missing from live"));
-            // Materialize the carry as f32 for the cross-segment handoff. A
-            // carry is a passed-through Input (the residual stream skipping the
-            // collective); the runtime's f32 read path does not recognize a
-            // bf16 passed-through Input as bf16 and reads its bytes as raw f32,
-            // halving it — corrupting the residual on the far side. An explicit
-            // f32 cast yields a buffer the read handles correctly; it is cast
-            // back to the activation dtype where the residual consumes it.
-            let carry_output = live.tensor.cast(DType::F32).output();
+            // The carry is a passed-through residual-stream Input. It reads back
+            // correctly at its real (bf16) dtype now that the runtime records
+            // input dtypes (see luminal output_dtype input_dtypes fallback).
+            let carry_output = live.tensor.output();
             output_handoff.push(HandoffTensor {
                 logical_name: (*c).to_string(),
                 luminal_id: carry_output.id,
                 shape: live.shape.clone(),
-                dtype: skein_ir::types::Dtype::F32,
+                dtype: live.dtype,
             });
             carry_specs.push(HandoffSpec {
                 logical_name: (*c).to_string(),
                 shape: live.shape.clone(),
-                dtype: skein_ir::types::Dtype::F32,
+                dtype: live.dtype,
             });
         }
 
@@ -528,13 +524,10 @@ impl<'a> DeviceWiring<'a> {
         let placement = skein_cost::cluster::Placement::from_plan(self.plan);
         let lm_head_w = self.weight("lm_head.weight")?;
         // With a vocab-sharded LM head this produces `[batch, seq, vocab/tp]`;
-        // replicated, it produces the full `[batch, seq, vocab]`. Materialize as
-        // f32: the logits are a bf16 *matmul* output read back through the
-        // runtime handoff path (`get_data_f32`), which does not recognize a raw
-        // matmul-output buffer as bf16 and would read the bytes as f32 — halving
-        // the vocab. An explicit f32 cast fixes the read (and the final logits
-        // should be f32 anyway, matching the HF reference).
-        let logits_local = normed.matmul(lm_head_w.permute((1, 0))).cast(DType::F32);
+        // replicated, it produces the full `[batch, seq, vocab]`. The bf16
+        // cublasLt output reads back at full width now that the runtime records
+        // the op's real output dtype (luminal HostOp::output_dtype).
+        let logits_local = normed.matmul(lm_head_w.permute((1, 0)));
         let full_shape = vec![self.batch, self.seq, self.ir.meta.vocab];
 
         if placement.tp > 1 {
@@ -548,7 +541,7 @@ impl<'a> DeviceWiring<'a> {
                 LiveTensor {
                     tensor: logits_local,
                     shape: vec![self.batch, self.seq, vocab_local],
-                    dtype: skein_ir::types::Dtype::F32,
+                    dtype: self.activation_dtype,
                 },
             );
             // AllGather concatenates the per-rank logit shards (rank-major,
@@ -569,7 +562,7 @@ impl<'a> DeviceWiring<'a> {
                 logical_name: LOGITS.to_string(),
                 luminal_id: gathered.id,
                 shape: full_shape,
-                dtype: skein_ir::types::Dtype::F32,
+                dtype: self.activation_dtype,
             }]);
         } else {
             let logits = logits_local.output();
@@ -578,7 +571,7 @@ impl<'a> DeviceWiring<'a> {
                 logical_name: LOGITS.to_string(),
                 luminal_id: logits.id,
                 shape: full_shape,
-                dtype: skein_ir::types::Dtype::F32,
+                dtype: self.activation_dtype,
             }]);
         }
         Ok(())
@@ -627,27 +620,17 @@ impl<'a> DeviceWiring<'a> {
         }
         let attn_out = self.wire_block_attention(block, normed_1)?;
 
-        // Record attn_out as block_N_attn_out in live (will either be the
-        // collective tensor or just an internal name when tp=1). When this is a
-        // cross-segment collective handoff (tp>1), materialize it as f32: the
-        // o_proj output is a bf16 *matmul* buffer, and the runtime handoff read
-        // (`get_data_f32`) does not recognize a raw matmul-output buffer as
-        // bf16, so it reads the raw bytes as f32 and HALVES the tensor —
-        // corrupting the AllReduce. An explicit f32 cast produces a buffer the
-        // read handles correctly; it is cast back to the activation dtype after
-        // the collective so the residual stays bf16.
+        // Record attn_out as block_N_attn_out in live (the collective tensor for
+        // tp>1, otherwise an internal name). The bf16 o_proj (cublasLt) output
+        // reads back correctly across the collective now that the runtime tracks
+        // host-op + input dtypes (luminal output_dtype fix).
         let attn_name = collective_attn_out(block);
-        let (attn_live, attn_handoff_dtype) = if placement.tp > 1 {
-            (attn_out.cast(DType::F32), skein_ir::types::Dtype::F32)
-        } else {
-            (attn_out, self.activation_dtype)
-        };
         self.live.insert(
             attn_name.clone(),
             LiveTensor {
-                tensor: attn_live,
+                tensor: attn_out,
                 shape: vec![self.batch, self.seq, self.hidden],
-                dtype: attn_handoff_dtype,
+                dtype: self.activation_dtype,
             },
         );
 
@@ -659,26 +642,11 @@ impl<'a> DeviceWiring<'a> {
         }
 
         // (4) Residual after attn (in the current segment, post-collective).
-        let attn_full_raw = self.live.get(&attn_name).expect("attn out missing").tensor;
-        // Cast the f32 collective handoff back to the activation dtype for the
-        // bf16 residual add (no-op when tp==1).
-        let attn_full = if placement.tp > 1 {
-            attn_full_raw.cast(to_luminal_dtype(self.activation_dtype))
-        } else {
-            attn_full_raw
-        };
+        let attn_full = self.live.get(&attn_name).expect("attn out missing").tensor;
         if block == 0 {
             self.debug_tap("dbg_l0_attn_out", attn_full);
         }
-        let carry_in_raw = self.live.get(&carry_in).expect("carry missing").tensor;
-        // When tp>1 the carry crossed the attn-collective cut and was carried as
-        // f32 (so the runtime read does not halve it); cast back to the
-        // activation dtype for the bf16 residual add.
-        let carry_in_live = if placement.tp > 1 {
-            carry_in_raw.cast(to_luminal_dtype(self.activation_dtype))
-        } else {
-            carry_in_raw
-        };
+        let carry_in_live = self.live.get(&carry_in).expect("carry missing").tensor;
         let after_attn = carry_in_live + attn_full;
         let carry_post = carry_post_attn(block);
         self.live.insert(
@@ -707,22 +675,15 @@ impl<'a> DeviceWiring<'a> {
             // MoE in every block.
             normed_2
         };
-        // Same matmul-output handoff fix as attn: the MoE down-proj output is a
-        // bf16 matmul buffer; materialize it as f32 when it crosses a collective
-        // (EP combine or TP ffn AllReduce) so the runtime read does not halve it.
-        let ffn_is_collective = (placement.tp > 1 && (has_moe || has_mlp)) || (placement.ep > 1 && has_moe);
+        // The MoE down-proj (cublasLt) output reads back correctly across the
+        // EP/TP collective now that the runtime tracks the host-op output dtype.
         let ffn_name = collective_ffn_out(block);
-        let (ffn_live, ffn_handoff_dtype) = if ffn_is_collective {
-            (ffn_out.cast(DType::F32), skein_ir::types::Dtype::F32)
-        } else {
-            (ffn_out, self.activation_dtype)
-        };
         self.live.insert(
             ffn_name.clone(),
             LiveTensor {
-                tensor: ffn_live,
+                tensor: ffn_out,
                 shape: vec![self.batch, self.seq, self.hidden],
-                dtype: ffn_handoff_dtype,
+                dtype: self.activation_dtype,
             },
         );
 
@@ -739,9 +700,9 @@ impl<'a> DeviceWiring<'a> {
             self.live.insert(
                 combine_name.clone(),
                 LiveTensor {
-                    tensor: ffn_live,
+                    tensor: ffn_out,
                     shape: vec![self.batch, self.seq, self.hidden],
-                    dtype: ffn_handoff_dtype,
+                    dtype: self.activation_dtype,
                 },
             );
             self.cut_segment_at_collective(point, &combine_name, &[&carry_post]);
@@ -758,7 +719,7 @@ impl<'a> DeviceWiring<'a> {
                 LiveTensor {
                     tensor: combined,
                     shape: vec![self.batch, self.seq, self.hidden],
-                    dtype: ffn_handoff_dtype,
+                    dtype: self.activation_dtype,
                 },
             );
         }
@@ -771,29 +732,15 @@ impl<'a> DeviceWiring<'a> {
         }
 
         // (8) Final residual + emit next-block carry.
-        let ffn_full_raw = self.live.get(&ffn_name).expect("ffn out missing").tensor;
-        // Cast the f32 collective handoff back to the activation dtype for the
-        // bf16 residual add (no-op when ffn never crossed a collective).
-        let ffn_full = if ffn_is_collective {
-            ffn_full_raw.cast(to_luminal_dtype(self.activation_dtype))
-        } else {
-            ffn_full_raw
-        };
+        let ffn_full = self.live.get(&ffn_name).expect("ffn out missing").tensor;
         if block == 0 {
             self.debug_tap("dbg_l0_moe_out", ffn_full);
         }
-        let carry_post_raw = self
+        let carry_post_live = self
             .live
             .get(&carry_post)
             .expect("post-attn carry missing")
             .tensor;
-        // carry_post crossed the ffn (and/or EP) collective cut as f32; cast
-        // back to the activation dtype for the bf16 residual add.
-        let carry_post_live = if ffn_is_collective {
-            carry_post_raw.cast(to_luminal_dtype(self.activation_dtype))
-        } else {
-            carry_post_raw
-        };
         let after_block = carry_post_live + ffn_full;
         let next_carry = carry_pre_block(block + 1);
         self.live.insert(

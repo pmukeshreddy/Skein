@@ -271,7 +271,6 @@ fn resolve_source_files(
 
 fn safetensors_dtype(dtype: Dtype) -> safetensors::Dtype {
     match dtype {
-        Dtype::F32 => safetensors::Dtype::F32,
         Dtype::Bf16 => safetensors::Dtype::BF16,
         Dtype::Fp16 => safetensors::Dtype::F16,
         // FP8 / Int4 variants don't have stable safetensors codes in 0.4.x;

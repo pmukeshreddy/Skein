@@ -1320,6 +1320,10 @@ impl HostOp for CuBlasLt {
     fn output_bytes(&self) -> Expression {
         (self.output_size() * self.d_dtype.bits()).ceil_div(8)
     }
+
+    fn output_dtype(&self) -> DType {
+        self.d_dtype
+    }
 }
 
 #[cfg(test)]

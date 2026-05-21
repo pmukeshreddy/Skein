@@ -152,6 +152,15 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// Returns the output buffer size in bytes (accounts for dtype).
     fn output_bytes(&self) -> Expression;
 
+    /// Dtype of this op's output buffer. The runtime records this in
+    /// `buffer_specs` so the host read-back (`get_f32`) widens half-precision
+    /// outputs correctly instead of byte-reinterpreting them (which halves the
+    /// element count). Default `F32`; ops that emit bf16/f16 (e.g. cublasLt with
+    /// a bf16 `d_dtype`) must override this.
+    fn output_dtype(&self) -> DType {
+        DType::F32
+    }
+
     /// Returns additional nodes (beyond graph edges) that this op needs buffers for.
     ///
     /// For most ops, this returns empty (buffers determined by graph edges).

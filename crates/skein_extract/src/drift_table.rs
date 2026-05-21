@@ -209,7 +209,6 @@ fn component_key(c: Component) -> &'static str {
 
 fn dtype_key(d: Dtype) -> &'static str {
     match d {
-        Dtype::F32 => "f32",
         Dtype::Bf16 => "bf16",
         Dtype::Fp16 => "fp16",
         Dtype::Fp8E4m3 => "fp8_e4m3",
@@ -235,7 +234,6 @@ fn dtype_order(d: Dtype) -> u8 {
         Dtype::Fp8E5m2 => 3,
         Dtype::Int8 => 4,
         Dtype::Int4 => 5,
-        Dtype::F32 => 6,
     }
 }
 

@@ -92,7 +92,6 @@ fn dtype_summary(plan: &skein_ir::plan::Plan) -> BTreeMap<String, usize> {
 
 fn dtype_key(d: Dtype) -> &'static str {
     match d {
-        Dtype::F32 => "f32",
         Dtype::Bf16 => "bf16",
         Dtype::Fp16 => "fp16",
         Dtype::Fp8E4m3 => "fp8_e4m3",

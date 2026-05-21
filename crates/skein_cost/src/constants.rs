@@ -28,10 +28,7 @@ pub struct DtypeTable {
 impl DtypeTable {
     pub fn get(self, d: Dtype) -> f64 {
         match d {
-            // F32 is never a planner-selected layer dtype (absent from
-            // Dtype::ALL); it only appears on emitter handoffs. Fall back to the
-            // bf16 cost coefficient so any incidental lookup is well-defined.
-            Dtype::F32 | Dtype::Bf16 => self.bf16,
+            Dtype::Bf16 => self.bf16,
             Dtype::Fp16 => self.fp16,
             Dtype::Fp8E4m3 => self.fp8_e4m3,
             Dtype::Fp8E5m2 => self.fp8_e5m2,
