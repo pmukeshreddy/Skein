@@ -222,11 +222,17 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             }
             // A 0-length input (the empty KV cache at decode position 0) becomes
             // a 0-byte device allocation whose pointer is null, which the CUDA
-            // backend rejects as a "missing input buffer". Stage a 1-element
-            // placeholder so the buffer is non-null; the dynamic `past` dim is 0
-            // for that step, so the concat's pad reads nothing from it (the
-            // cached-decode output reduces to just the current token — correct).
-            let data = if data.is_empty() { vec![0.0] } else { data };
+            // backend rejects. Stage a non-null placeholder so the buffer is
+            // valid. It must be large enough that the concat's reshape/pad/Gather
+            // — which can address slot 0 as a full `n_kv*head_dim` token even
+            // though the dynamic `past` dim is 0 and the result is masked out —
+            // stays in-bounds. 64Ki f32 (256 KiB) comfortably covers one token's
+            // KV for any realistic head config; its contents are never used.
+            let data = if data.is_empty() {
+                vec![0.0; 64 * 1024]
+            } else {
+                data
+            };
             self.staged_f32.insert(node, data);
         } else {
             self.external_f32.insert(node, data);
