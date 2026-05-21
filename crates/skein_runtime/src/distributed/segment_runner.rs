@@ -104,15 +104,21 @@ impl LocalSegments for SegmentRunner {
         };
         let err = Self::segment_err(segment_idx);
 
-        // Feed inputs. A `kvcache_*` input is fed the accumulated past from the
-        // KV cache; otherwise from the handoff store (i32 wins when both exist —
-        // only `input_tokens` is i32 and never collides with an f32 name).
+        // Feed inputs. A `kvcache_*` input is fed the whole fixed-capacity cache
+        // buffer for its layer (slots 0..position valid); otherwise from the
+        // handoff store (i32 wins when both exist — only `input_tokens` is i32
+        // and never collides with an f32 name).
         for name in &input_names {
             if let Some((kind, layer)) = parse_kvcache_name(name) {
-                let past = self.kv_cache.past(kind, layer).to_vec();
+                let full = self.segments[segment_idx]
+                    .kv_cache_sizes
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0);
+                let buf = self.kv_cache.buffer(kind, layer, full).to_vec();
                 self.segments[segment_idx]
                     .runtime
-                    .set_tensor_by_name(name, past)
+                    .set_tensor_by_name(name, buf)
                     .map_err(&err)?;
             } else if let Some(data) = self.handoffs_i32.get(name).cloned() {
                 self.segments[segment_idx]
@@ -129,27 +135,22 @@ impl LocalSegments for SegmentRunner {
             // weight already loaded into the runtime); not an error here.
         }
 
-        // Cached decode: set this step's dynamic `past` length (= position) on
-        // the segment graph. A no-op for static-shape segments.
-        self.segments[segment_idx]
-            .runtime
-            .set_dyn_dim('p', self.position);
-
         self.segments[segment_idx]
             .runtime
             .execute_segment()
             .map_err(&err)?;
 
         // Capture named outputs. A `kvcache_*` output is the new token's K/V —
-        // appended to the cache so the next step attends over it; everything
-        // else goes to the handoff store for downstream segments / collectives.
+        // written into slot `position` of the fixed cache so the next step
+        // attends over it; everything else goes to the handoff store for
+        // downstream segments / collectives.
         for name in &output_names {
             let data = self.segments[segment_idx]
                 .runtime
                 .get_tensor_by_name(name)
                 .map_err(&err)?;
             if let Some((kind, layer)) = parse_kvcache_name(name) {
-                self.kv_cache.append(kind, layer, &data);
+                self.kv_cache.write_slot(kind, layer, self.position, &data);
             } else {
                 self.handoffs.insert(name.clone(), data);
             }
@@ -218,6 +219,7 @@ mod tests {
             output_names: vec!["out".to_string()],
             capture_names: vec![],
             weight_names: vec![],
+            kv_cache_sizes: HashMap::new(),
         }
     }
 
@@ -246,40 +248,30 @@ mod tests {
         ));
     }
 
-    /// KV-cached decode mechanics: a `kvcache_k_0` handoff is fed the
-    /// accumulated past and its step output is appended. The mock emits the
-    /// length of the past it was fed, so after N steps the cache holds
-    /// `[0, 1, ... N-1]` — proving the past grows by one each step and outputs
-    /// accumulate (no GPU, no Luminal).
+    /// Fixed-capacity KV-cache decode mechanics: a `kvcache_k_0` input is fed the
+    /// whole fixed buffer each step and its per-token output is written into slot
+    /// `position`. The mock always emits the token `[7, 7]`; after stepping
+    /// positions 0,1,2 the cache holds it in the first three slots and zeros
+    /// beyond — proving positional writes (no GPU, no Luminal).
     #[test]
-    fn kv_cache_accumulates_across_decode_steps() {
+    fn kv_cache_writes_into_position_slots() {
         use crate::kv_cache::KvKind;
 
-        /// On execute does nothing; reports the length of the past it last
-        /// received for `kvcache_k_0` as that step's new (one-element) key.
+        /// Ignores its input; emits a fixed 2-element "new token" for `kvcache_k_0`.
         #[derive(Default)]
-        struct CachePastEcho {
-            last_past_len: usize,
-        }
-        impl DynRuntime for CachePastEcho {
+        struct TokenEmitter;
+        impl DynRuntime for TokenEmitter {
             fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
                 Ok(())
             }
             fn get_tensor_by_name(&self, name: &str) -> Result<Vec<f32>, DynRuntimeError> {
                 if name == "kvcache_k_0" {
-                    Ok(vec![self.last_past_len as f32])
+                    Ok(vec![7.0, 7.0])
                 } else {
                     Err(DynRuntimeError::UnknownTensor(name.to_string()))
                 }
             }
-            fn set_tensor_by_name(
-                &mut self,
-                name: &str,
-                data: Vec<f32>,
-            ) -> Result<(), DynRuntimeError> {
-                if name == "kvcache_k_0" {
-                    self.last_past_len = data.len();
-                }
+            fn set_tensor_by_name(&mut self, _: &str, _: Vec<f32>) -> Result<(), DynRuntimeError> {
                 Ok(())
             }
             fn set_tensor_i32_by_name(
@@ -291,20 +283,27 @@ mod tests {
             }
         }
 
+        // CAP = 4 slots, per-token = 2 -> full buffer length 8.
+        let mut kv_cache_sizes = HashMap::new();
+        kv_cache_sizes.insert("kvcache_k_0".to_string(), 8usize);
         let seg = RuntimeSegment {
-            runtime: Box::new(CachePastEcho::default()),
+            runtime: Box::new(TokenEmitter),
             input_names: vec!["kvcache_k_0".to_string()],
             output_names: vec!["kvcache_k_0".to_string()],
             capture_names: vec![],
             weight_names: vec![],
+            kv_cache_sizes,
         };
         let mut runner = SegmentRunner::new(vec![seg]);
-        for _ in 0..3 {
+        for p in 0..3 {
+            runner.set_position(p);
             runner.run_segment(0).unwrap();
         }
-        // Step 0 fed empty past (len 0), step 1 fed [0] (len 1), step 2 fed
-        // [0,1] (len 2) → appended outputs are [0, 1, 2].
-        assert_eq!(runner.kv_cache().past(KvKind::Key, 0), &[0.0, 1.0, 2.0]);
+        // Token written into slots 0,1,2; slot 3 still zero.
+        assert_eq!(
+            runner.kv_cache().peek(KvKind::Key, 0),
+            &[7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 0.0, 0.0]
+        );
         // And the f32 handoff store does NOT also hold the cache tensor.
         assert!(runner.read("kvcache_k_0").is_err());
     }
@@ -391,6 +390,7 @@ mod tests {
                     output_names: vec!["x".to_string()],
                     capture_names: vec![],
                     weight_names: vec![],
+                    kv_cache_sizes: HashMap::new(),
                 };
                 let runner = SegmentRunner::new(vec![seg]);
                 let mut exec = RankExecutor::new(rank, runner);

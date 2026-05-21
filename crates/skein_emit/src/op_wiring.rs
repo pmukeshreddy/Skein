@@ -97,18 +97,17 @@ use crate::segment::{HandoffTensor, Segment, SequenceStep};
 use crate::shard_role::{ShardRole, shard_role_for_param};
 
 /// Logical name of the runtime-fed absolute-position scalar (`[1]`, f32) the
-/// cached-decode attention reads each step (for RoPE of the current token).
+/// cached-decode attention reads each step (for RoPE + the validity mask).
 const POSITION_INPUT: &str = "position";
-/// Dynamic-dim character for the KV cache's growing `past` length. The serving
-/// runtime sets it per step (`past == the current token's absolute index`); the
-/// Luminal search uses [`SEARCH_PAST`] as a representative value to compile the
-/// dynamic-`past` kernels. Cache handoffs are named `kvcache_{k|v}_{block}` so
-/// `skein_runtime::kv_cache::parse_kvcache_name` routes them to the per-layer
-/// cache (fed the accumulated past, new step appended).
-const PAST_DIM: char = 'p';
-/// Representative `past` length baked into the graph for the compile-time
-/// search only; overridden at runtime via the dynamic-dim map each step.
-const SEARCH_PAST: usize = 4;
+/// Fixed KV-cache capacity (slots) baked into every attention segment. The cache
+/// is a static `[batch, KV_CACHE_CAP, n_kv*head_dim]` buffer — no dynamic /
+/// zero-length dim (which the CUDA backend can't represent). The runtime feeds
+/// the full buffer each step, writes the new token's K/V into slot `position`,
+/// and the graph masks slots `> position`. Caps the max sequence length per
+/// request; raise if longer contexts are needed (cost: O(CAP) attention/step).
+/// Cache handoffs are named `kvcache_{k|v}_{block}` so
+/// `skein_runtime::kv_cache::parse_kvcache_name` routes them to the per-layer cache.
+pub const KV_CACHE_CAP: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // Public entry: wire_segments
@@ -723,43 +722,42 @@ impl<'a> DeviceWiring<'a> {
         let rope_theta = self.ir.meta.rope_theta;
 
         // Cached decode: project the current token's q/k/v (seq = 1) and attend
-        // over the runtime-fed past K/V plus the current token. RoPE/scores/
-        // softmax/Attn·V run in fp32 — q/k/v, the cache, and `position` are all
-        // f32 — both for numerical parity with HF's fp32 softmax and so the
-        // cache round-trips losslessly through the runtime's f32 `KvCache`. Only
-        // the final attention output is cast back to the activation dtype for
-        // `o_proj`. This replaces the old stateless `seq=1`, position-0 lowering.
+        // over a fixed-capacity KV cache (slots 0..position) plus the current
+        // token. RoPE/scores/softmax/Attn·V run in fp32 — q/k/v, the cache, and
+        // `position` are all f32 — both for numerical parity with HF's fp32
+        // softmax and so the cache round-trips losslessly through the runtime's
+        // f32 cache. Only the final attention output is cast back to the
+        // activation dtype for `o_proj`. This replaces the old stateless `seq=1`,
+        // position-0 lowering.
         let q = normed.matmul(q_w.permute((1, 0))).cast(DType::F32);
         let k_new = normed.matmul(k_w.permute((1, 0))).cast(DType::F32);
         let v_new = normed.matmul(v_w.permute((1, 0))).cast(DType::F32);
 
-        // Runtime-fed accumulated past (dynamic `past` length) + absolute
-        // position. `SegmentRunner` feeds these by name each step.
-        let dims = || {
+        // Runtime-fed fixed-capacity cache [batch, KV_CACHE_CAP, kv_dim] (static,
+        // never empty/null) + the absolute `position`. `SegmentRunner` feeds the
+        // full cache buffer each step and writes the new K/V into slot `position`.
+        let cache_dims = || {
             vec![
                 Expression::from(batch),
-                Expression::from(PAST_DIM),
+                Expression::from(KV_CACHE_CAP),
                 Expression::from(kv_dim),
             ]
         };
         let k_cache = self.runtime_input(
             &format!("kvcache_k_{block}"),
-            dims(),
-            vec![batch, SEARCH_PAST, kv_dim],
+            cache_dims(),
+            vec![batch, KV_CACHE_CAP, kv_dim],
             DType::F32,
         );
         let v_cache = self.runtime_input(
             &format!("kvcache_v_{block}"),
-            dims(),
-            vec![batch, SEARCH_PAST, kv_dim],
+            cache_dims(),
+            vec![batch, KV_CACHE_CAP, kv_dim],
             DType::F32,
         );
         let position = self.position_input();
-        // Representative dynamic `past` for the compile-time search; the runtime
-        // overrides it each step via the dynamic-dim map.
-        self.cur_cx.set_dim(PAST_DIM, SEARCH_PAST);
 
-        let (attn, k_store, v_store) = attention_decode_step(
+        let (attn, k_store, v_store) = attention_fixed_cache(
             q,
             k_new,
             v_new,
@@ -769,11 +767,12 @@ impl<'a> DeviceWiring<'a> {
             n_heads_local,
             n_kv_heads_local,
             head_dim,
+            KV_CACHE_CAP,
             rope_theta,
         );
 
-        // Hand the new (rotated) key + value back to the runtime to append to
-        // this layer's cache for the next step.
+        // Hand the new (rotated) key + value back to the runtime to write into
+        // slot `position` of this layer's fixed cache for the next step.
         let k_out = k_store.output();
         let v_out = v_store.output();
         self.cur_extra_outputs.push(HandoffTensor {
@@ -1450,6 +1449,122 @@ pub fn attention_decode_step(
     // The new (rotated) key and value, flattened for the runtime to append.
     let k_store = k_hs.merge_dims(2, 3); // [b, 1, n_kv*d]
     let v_store = v_hs.merge_dims(2, 3);
+    (attn, k_store, v_store)
+}
+
+/// Cached-decode attention against a **fixed-capacity** KV cache of `max_cache`
+/// slots — the production-shaped design that avoids any dynamic / zero-length
+/// dimension (luminal's CUDA runtime cannot represent the empty cache at decode
+/// position 0 with a growing `past` dim: it resolves to a null device buffer).
+///
+/// `k_cache`/`v_cache` are static `[batch, max_cache, n_kv*head_dim]` runtime-fed
+/// buffers holding the rotated past keys / raw values in slots `0..position`;
+/// `position` is the current token's absolute index (`[1]`, runtime scalar). The
+/// new token's rotated K / raw V are written into slot `position` *in-graph* via
+/// an arithmetic select (no scatter op, no dynamic dim), attention masks slots
+/// `> position`, and the new K/V are returned flattened for the runtime to
+/// persist into slot `position` of its fixed buffer for the next step. Single
+/// query, so the only mask is the validity mask. Assumes `batch == 1` (the
+/// served plan's `max_batch`); the select's `[1, C]` masks broadcast as
+/// `[batch=1, C, ...]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_fixed_cache(
+    q: GraphTensor,        // [b, 1, n_heads*d]
+    k_new: GraphTensor,    // [b, 1, n_kv*d]
+    v_new: GraphTensor,    // [b, 1, n_kv*d]
+    k_cache: GraphTensor,  // [b, C, n_kv*d]
+    v_cache: GraphTensor,  // [b, C, n_kv*d]
+    position: GraphTensor, // [1]
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_cache: usize,
+    rope_theta: f32,
+) -> (GraphTensor, GraphTensor, GraphTensor) {
+    let kv_groups = n_heads / n_kv_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let half = head_dim / 2;
+    let batch = q.dims()[0];
+    let kv_dim = n_kv_heads * head_dim;
+
+    // Runtime-position RoPE tables for the single current position.
+    let inv_freq = {
+        let cx = q.graph();
+        let idx = cx.arange(half).cast(DType::F32);
+        (idx * (-2.0 / head_dim as f32 * rope_theta.ln())).exp() // [half]
+    };
+    let pos_f = position.cast(DType::F32); // [1]
+    let angles = pos_f.expand_dim(1, half) * inv_freq.expand_dim(0, 1); // [1, half]
+    let emb = angles.concat_along(angles, 1); // [1, head_dim]
+
+    // Rotate q and k_new at `position`.
+    let q_hs = q.split_dims(2, head_dim); // [b,1,n_heads,d]
+    let qd = q_hs.dims();
+    let q_cos = emb.cos().expand_dim(0, qd[0]).expand_dim(2, qd[2]).cast(q.dtype);
+    let q_sin = emb.sin().expand_dim(0, qd[0]).expand_dim(2, qd[2]).cast(q.dtype);
+    let q_hs = q_hs * q_cos + rotate_half(q_hs, head_dim) * q_sin;
+
+    let k_hs = k_new.split_dims(2, head_dim); // [b,1,n_kv,d]
+    let kd = k_hs.dims();
+    let k_cos = emb
+        .cos()
+        .expand_dim(0, kd[0])
+        .expand_dim(2, kd[2])
+        .cast(k_new.dtype);
+    let k_sin = emb
+        .sin()
+        .expand_dim(0, kd[0])
+        .expand_dim(2, kd[2])
+        .cast(k_new.dtype);
+    let k_hs = k_hs * k_cos + rotate_half(k_hs, head_dim) * k_sin; // [b,1,n_kv,d]
+    let v_hs = v_new.split_dims(2, head_dim); // [b,1,n_kv,d]
+
+    // New token flattened — returned for the runtime to write into slot `position`.
+    let k_store = k_hs.merge_dims(2, 3); // [b,1,n_kv*d]
+    let v_store = v_hs.merge_dims(2, 3);
+
+    // Slot indices and the current-slot / validity selectors.
+    //   is_cur[slot] = (slot <= pos) - (slot <= pos-1)  == 1 iff slot == pos
+    //   allowed[slot] = (slot <= pos)                    == 1 for valid slots
+    let slots = {
+        let cx = q.graph();
+        cx.arange(max_cache).cast(DType::F32).expand_dim(0, 1) // [1, C]
+    };
+    let pos_c = pos_f.expand_dim(1, max_cache); // [1, C]
+    let posm1_c = (pos_f - 1.0).expand_dim(1, max_cache); // [1, C]
+    let is_cur = slots.le(pos_c) - slots.le(posm1_c); // [1, C]
+
+    // Write the new token into slot `position` via select (batch == 1 → the
+    // [1, C] masks broadcast across the [b, C, kv_dim] cache):
+    //   full = cache * (1 - is_cur) + new_broadcast * is_cur
+    let is_cur_b = is_cur.expand_dim(2, kv_dim); // [1, C, kv_dim] == [b, C, kv_dim]
+    let keep = (is_cur_b * -1.0) + 1.0; // 1 - is_cur
+    let mut k_new_b = k_store; // [b, 1, kv_dim]
+    k_new_b.shape.expand(k_cache.dims()); // broadcast slot dim 1 -> C
+    let mut v_new_b = v_store;
+    v_new_b.shape.expand(v_cache.dims());
+    let k_full = k_cache * keep + k_new_b * is_cur_b; // [b, C, kv_dim]
+    let v_full = v_cache * keep + v_new_b * is_cur_b;
+
+    // GQA attention over the fixed cache, masking slots > position.
+    let k_full_hs = k_full.split_dims(2, head_dim); // [b, C, n_kv, d]
+    let v_full_hs = v_full.split_dims(2, head_dim);
+    let q5 = q_hs.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4)); // [b,n_kv,groups,1,d]
+    let k5 = k_full_hs.permute((0, 2, 3, 1)).expand_dim(2, kv_groups); // [b,n_kv,groups,d,C]
+    let v5 = v_full_hs.permute((0, 2, 1, 3)).expand_dim(2, kv_groups); // [b,n_kv,groups,C,d]
+    let scores = q5.matmul(k5) * scale; // [b,n_kv,groups,1,C]
+    let bias = ((slots.le(pos_c) - 1.0) * 1.0e9)
+        .expand_dim(0, batch)
+        .expand_dim(1, n_kv_heads)
+        .expand_dim(2, kv_groups)
+        .cast(scores.dtype); // [b,n_kv,groups,1,C]
+    let weights = (scores + bias).softmax(4);
+    let attn = weights.matmul(v5); // [b,n_kv,groups,1,d]
+    let attn = attn
+        .permute((0, 3, 1, 2, 4))
+        .merge_dims(3, 4)
+        .merge_dims(2, 3); // [b, 1, n_heads*d]
+
     (attn, k_store, v_store)
 }
 

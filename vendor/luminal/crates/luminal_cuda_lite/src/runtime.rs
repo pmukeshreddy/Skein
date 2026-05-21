@@ -776,21 +776,15 @@ impl CudaRuntime {
         bucket.cached_buffer_ptrs.clear();
         bucket.last_dyn_map = dyn_dims.clone();
 
-        // Minimum slot size for any logical buffer. A buffer whose size resolves
-        // to 0 under the current dyn_map (e.g. an empty KV cache at decode
-        // position 0, `past == 0`) must still get a real, non-null arena slot:
-        // kernels that consume it (the concat's pad/Gather) compute a clamped
-        // index and touch slot 0 even though they mask the result, so a null /
-        // 0-byte buffer is an illegal access. A small fixed floor keeps slot 0
-        // in-bounds; the masking makes its (garbage) contents irrelevant.
-        const MIN_LOGICAL_BUFFER_BYTES: usize = 256;
         let mut logical_bytes = FxHashMap::default();
         for (node, spec) in &bucket.buffer_specs {
             bucket
                 .intermediate_buffer_dims
                 .extend(spec.bytes.dyn_vars());
             let bytes = spec.bytes.exec(dyn_dims).unwrap();
-            logical_bytes.insert(*node, bytes.max(MIN_LOGICAL_BUFFER_BYTES));
+            if bytes > 0 {
+                logical_bytes.insert(*node, bytes);
+            }
         }
 
         if logical_bytes.is_empty() {

@@ -19,8 +19,12 @@ pub enum KvKind {
     Value,
 }
 
-/// Per-layer accumulated keys and values (flat `f32`, row-major over the
-/// cached tokens). Grows by one token's worth each decode step.
+/// Per-layer **fixed-capacity** keys and values (flat `f32`, row-major over a
+/// fixed `KV_CACHE_CAP` slots × `n_kv*head_dim`). Each layer's buffer is
+/// allocated zero on first use and the new token's K/V is written into slot
+/// `position` each decode step; the graph reads the whole buffer and masks slots
+/// `> position`. (The previous growing/append design used a dynamic `past` dim,
+/// which luminal's CUDA backend can't represent at `past == 0`.)
 #[derive(Debug, Clone, Default)]
 pub struct KvCache {
     keys: Vec<Vec<f32>>,
@@ -28,8 +32,8 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    /// A cache for `layers` attention layers, all initially empty (prefill
-    /// seeds them on the first step).
+    /// A cache for `layers` attention layers; each layer's fixed buffer is
+    /// allocated lazily on first [`buffer`](Self::buffer) call.
     pub fn new(layers: usize) -> Self {
         Self {
             keys: vec![Vec::new(); layers],
@@ -41,8 +45,45 @@ impl KvCache {
         self.keys.len()
     }
 
-    /// Accumulated past for `(kind, layer)`. Empty before the first step.
-    pub fn past(&self, kind: KvKind, layer: usize) -> &[f32] {
+    fn store_mut(&mut self, kind: KvKind) -> &mut Vec<Vec<f32>> {
+        match kind {
+            KvKind::Key => &mut self.keys,
+            KvKind::Value => &mut self.values,
+        }
+    }
+
+    /// The whole fixed-capacity buffer for `(kind, layer)`, allocated to
+    /// `full_len` zeros on first use. Fed to the graph each step.
+    pub fn buffer(&mut self, kind: KvKind, layer: usize, full_len: usize) -> &[f32] {
+        let store = self.store_mut(kind);
+        if layer >= store.len() {
+            store.resize(layer + 1, Vec::new());
+        }
+        if store[layer].len() != full_len {
+            store[layer] = vec![0.0; full_len];
+        }
+        &store[layer]
+    }
+
+    /// Write this step's new token K/V `data` into `slot` of `(kind, layer)`
+    /// (offset `slot * data.len()`). No-op if the buffer isn't allocated yet or
+    /// the slot is out of range.
+    pub fn write_slot(&mut self, kind: KvKind, layer: usize, slot: usize, data: &[f32]) {
+        let store = self.store_mut(kind);
+        let Some(buf) = store.get_mut(layer) else {
+            return;
+        };
+        if data.is_empty() {
+            return;
+        }
+        let off = slot * data.len();
+        if off + data.len() <= buf.len() {
+            buf[off..off + data.len()].copy_from_slice(data);
+        }
+    }
+
+    /// Read-only view of `(kind, layer)`'s fixed buffer (empty if unallocated).
+    pub fn peek(&self, kind: KvKind, layer: usize) -> &[f32] {
         let store = match kind {
             KvKind::Key => &self.keys,
             KvKind::Value => &self.values,
@@ -50,35 +91,17 @@ impl KvCache {
         store.get(layer).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// Append this step's new keys/values for `(kind, layer)`.
-    pub fn append(&mut self, kind: KvKind, layer: usize, data: &[f32]) {
-        let store = match kind {
-            KvKind::Key => &mut self.keys,
-            KvKind::Value => &mut self.values,
-        };
-        if layer >= store.len() {
-            store.resize(layer + 1, Vec::new());
-        }
-        store[layer].extend_from_slice(data);
-    }
-
-    /// Total cached elements for `(kind, layer)` — proportional to the number of
-    /// cached tokens.
-    pub fn len(&self, kind: KvKind, layer: usize) -> usize {
-        self.past(kind, layer).len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.keys.iter().all(|k| k.is_empty()) && self.values.iter().all(|v| v.is_empty())
     }
 
-    /// Clear all layers (new request reusing the same cache allocation).
+    /// Zero all layers for a new request, keeping the allocations.
     pub fn reset(&mut self) {
         for k in &mut self.keys {
-            k.clear();
+            k.iter_mut().for_each(|x| *x = 0.0);
         }
         for v in &mut self.values {
-            v.clear();
+            v.iter_mut().for_each(|x| *x = 0.0);
         }
     }
 }
@@ -101,24 +124,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn append_grows_and_past_concatenates() {
+    fn fixed_buffer_writes_into_slots() {
+        // 2 layers, per-token width 2, capacity 3 slots -> full_len = 6.
         let mut c = KvCache::new(2);
         assert!(c.is_empty());
-        c.append(KvKind::Key, 0, &[1.0, 2.0]);
-        c.append(KvKind::Key, 0, &[3.0, 4.0]);
-        c.append(KvKind::Value, 0, &[9.0]);
-        assert_eq!(c.past(KvKind::Key, 0), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(c.past(KvKind::Value, 0), &[9.0]);
-        assert_eq!(c.past(KvKind::Key, 1), &[] as &[f32]);
+        assert_eq!(c.buffer(KvKind::Key, 0, 6), &[0.0; 6]); // lazily zero-allocated
+        // Write token 0 into slot 0 and token 1 into slot 1.
+        c.write_slot(KvKind::Key, 0, 0, &[1.0, 2.0]);
+        c.write_slot(KvKind::Key, 0, 1, &[3.0, 4.0]);
+        c.write_slot(KvKind::Value, 0, 0, &[9.0, 8.0]);
+        assert_eq!(c.buffer(KvKind::Key, 0, 6), &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+        assert_eq!(c.buffer(KvKind::Value, 0, 6), &[9.0, 8.0, 0.0, 0.0, 0.0, 0.0]);
+        // Out-of-range slot is a no-op (slot 3 would start at offset 6).
+        c.write_slot(KvKind::Key, 0, 3, &[7.0, 7.0]);
+        assert_eq!(c.buffer(KvKind::Key, 0, 6), &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
         assert!(!c.is_empty());
     }
 
     #[test]
-    fn reset_clears_but_keeps_layers() {
+    fn reset_zeros_but_keeps_layers() {
         let mut c = KvCache::new(1);
-        c.append(KvKind::Key, 0, &[1.0]);
+        let _ = c.buffer(KvKind::Key, 0, 4);
+        c.write_slot(KvKind::Key, 0, 0, &[1.0, 2.0]);
         c.reset();
-        assert!(c.is_empty());
+        assert_eq!(c.buffer(KvKind::Key, 0, 4), &[0.0; 4]);
         assert_eq!(c.layers(), 1);
     }
 

@@ -67,6 +67,10 @@ pub struct RuntimeSegment {
     pub output_names: Vec<String>,
     pub capture_names: Vec<String>,
     pub weight_names: Vec<(String, Vec<usize>)>,
+    /// For each `kvcache_*` input of this segment, the full element count of its
+    /// fixed-capacity buffer (`batch * KV_CACHE_CAP * n_kv*head_dim`). The runner
+    /// allocates the cache to this size and feeds it whole each step.
+    pub kv_cache_sizes: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,8 +193,11 @@ impl<'a> TopologyExecutor<'a> {
                         for name in &segment.input_names {
                             let key = (device_idx, name.clone());
                             if is_kvcache_name(name) {
-                                let past = kv.get(&key).cloned().unwrap_or_default();
-                                segment.runtime.set_tensor_by_name(name, past)?;
+                                // Feed the whole fixed-capacity cache buffer
+                                // (allocated zero on first use to its full size).
+                                let full = segment.kv_cache_sizes.get(name).copied().unwrap_or(0);
+                                let buf = kv.entry(key).or_insert_with(|| vec![0.0; full]);
+                                segment.runtime.set_tensor_by_name(name, buf.clone())?;
                             } else if name == "position" {
                                 segment
                                     .runtime
@@ -202,17 +209,21 @@ impl<'a> TopologyExecutor<'a> {
                             }
                         }
 
-                        // This step's dynamic `past` length (= position).
-                        segment.runtime.set_dyn_dim('p', position);
                         segment.runtime.execute_segment()?;
 
                         for name in &segment.output_names {
                             let data = segment.runtime.get_tensor_by_name(name)?;
                             if is_kvcache_name(name) {
-                                // The new token's K/V — append to this layer's cache.
-                                kv.entry((device_idx, name.clone()))
-                                    .or_default()
-                                    .extend_from_slice(&data);
+                                // The new token's K/V — write into slot `position`
+                                // of this layer's fixed cache.
+                                let full = segment.kv_cache_sizes.get(name).copied().unwrap_or(0);
+                                let buf = kv
+                                    .entry((device_idx, name.clone()))
+                                    .or_insert_with(|| vec![0.0; full]);
+                                let off = position * data.len();
+                                if !data.is_empty() && off + data.len() <= buf.len() {
+                                    buf[off..off + data.len()].copy_from_slice(&data);
+                                }
                             } else {
                                 if name == "logits" {
                                     final_logits = data.clone();
@@ -354,6 +365,12 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
         .iter()
         .map(|(name, tensor)| (name.clone(), tensor.shape.clone()))
         .collect();
+    let kv_cache_sizes = segment
+        .input_handoff
+        .iter()
+        .filter(|h| h.logical_name.starts_with("kvcache_"))
+        .map(|h| (h.logical_name.clone(), h.shape.iter().product::<usize>()))
+        .collect();
 
     let mut name_to_node = HashMap::new();
     name_to_node.extend(segment.op_nodes.iter().map(|(k, v)| (k.clone(), *v)));
@@ -386,6 +403,7 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
         output_names,
         capture_names,
         weight_names,
+        kv_cache_sizes,
     })
 }
 
