@@ -172,6 +172,111 @@ impl<'a> TopologyExecutor<'a> {
         let last_pos = prompt.len() - 1;
 
         let n_devices = self.runtimes.len();
+
+        // Batched-prefill path: SKEIN_PREFILL_SEQ>1 means the compiled graph is
+        // the seq=N prefill graph — feed the WHOLE prompt in ONE forward (causal
+        // attention computes every position at once; no per-token loop, no KV
+        // cache input). Return the last token's logits. This is the parallel
+        // prefill; the per-token loop below is the seq=1 (decode-style) path.
+        let prefill_seq = std::env::var("SKEIN_PREFILL_SEQ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        if prefill_seq > 1 {
+            let n = prompt.len();
+            let toks_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+            let mut handoffs: HashMap<(usize, String), Vec<f32>> = HashMap::new();
+            let mut handoff_i32: HashMap<(usize, String), Vec<i32>> = HashMap::new();
+            for d in 0..n_devices {
+                handoff_i32.insert((d, "input_tokens".to_string()), toks_i32.clone());
+            }
+            for step in self.sequencing {
+                match step {
+                    SequenceStep::ExecuteSegment {
+                        device_idx,
+                        segment_idx,
+                    } => {
+                        let device_idx = *device_idx as usize;
+                        let segment_idx = *segment_idx;
+                        let segment = self
+                            .runtimes
+                            .get_mut(device_idx)
+                            .and_then(|d| d.get_mut(segment_idx))
+                            .ok_or(CompileError::MissingSegment {
+                                device_idx,
+                                segment_idx,
+                            })?;
+                        for name in &segment.input_names {
+                            let key = (device_idx, name.clone());
+                            if let Some(data) = handoff_i32.get(&key) {
+                                segment.runtime.set_tensor_i32_by_name(name, data.clone())?;
+                            } else if let Some(data) = handoffs.get(&key) {
+                                segment.runtime.set_tensor_by_name(name, data.clone())?;
+                            }
+                        }
+                        segment.runtime.execute_segment()?;
+                        if let Some(dump_dir) = dump_dir.as_deref() {
+                            for name in &segment.capture_names {
+                                let data = segment.runtime.get_tensor_by_name(name)?;
+                                dump_capture(dump_dir, name, device_idx, &data);
+                            }
+                        }
+                        for name in &segment.output_names {
+                            let data = segment.runtime.get_tensor_by_name(name)?;
+                            if name == "logits" {
+                                final_logits = data.clone();
+                            }
+                            if !is_kvcache_name(name) {
+                                handoffs.insert((device_idx, name.clone()), data);
+                            }
+                        }
+                    }
+                    SequenceStep::Collective {
+                        collective,
+                        participants,
+                        tensor,
+                        ..
+                    } => {
+                        let participants: Vec<usize> =
+                            participants.iter().map(|p| *p as usize).collect();
+                        let mut adapters = Vec::with_capacity(participants.len());
+                        for &p in &participants {
+                            let data = handoffs
+                                .get(&(p, tensor.clone()))
+                                .cloned()
+                                .unwrap_or_default();
+                            adapters.push(HandoffRuntime::new(tensor, data));
+                        }
+                        let mut refs: Vec<&mut dyn DynRuntime> = adapters
+                            .iter_mut()
+                            .map(|r| r as &mut dyn DynRuntime)
+                            .collect();
+                        let local_participants: Vec<usize> = (0..participants.len()).collect();
+                        self.collectives.execute(
+                            *collective,
+                            &local_participants,
+                            tensor,
+                            refs.as_mut_slice(),
+                        )?;
+                        for (rank, &device) in participants.iter().enumerate() {
+                            let data = refs[rank].get_tensor_by_name(tensor)?;
+                            if tensor == "logits" {
+                                final_logits = data.clone();
+                            }
+                            handoffs.insert((device, tensor.clone()), data);
+                        }
+                    }
+                }
+            }
+            // final_logits is [n, vocab] over all prompt positions; return the
+            // last token's row (the next-token prediction), matching decode.
+            if n > 1 && !final_logits.is_empty() && final_logits.len() % n == 0 {
+                let vocab = final_logits.len() / n;
+                return Ok(final_logits[(n - 1) * vocab..].to_vec());
+            }
+            return Ok(final_logits);
+        }
+
         for (position, &tok) in prompt.iter().enumerate() {
             let mut handoffs: HashMap<(usize, String), Vec<f32>> = HashMap::new();
             let mut handoff_i32: HashMap<(usize, String), Vec<i32>> = HashMap::new();

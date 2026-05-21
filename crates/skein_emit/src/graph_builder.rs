@@ -51,7 +51,15 @@ pub fn build_device_graph(
     ir: &Graph,
     device_idx: u32,
 ) -> Result<LoweredGraph, EmitError> {
-    let (segments, sequencing) = crate::op_wiring::wire_segments(plan, cluster, ir, device_idx)?;
+    // SKEIN_PREFILL_SEQ>1 builds the batched-prefill graph (whole prompt chunk
+    // in one forward) instead of the seq=1 cached-decode graph.
+    let seq = std::env::var("SKEIN_PREFILL_SEQ")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let (segments, sequencing) =
+        crate::op_wiring::wire_segments_with_seq(plan, cluster, ir, device_idx, seq)?;
     Ok(LoweredGraph {
         segments,
         sequencing,

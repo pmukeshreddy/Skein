@@ -126,8 +126,22 @@ pub fn wire_segments(
     ir: &Graph,
     device_idx: u32,
 ) -> Result<(Vec<Segment>, Vec<SequenceStep>), EmitError> {
+    wire_segments_with_seq(plan, cluster, ir, device_idx, 1)
+}
+
+/// Like [`wire_segments`] but with an explicit sequence length. `seq == 1` is
+/// the cached-decode graph; `seq > 1` builds the batched-prefill graph that
+/// processes the whole prompt chunk in a single forward (causal attention),
+/// instead of one token per forward.
+pub fn wire_segments_with_seq(
+    plan: &Plan,
+    cluster: &Cluster,
+    ir: &Graph,
+    device_idx: u32,
+    seq: usize,
+) -> Result<(Vec<Segment>, Vec<SequenceStep>), EmitError> {
     let points = device_collective_points(plan, ir, device_idx);
-    let mut wiring = DeviceWiring::new(plan, cluster, ir, device_idx)?;
+    let mut wiring = DeviceWiring::new(plan, cluster, ir, device_idx, seq)?;
 
     let mut point_iter = points.iter();
     // `wire_initial` consumes the vocab-parallel embedding AllReduce (if any),
@@ -203,6 +217,7 @@ impl<'a> DeviceWiring<'a> {
         cluster: &'a Cluster,
         ir: &'a Graph,
         device_idx: u32,
+        seq: usize,
     ) -> Result<Self, EmitError> {
         if device_idx >= cluster.num_devices() {
             return Err(EmitError::DeviceOutOfRange {
@@ -211,7 +226,8 @@ impl<'a> DeviceWiring<'a> {
             });
         }
         let batch = plan.batching.max_batch() as usize;
-        let seq = 1usize; // decode-mode static seq; matches topology shape contract.
+        // seq == 1 is the cached-decode graph; seq > 1 is the batched-prefill
+        // graph (whole prompt in one forward, causal attention).
         let hidden = ir.meta.hidden;
         let activation_dtype = plan
             .dtype_map
@@ -804,58 +820,77 @@ impl<'a> DeviceWiring<'a> {
             self.debug_tap("dbg_l0_v_proj", v_new);
         }
 
-        // Runtime-fed fixed-capacity cache [batch, KV_CACHE_CAP, kv_dim] (static,
-        // never empty/null) + the absolute `position`. `SegmentRunner` feeds the
-        // full cache buffer each step and writes the new K/V into slot `position`.
-        let cache_dims = || {
-            vec![
-                Expression::from(batch),
-                Expression::from(KV_CACHE_CAP),
-                Expression::from(kv_dim),
-            ]
+        let (attn, k_store, v_store) = if self.seq > 1 {
+            // Batched prefill: the whole prompt chunk in ONE forward. Causal
+            // self-attention over the N tokens with no prior cache (past = 0);
+            // returns the N rotated K + V for the runtime to write into cache
+            // slots 0..N — the same fixed-cap cache the decode graph reads.
+            attention_with_kv_cache(
+                q,
+                k_new,
+                v_new,
+                k_new, // dummy cache (past = 0 skips the concat)
+                v_new,
+                n_heads_local,
+                n_kv_heads_local,
+                head_dim,
+                0,
+                rope_theta,
+            )
+        } else {
+            // Cached decode (seq = 1): runtime-fed fixed-capacity cache
+            // [batch, KV_CACHE_CAP, kv_dim] + the absolute `position`. The
+            // `SegmentRunner` feeds the full cache buffer each step and writes
+            // the new K/V into slot `position`.
+            let cache_dims = || {
+                vec![
+                    Expression::from(batch),
+                    Expression::from(KV_CACHE_CAP),
+                    Expression::from(kv_dim),
+                ]
+            };
+            let k_cache = self.runtime_input(
+                &format!("kvcache_k_{block}"),
+                cache_dims(),
+                vec![batch, KV_CACHE_CAP, kv_dim],
+                DType::F32,
+            );
+            let v_cache = self.runtime_input(
+                &format!("kvcache_v_{block}"),
+                cache_dims(),
+                vec![batch, KV_CACHE_CAP, kv_dim],
+                DType::F32,
+            );
+            let position = self.position_input();
+            attention_fixed_cache(
+                q,
+                k_new,
+                v_new,
+                k_cache,
+                v_cache,
+                position,
+                n_heads_local,
+                n_kv_heads_local,
+                head_dim,
+                KV_CACHE_CAP,
+                rope_theta,
+            )
         };
-        let k_cache = self.runtime_input(
-            &format!("kvcache_k_{block}"),
-            cache_dims(),
-            vec![batch, KV_CACHE_CAP, kv_dim],
-            DType::F32,
-        );
-        let v_cache = self.runtime_input(
-            &format!("kvcache_v_{block}"),
-            cache_dims(),
-            vec![batch, KV_CACHE_CAP, kv_dim],
-            DType::F32,
-        );
-        let position = self.position_input();
 
-        let (attn, k_store, v_store) = attention_fixed_cache(
-            q,
-            k_new,
-            v_new,
-            k_cache,
-            v_cache,
-            position,
-            n_heads_local,
-            n_kv_heads_local,
-            head_dim,
-            KV_CACHE_CAP,
-            rope_theta,
-        );
-
-        // Hand the new (rotated) key + value back to the runtime to write into
-        // slot `position` of this layer's fixed cache for the next step.
+        // Hand the new (rotated) K + V back to the runtime to write into the
+        // cache — slot `position` for decode (seq=1), slots 0..seq for prefill.
         let k_out = k_store.output();
         let v_out = v_store.output();
         self.cur_extra_outputs.push(HandoffTensor {
             logical_name: format!("kvcache_k_{block}"),
             luminal_id: k_out.id,
-            shape: vec![batch, 1, kv_dim],
+            shape: vec![batch, self.seq, kv_dim],
             dtype: act,
         });
         self.cur_extra_outputs.push(HandoffTensor {
             logical_name: format!("kvcache_v_{block}"),
             luminal_id: v_out.id,
-            shape: vec![batch, 1, kv_dim],
+            shape: vec![batch, self.seq, kv_dim],
             dtype: act,
         });
 
