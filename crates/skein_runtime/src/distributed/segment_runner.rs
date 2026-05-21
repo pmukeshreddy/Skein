@@ -58,6 +58,11 @@ pub struct SegmentRunner {
     /// dynamic `past` length the attention segments read. Set per step via
     /// [`set_position`](Self::set_position).
     position: usize,
+    /// When true (batched-prefill graph), `kvcache_*` outputs are NOT written
+    /// into this runner's cache at `position`; instead they are kept in
+    /// `handoffs` (shape [seq, kv_dim]) so the caller can write the N tokens'
+    /// K/V into the decode runner's cache. See `RankServer::forward_prefill`.
+    prefill_capture: bool,
 }
 
 impl SegmentRunner {
@@ -94,7 +99,43 @@ impl SegmentRunner {
             handoffs_i32: HashMap::new(),
             kv,
             position: 0,
+            prefill_capture: false,
         }
+    }
+
+    /// Enable/disable batched-prefill capture: when on, `kvcache_*` outputs are
+    /// kept in the handoff store (whole [seq, kv_dim] tensor) instead of being
+    /// written one slot at a time into this runner's cache.
+    pub fn set_prefill_capture(&mut self, on: bool) {
+        self.prefill_capture = on;
+    }
+
+    /// Read a captured handoff/output tensor by name (e.g. a prefill
+    /// `kvcache_*` output, or `logits`). None if not produced this run.
+    pub fn read_handoff(&self, name: &str) -> Option<Vec<f32>> {
+        self.handoffs.get(name).cloned()
+    }
+
+    /// Write one token's K or V into this runner's paged cache at `slot` for
+    /// `layer`. Used to land batched-prefill K/V (computed by the prefill graph)
+    /// into the decode runner's cache before decoding continues.
+    pub fn write_kv_slot(&mut self, kind: crate::kv_cache::KvKind, layer: usize, slot: usize, data: &[f32]) {
+        self.kv.write_slot(kind, layer, slot, data);
+    }
+
+    /// Upload all segments' weights now, as persistent GPU buffers (instead of
+    /// lazily on first execute). The serve calls this on the decode runner so a
+    /// sibling prefill graph can share the resident weights by device pointer.
+    pub fn materialize_weights(&mut self) {
+        for seg in &mut self.segments {
+            seg.runtime.materialize_weights();
+        }
+    }
+
+    /// The compiled segments (e.g. so a prefill loader can read resident weight
+    /// device pointers to share, rather than loading a second copy).
+    pub fn segments(&self) -> &[skein_compile::RuntimeSegment] {
+        &self.segments
     }
 
     /// Borrow the paged KV cache (e.g. to inspect page utilisation).
@@ -261,7 +302,14 @@ impl LocalSegments for SegmentRunner {
                 .get_tensor_by_name(name)
                 .map_err(&err)?;
             if let Some((kind, layer)) = parse_kvcache_name(name) {
-                self.kv.write_slot(kind, layer, self.position, &data);
+                if self.prefill_capture {
+                    // Batched prefill: keep the whole [seq, kv_dim] tensor so the
+                    // caller writes the N tokens into the decode runner's cache.
+                    let _ = (kind, layer);
+                    self.handoffs.insert(name.clone(), data);
+                } else {
+                    self.kv.write_slot(kind, layer, self.position, &data);
+                }
             } else {
                 self.handoffs.insert(name.clone(), data);
             }

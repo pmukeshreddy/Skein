@@ -23,9 +23,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use skein_compile::{
-    CudaComputeRuntime, DEFAULT_SEARCH_BUDGET, SkeinArtifact, load_device_runtime_segments,
+    CudaComputeRuntime, DEFAULT_SEARCH_BUDGET, SkeinArtifact, load_device_prefill_segments,
+    load_device_runtime_segments,
 };
 use skein_emit::segment::SequenceStep;
+
+use crate::kv_cache::KvKind;
 
 use crate::cuda::nccl::NcclCollective;
 use crate::distributed::{
@@ -46,6 +49,13 @@ pub struct RankServer {
     collective: NcclCollective,
     schedule: Vec<SequenceStep>,
     vocab: u32,
+    /// Optional batched-prefill executor (seq=N graph sharing the decode graph's
+    /// weights by device pointer). Gated by `SKEIN_BATCHED_PREFILL=<seq>`. When
+    /// present and the prompt length matches `prefill_seq`, the whole prompt is
+    /// prefilled in ONE forward instead of token-by-token.
+    prefill: Option<RankExecutor<SegmentRunner>>,
+    prefill_seq: usize,
+    num_layers: usize,
 }
 
 impl RankServer {
@@ -80,13 +90,46 @@ impl RankServer {
         )
         .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
 
-        let executor = RankExecutor::new(layout.rank, SegmentRunner::new(segments));
+        let mut executor = RankExecutor::new(layout.rank, SegmentRunner::new(segments));
+
+        // Batched prefill (gated): build a seq=N prefill graph that SHARES the
+        // decode graph's resident weights by device pointer (no 2nd 47GB copy).
+        // The decode + prefill graphs have the same segmentation, so they reuse
+        // the same global schedule. Prompt length must equal `prefill_seq`.
+        let prefill_seq = std::env::var("SKEIN_BATCHED_PREFILL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 1)
+            .unwrap_or(0);
+        let prefill = if prefill_seq > 1 {
+            // Decode weights must be GPU-resident before the prefill graph shares
+            // their pointers.
+            executor.runner_mut().materialize_weights();
+            let prefill_segs = load_device_prefill_segments::<CudaComputeRuntime>(
+                &artifact,
+                layout.rank,
+                DEFAULT_SEARCH_BUDGET,
+                prefill_seq,
+                executor.runner().segments(),
+            )
+            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+            Some(RankExecutor::new(
+                layout.rank,
+                SegmentRunner::new(prefill_segs),
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             layout,
             executor,
             collective,
             schedule: artifact.sequencing.clone(),
             vocab: artifact.plan.model_meta.vocab as u32,
+            prefill,
+            prefill_seq,
+            num_layers: artifact.plan.model_meta.num_layers,
         })
     }
 
@@ -143,6 +186,59 @@ impl RankServer {
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))
     }
 
+    /// Batched prefill: process the WHOLE prompt (`prefill_seq` tokens) in ONE
+    /// forward through the seq=N prefill graph (which shares the decode graph's
+    /// weights), write the N tokens' K/V into the decode runner's paged cache
+    /// (slots 0..N), and return the last token's logits. Replaces N sequential
+    /// `forward_step` prefill calls. Requires `self.prefill` to be present and
+    /// `prompt_tokens.len() == self.prefill_seq`.
+    fn forward_prefill(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>, RuntimeError> {
+        let n = prompt_tokens.len();
+        // Take the prefill executor out so its &mut doesn't alias self.schedule /
+        // self.executor below; put it back before returning.
+        let mut prefill = self.prefill.take().expect("prefill executor present");
+        {
+            let runner = prefill.runner_mut();
+            runner.set_input_tokens(
+                INPUT_TOKENS,
+                prompt_tokens.iter().map(|&t| t as i32).collect(),
+            );
+            runner.set_prefill_capture(true);
+        }
+        let run_res = prefill
+            .run(&self.schedule, &self.collective)
+            .map_err(|e| RuntimeError::ServerInit(e.to_string()));
+        if let Err(e) = run_res {
+            self.prefill = Some(prefill);
+            return Err(e);
+        }
+        // Land the prompt's K/V into the decode runner's paged cache (the active
+        // request's pages cover slots 0..n). Each kvcache_{k|v}_{layer} output is
+        // [n, kv_dim]; write it row by row into slots 0..n.
+        for layer in 0..self.num_layers {
+            for (tag, kind) in [("k", KvKind::Key), ("v", KvKind::Value)] {
+                let name = format!("kvcache_{tag}_{layer}");
+                if let Some(kv) = prefill.runner().read_handoff(&name) {
+                    if n == 0 || kv.len() % n != 0 {
+                        continue;
+                    }
+                    let kvd = kv.len() / n;
+                    for slot in 0..n {
+                        self.executor.runner_mut().write_kv_slot(
+                            kind,
+                            layer,
+                            slot,
+                            &kv[slot * kvd..(slot + 1) * kvd],
+                        );
+                    }
+                }
+            }
+        }
+        let logits = prefill.runner().read_handoff(LOGITS);
+        self.prefill = Some(prefill);
+        logits.ok_or_else(|| RuntimeError::ServerInit("prefill produced no logits".into()))
+    }
+
     /// Compute next-token logits for an entire `seq` from scratch: resets the KV
     /// cache and prefills `seq` token-by-token, returning the logits after its
     /// last token. Used by the speculative loop, which probes arbitrary candidate
@@ -194,12 +290,25 @@ impl RankServer {
         let mut position = prefill_start_pos;
         let mut logits = Vec::new();
         let prefill_start = Instant::now();
-        for &tok in &prompt_tokens[prefill_start_pos..] {
-            logits = self.forward_step(tok, position)?;
-            position += 1;
-        }
+        // Batched prefill (gated): if the prefill graph is loaded, there is no
+        // resident prefix to reuse (prefill_start_pos == 0), and the prompt
+        // length matches the prefill graph's seq, process the WHOLE prompt in
+        // one forward instead of the per-token loop below.
+        let batched = self.prefill.is_some()
+            && prefill_start_pos == 0
+            && prompt_tokens.len() == self.prefill_seq;
+        let prefill_steps = if batched {
+            logits = self.forward_prefill(prompt_tokens)?;
+            position = prompt_tokens.len();
+            1
+        } else {
+            for &tok in &prompt_tokens[prefill_start_pos..] {
+                logits = self.forward_step(tok, position)?;
+                position += 1;
+            }
+            prompt_tokens.len() - prefill_start_pos
+        };
         let ttft = prefill_start.elapsed();
-        let prefill_steps = prompt_tokens.len() - prefill_start_pos;
 
         // Decode: argmax the current logits, emit, and feed it back as the next
         // token at the running position. Grow the request's pages by one token
