@@ -168,10 +168,19 @@ impl<'a> TopologyExecutor<'a> {
         let mut final_logits = Vec::new();
         let last_pos = prompt.len() - 1;
 
+        let n_devices = self.runtimes.len();
         for (position, &tok) in prompt.iter().enumerate() {
             let mut handoffs: HashMap<(usize, String), Vec<f32>> = HashMap::new();
             let mut handoff_i32: HashMap<(usize, String), Vec<i32>> = HashMap::new();
-            handoff_i32.insert((0, "input_tokens".to_string()), vec![tok as i32]);
+            // Feed input_tokens to *every* device, not just device 0: with tp>1
+            // a segment on another device also consumes it (e.g. the embedding
+            // Cast). The serve path feeds it per-rank; this single-process
+            // driver must do so for all devices or that segment's Int input
+            // buffer is never bound. (Each segment only pulls it if its
+            // input_names list it, so over-registering is harmless.)
+            for d in 0..n_devices {
+                handoff_i32.insert((d, "input_tokens".to_string()), vec![tok as i32]);
+            }
 
             for step in self.sequencing {
                 match step {
@@ -386,6 +395,11 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
             .iter()
             .map(|h| (h.logical_name.clone(), h.luminal_id)),
     );
+    let input_name_to_node = segment
+        .input_handoff
+        .iter()
+        .map(|h| (h.logical_name.clone(), h.luminal_id))
+        .collect();
     name_to_node.extend(
         segment
             .output_handoff
@@ -396,7 +410,7 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
     let input_zeros = segment_input_zero_bytes(&segment);
     let runtime =
         R::build_and_search_with_input_zeros(&mut segment.graph, search_budget, &input_zeros)?;
-    let wrapped = DynRuntimeWrapper::new(runtime, segment.graph, name_to_node);
+    let wrapped = DynRuntimeWrapper::new(runtime, segment.graph, name_to_node, input_name_to_node);
     Ok(RuntimeSegment {
         runtime: Box::new(wrapped),
         input_names,

@@ -146,6 +146,7 @@ pub struct DynRuntimeWrapper<R: ComputeRuntime> {
     inner: R,
     graph: Graph,
     name_to_node: HashMap<String, NodeIndex>,
+    input_name_to_node: HashMap<String, NodeIndex>,
     input_nodes: HashSet<NodeIndex>,
     staged_f32: HashMap<NodeIndex, Vec<f32>>,
     staged_i32: HashMap<NodeIndex, Vec<i32>>,
@@ -153,7 +154,12 @@ pub struct DynRuntimeWrapper<R: ComputeRuntime> {
 }
 
 impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
-    pub fn new(inner: R, graph: Graph, name_to_node: HashMap<String, NodeIndex>) -> Self {
+    pub fn new(
+        inner: R,
+        graph: Graph,
+        name_to_node: HashMap<String, NodeIndex>,
+        input_name_to_node: HashMap<String, NodeIndex>,
+    ) -> Self {
         let input_nodes = graph
             .node_indices()
             .filter(|node| {
@@ -166,6 +172,7 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
             inner,
             graph,
             name_to_node,
+            input_name_to_node,
             input_nodes,
             staged_f32: HashMap::new(),
             staged_i32: HashMap::new(),
@@ -189,6 +196,14 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
         self.name_to_node
             .get(name)
             .copied()
+            .ok_or_else(|| DynRuntimeError::UnknownTensor(name.to_string()))
+    }
+
+    fn input_node_for(&self, name: &str) -> Result<NodeIndex, DynRuntimeError> {
+        self.input_name_to_node
+            .get(name)
+            .copied()
+            .or_else(|| self.name_to_node.get(name).copied())
             .ok_or_else(|| DynRuntimeError::UnknownTensor(name.to_string()))
     }
 }
@@ -215,7 +230,14 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     }
 
     fn set_tensor_by_name(&mut self, name: &str, data: Vec<f32>) -> Result<(), DynRuntimeError> {
-        let node = self.node_for(name)?;
+        let node = self.input_node_for(name)?;
+        tracing::debug!(
+            name,
+            node = node.index(),
+            is_input = self.input_nodes.contains(&node),
+            len = data.len(),
+            "set_tensor_by_name"
+        );
         if self.input_nodes.contains(&node) {
             if name == "input_tokens" {
                 return Err(DynRuntimeError::ExpectedI32(name.to_string()));
@@ -232,7 +254,7 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
         name: &str,
         data: Vec<i32>,
     ) -> Result<(), DynRuntimeError> {
-        let node = self.node_for(name)?;
+        let node = self.input_node_for(name)?;
         if self.input_nodes.contains(&node) {
             self.staged_i32.insert(node, data);
         } else {

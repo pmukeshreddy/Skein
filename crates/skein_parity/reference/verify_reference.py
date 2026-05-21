@@ -76,7 +76,16 @@ def forward(request: Dict[str, Any]) -> None:
 
     model_path = request["model_path"]
     dtype = torch_dtype(request.get("reference_dtype", "bfloat16"))
-    kwargs: Dict[str, Any] = {"torch_dtype": dtype}
+    # Load the reference directly onto GPU 1 (the candidate uses GPU 0). CPU
+    # forward of Mixtral is minutes/token and a CPU load spikes ~90GB host RAM;
+    # pinning to cuda:1 (idle) makes the reference fast and avoids RAM pressure.
+    import os
+    ref_device = os.environ.get("SKEIN_REF_DEVICE", "cuda:1")
+    kwargs: Dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": {"": ref_device},
+        "low_cpu_mem_usage": True,
+    }
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     model.eval()
 
@@ -100,7 +109,7 @@ def forward(request: Dict[str, Any]) -> None:
                 tokens = prompt.get("tokens")
                 if tokens is None:
                     raise ValueError("forward prompts must contain tokens")
-                input_ids = torch.tensor([tokens], dtype=torch.long)
+                input_ids = torch.tensor([tokens], dtype=torch.long).to(model.device)
                 for i in range(len(captures)):
                     captures[i] = None
                 out = model(input_ids=input_ids)

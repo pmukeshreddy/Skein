@@ -56,11 +56,11 @@ impl KvCache {
     /// `full_len` zeros on first use. Fed to the graph each step.
     pub fn buffer(&mut self, kind: KvKind, layer: usize, full_len: usize) -> &[f32] {
         let store = self.store_mut(kind);
-        if layer >= store.len() {
-            store.resize(layer + 1, Vec::new());
+        while store.len() <= layer {
+            store.push(Vec::new());
         }
-        if store[layer].len() != full_len {
-            store[layer] = vec![0.0; full_len];
+        if full_len > 0 && store[layer].len() < full_len {
+            store[layer].resize(full_len, 0.0);
         }
         &store[layer]
     }
@@ -132,6 +132,7 @@ mod tests {
         // Write token 0 into slot 0 and token 1 into slot 1.
         c.write_slot(KvKind::Key, 0, 0, &[1.0, 2.0]);
         c.write_slot(KvKind::Key, 0, 1, &[3.0, 4.0]);
+        let _ = c.buffer(KvKind::Value, 0, 6);
         c.write_slot(KvKind::Value, 0, 0, &[9.0, 8.0]);
         assert_eq!(c.buffer(KvKind::Key, 0, 6), &[1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
         assert_eq!(c.buffer(KvKind::Value, 0, 6), &[9.0, 8.0, 0.0, 0.0, 0.0, 0.0]);

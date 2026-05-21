@@ -1532,12 +1532,14 @@ pub fn attention_fixed_cache(
     };
     let pos_c = pos_f.expand_dim(1, max_cache); // [1, C]
     let posm1_c = (pos_f - 1.0).expand_dim(1, max_cache); // [1, C]
-    let is_cur = slots.le(pos_c) - slots.le(posm1_c); // [1, C]
+    // `le` yields Bool; cast to f32 for the arithmetic select / mask.
+    let is_cur = slots.le(pos_c).cast(DType::F32) - slots.le(posm1_c).cast(DType::F32); // [1, C]
 
     // Write the new token into slot `position` via select (batch == 1 → the
     // [1, C] masks broadcast across the [b, C, kv_dim] cache):
     //   full = cache * (1 - is_cur) + new_broadcast * is_cur
-    let is_cur_b = is_cur.expand_dim(2, kv_dim); // [1, C, kv_dim] == [b, C, kv_dim]
+    let mut is_cur_b = is_cur.expand_dim(2, kv_dim); // [1, C, kv_dim]
+    is_cur_b.shape.expand(k_cache.dims()); // [b, C, kv_dim]
     let keep = (is_cur_b * -1.0) + 1.0; // 1 - is_cur
     let mut k_new_b = k_store; // [b, 1, kv_dim]
     k_new_b.shape.expand(k_cache.dims()); // broadcast slot dim 1 -> C
@@ -1553,7 +1555,8 @@ pub fn attention_fixed_cache(
     let k5 = k_full_hs.permute((0, 2, 3, 1)).expand_dim(2, kv_groups); // [b,n_kv,groups,d,C]
     let v5 = v_full_hs.permute((0, 2, 1, 3)).expand_dim(2, kv_groups); // [b,n_kv,groups,C,d]
     let scores = q5.matmul(k5) * scale; // [b,n_kv,groups,1,C]
-    let bias = ((slots.le(pos_c) - 1.0) * 1.0e9)
+    let allowed = slots.le(pos_c).cast(DType::F32);
+    let bias = ((allowed - 1.0) * 1.0e9)
         .expand_dim(0, batch)
         .expand_dim(1, n_kv_heads)
         .expand_dim(2, kv_groups)

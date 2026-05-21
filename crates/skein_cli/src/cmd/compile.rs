@@ -153,7 +153,7 @@ fn build_artifact<R: ComputeRuntime>(
     search_budget: usize,
     label: &str,
 ) -> Result<SkeinArtifact, CliError> {
-    if artifact_dir.exists() {
+    if artifact_dir.join("plan.json").exists() {
         return SkeinArtifact::load(artifact_dir).map_err(CliError::from);
     }
     std::fs::create_dir_all(artifact_dir)?;

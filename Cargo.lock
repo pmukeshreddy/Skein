@@ -2687,6 +2687,7 @@ dependencies = [
  "skein_emit",
  "skein_ir",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
