@@ -19,7 +19,26 @@ use std::collections::HashMap;
 use skein_compile::RuntimeSegment;
 
 use super::rank_executor::{LocalSegments, RankExecError};
-use crate::kv_cache::{KvCache, parse_kvcache_name};
+use crate::error::RuntimeError;
+use crate::kv::PagedKvCache;
+use crate::kv_cache::parse_kvcache_name;
+use crate::types::RequestId;
+
+/// Default runtime KV paging geometry for the serve path. `page_size` tokens
+/// per page; `total_pages` is the per-device page budget (16 * 256 = 4096 token
+/// slots, comfortably above one request's `KV_CACHE_CAP` while leaving room for
+/// cached prefixes); the radix depth bounds prefix-match length.
+const DEFAULT_PAGE_SIZE: u32 = 16;
+const DEFAULT_TOTAL_PAGES: u32 = 256;
+const DEFAULT_RADIX_DEPTH: u32 = 4096;
+
+/// Parse a `u32` from the environment, falling back to `default`.
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
 
 /// Drives one device's compiled segments + the rank-local handoff store.
 pub struct SegmentRunner {
@@ -29,11 +48,12 @@ pub struct SegmentRunner {
     handoffs: HashMap<String, Vec<f32>>,
     /// Integer handoff tensors (e.g. `input_tokens`).
     handoffs_i32: HashMap<String, Vec<i32>>,
-    /// Per-layer KV cache. Handoffs named `kvcache_{k|v}_{layer}` are fed from
-    /// the accumulated past and their step output appended here — so the model
-    /// attends to all prior tokens (cached decode) while each segment stays
-    /// fixed-shape per step.
-    kv_cache: KvCache,
+    /// Paged per-layer KV cache. Handoffs named `kvcache_{k|v}_{layer}` are fed
+    /// from the active request's pages (cached prefix + freshly written tokens)
+    /// and each step's output is written into the page covering `position` — so
+    /// the model attends over all prior tokens (cached decode) and cross-request
+    /// prefixes are reused, while each segment stays fixed-shape per step.
+    kv: PagedKvCache,
     /// Current decode position = number of tokens already in the cache = the
     /// dynamic `past` length the attention segments read. Set per step via
     /// [`set_position`](Self::set_position).
@@ -42,23 +62,100 @@ pub struct SegmentRunner {
 
 impl SegmentRunner {
     pub fn new(segments: Vec<RuntimeSegment>) -> Self {
+        // Page geometry is overridable from the environment so a run can pick a
+        // smaller page (finer-grained prefix reuse) without a recompile.
+        let page_size = env_u32("SKEIN_KV_PAGE_SIZE", DEFAULT_PAGE_SIZE).max(1);
+        let total_pages = env_u32("SKEIN_KV_TOTAL_PAGES", DEFAULT_TOTAL_PAGES).max(1);
+        let prefix_enable = std::env::var_os("SKEIN_PREFIX_CACHE_OFF").is_none();
+        Self::with_kv(
+            segments,
+            page_size,
+            total_pages,
+            prefix_enable,
+            DEFAULT_RADIX_DEPTH,
+        )
+    }
+
+    /// Construct with an explicit KV paging geometry (page size, page budget,
+    /// prefix-cache on/off, radix depth). The serve bootstrap uses this to size
+    /// pages from the device KV budget.
+    pub fn with_kv(
+        segments: Vec<RuntimeSegment>,
+        page_size: u32,
+        total_pages: u32,
+        prefix_enable: bool,
+        radix_max_depth: u32,
+    ) -> Self {
+        let kv = PagedKvCache::new(page_size, total_pages, prefix_enable, radix_max_depth, 0)
+            .expect("valid KV paging geometry");
         Self {
             segments,
             handoffs: HashMap::new(),
             handoffs_i32: HashMap::new(),
-            kv_cache: KvCache::new(0),
+            kv,
             position: 0,
         }
     }
 
-    /// Borrow the KV cache (e.g. to inspect cached length).
-    pub fn kv_cache(&self) -> &KvCache {
-        &self.kv_cache
+    /// Borrow the paged KV cache (e.g. to inspect page utilisation).
+    pub fn kv(&self) -> &PagedKvCache {
+        &self.kv
     }
 
-    /// Clear the KV cache between requests (reuses the allocation).
+    /// Begin a request: admit it through the paged allocator (prefix match +
+    /// page allocation) and make it active. Returns the number of prompt tokens
+    /// reused from the prefix cache — the caller skips recomputing those.
+    pub fn begin_request(&mut self, id: RequestId, tokens: &[u32]) -> Result<usize, RuntimeError> {
+        let matched = self.kv.begin_request(id, tokens)?;
+        self.position = matched;
+        Ok(matched)
+    }
+
+    /// Grow the active request's pages by one decode token (call before the
+    /// step that writes that token's KV).
+    pub fn advance_kv(&mut self) -> Result<(), RuntimeError> {
+        self.kv.advance(1)
+    }
+
+    /// Admit a request without making it active (continuous-batching driver,
+    /// which keeps several requests in-flight). Returns the prefix-cache hit.
+    pub fn admit_request(&mut self, id: RequestId, tokens: &[u32]) -> Result<usize, RuntimeError> {
+        self.kv.admit_request(id, tokens)
+    }
+
+    /// Switch the active request to `id` at decode position `position` (its KV
+    /// is read/written through that request's pages from now until the next
+    /// switch). Keeps `self.position` in sync.
+    pub fn activate_request(&mut self, id: RequestId, position: usize) -> Result<(), RuntimeError> {
+        self.kv.set_active(id, position)?;
+        self.position = position;
+        Ok(())
+    }
+
+    /// Release a specific request's pages (whether or not it is active).
+    pub fn release_request(&mut self, id: RequestId) -> Result<(), RuntimeError> {
+        self.kv.release(id)
+    }
+
+    /// Release the active request's pages back to the cache/free list.
+    pub fn end_request(&mut self) {
+        self.kv.end_request();
+    }
+
+    /// Prefix-cache tokens reused by the active request (for metrics).
+    pub fn prefix_hit_tokens(&self) -> usize {
+        self.kv.prefix_hit_tokens()
+    }
+
+    /// Pages in use across all requests on this device.
+    pub fn kv_pages_in_use(&self) -> u32 {
+        self.kv.in_use_pages()
+    }
+
+    /// Clear the KV cache between requests (releases the active request's
+    /// pages; cached prefix bytes survive for reuse).
     pub fn reset_kv_cache(&mut self) {
-        self.kv_cache.reset();
+        self.kv.reset();
         self.position = 0;
     }
 
@@ -68,6 +165,10 @@ impl SegmentRunner {
     /// applied to each segment's dynamic-dim map in [`run_segment`].
     pub fn set_position(&mut self, position: usize) {
         self.position = position;
+        // The paged cache uses `position` as the valid-slot count for buffer
+        // assembly (and grows the implicit request's pages when no explicit
+        // request was begun).
+        let _ = self.kv.set_position(position);
         self.handoffs
             .insert("position".to_string(), vec![position as f32]);
     }
@@ -120,7 +221,7 @@ impl LocalSegments for SegmentRunner {
                     .get(name)
                     .copied()
                     .unwrap_or(0);
-                let buf = self.kv_cache.buffer(kind, layer, full).to_vec();
+                let buf = self.kv.buffer(kind, layer, full);
                 self.segments[segment_idx]
                     .runtime
                     .set_tensor_by_name(name, buf)
@@ -160,7 +261,7 @@ impl LocalSegments for SegmentRunner {
                 .get_tensor_by_name(name)
                 .map_err(&err)?;
             if let Some((kind, layer)) = parse_kvcache_name(name) {
-                self.kv_cache.write_slot(kind, layer, self.position, &data);
+                self.kv.write_slot(kind, layer, self.position, &data);
             } else {
                 self.handoffs.insert(name.clone(), data);
             }
@@ -317,10 +418,12 @@ mod tests {
             runner.set_position(p);
             runner.run_segment(0).unwrap();
         }
-        // Token written into slots 0,1,2; slot 3 still zero.
+        // The fixed `[7,7]` token was written into paged slots 0,1,2 — the
+        // paged cache assembles them back into the valid-slot view (3 slots ×
+        // width 2). This proves positional writes route through the page store.
         assert_eq!(
-            runner.kv_cache().peek(KvKind::Key, 0),
-            &[7.0, 7.0, 7.0, 7.0, 7.0, 7.0, 0.0, 0.0]
+            runner.kv().peek_active(KvKind::Key, 0),
+            vec![7.0, 7.0, 7.0, 7.0, 7.0, 7.0]
         );
         // And the f32 handoff store does NOT also hold the cache tensor.
         assert!(runner.read("kvcache_k_0").is_err());

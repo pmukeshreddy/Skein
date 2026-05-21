@@ -40,13 +40,19 @@
 
 pub mod barrier_collective;
 #[cfg(feature = "cuda")]
+pub mod batch_driver;
+#[cfg(feature = "cuda")]
 pub mod gpu_rank;
 pub mod launcher;
+pub mod local_topology;
 pub mod rank_executor;
 pub mod rendezvous;
 pub mod segment_runner;
 
 pub use barrier_collective::BarrierCollective;
+#[cfg(feature = "cuda")]
+pub use batch_driver::{BatchOutput, ContinuousBatchDriver, DriverMetrics};
+pub use local_topology::LocalTopology;
 pub use rank_executor::{LocalSegments, RankExecError, RankExecutor};
 pub use segment_runner::SegmentRunner;
 

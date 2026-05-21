@@ -25,8 +25,151 @@ pub async fn run(args: ServeArgs, output: OutputFormat) -> Result<(), CliError> 
     if let Some(gpus) = args.gpus.clone() {
         return launch_ranks(&args, &gpus);
     }
-    // Mode 3: single-process HTTP serve.
+    // Mode 3a: single-process continuous-batching demo.
+    if args.batch_demo {
+        return run_batch_demo(args).await;
+    }
+    // Mode 3b: single-process HTTP serve.
     run_single_process(args, output).await
+}
+
+/// Single-process continuous-batching demo: drive the `ContinuousBatcher` over
+/// the paged-KV `ContinuousBatchDriver`. Phase A submits several prompts
+/// concurrently (admit → mixed prefill/decode batch → retire, with optional
+/// CUDA-graph decode replay); Phase B re-submits a prompt that shares Phase A's
+/// prefix to exercise cross-request prefix reuse. Prints per-request output and
+/// driver metrics.
+#[cfg(feature = "cuda")]
+async fn run_batch_demo(args: ServeArgs) -> Result<(), CliError> {
+    use skein_compile::{CudaComputeRuntime, DEFAULT_SEARCH_BUDGET};
+    use skein_runtime::SkeinTokenizer;
+    use skein_runtime::batcher::ContinuousBatcher;
+    use skein_runtime::distributed::ContinuousBatchDriver;
+    use skein_runtime::kv::PagedKVAllocator;
+    use std::sync::{Arc, Mutex};
+
+    let artifact = SkeinArtifact::load(&args.artifact)?;
+    let workload = load_workload(&args.workload)?;
+    let cost_model = load_cost_model(&args.cost)?;
+    let cost_constants = cost_model.constants().clone();
+    let plan = artifact.plan.clone();
+    let artifact_dir = args.artifact.clone();
+    let cuda_graphs = args.cuda_graphs;
+    let total_kv_bytes = args.total_kv_bytes;
+    let bytes_per_token = args.bytes_per_token;
+
+    // Tokenize the demo prompts with the model's real tokenizer when bundled.
+    let tokenizer = SkeinTokenizer::from_artifact_dir(&artifact_dir).ok().flatten();
+    let vocab = plan.model_meta.vocab as u32;
+    let prompts: Vec<String> = match args.demo_prompts {
+        Some(s) => s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect(),
+        None => vec![
+            "The capital of France is".to_string(),
+            "The capital of France is Paris".to_string(),
+        ],
+    };
+    let encode = |p: &str| -> Vec<u32> {
+        match &tokenizer {
+            Some(t) => t.encode(p).unwrap_or_default(),
+            None => {
+                let m = vocab.max(1);
+                p.bytes().map(|b| (b as u32) % m).collect()
+            }
+        }
+    };
+    let tokenized: Vec<(String, Vec<u32>)> =
+        prompts.iter().map(|p| (p.clone(), encode(p))).collect();
+    let max_new = args.max_new_tokens.max(1);
+
+    // GPU work is sync + !Send-bound to its thread; run it off the async runtime.
+    let report = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let kv = PagedKVAllocator::new(
+            &plan,
+            total_kv_bytes,
+            bytes_per_token,
+            cost_constants.runtime.radix_max_depth,
+        )
+        .map_err(|e| e.to_string())?;
+        let batcher = ContinuousBatcher::new(&plan, &workload, &cost_constants, Arc::new(Mutex::new(kv)));
+        let mut driver = ContinuousBatchDriver::load::<CudaComputeRuntime>(
+            &artifact_dir,
+            batcher,
+            DEFAULT_SEARCH_BUDGET,
+            cuda_graphs,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let mut out = String::new();
+        // Phase A: submit all prompts concurrently → continuous batching.
+        let now = now_ms();
+        for (_p, toks) in &tokenized {
+            driver
+                .submit(toks.clone(), max_new, now)
+                .map_err(|e| e.to_string())?;
+        }
+        let results = driver.run_to_completion(now).map_err(|e| e.to_string())?;
+        out.push_str("=== Phase A: concurrent continuous batching ===\n");
+        for r in &results {
+            out.push_str(&format!(
+                "  req#{} prompt_len={} prefix_hit={} prefill_steps={} tokens={:?}\n",
+                r.order, r.prompt_len, r.prefix_hit_tokens, r.prefill_steps, r.tokens
+            ));
+        }
+
+        // Phase B: re-submit the first prompt — its KV pages are still cached,
+        // so the shared prefix is reused (prefix_hit > 0) with fewer prefill
+        // forward steps.
+        if let Some((_p, toks)) = tokenized.first() {
+            let now2 = now_ms();
+            driver.submit(toks.clone(), max_new, now2).map_err(|e| e.to_string())?;
+            let warm = driver.run_to_completion(now2).map_err(|e| e.to_string())?;
+            out.push_str("=== Phase B: re-submit prompt #0 (cross-request prefix reuse) ===\n");
+            for r in &warm {
+                out.push_str(&format!(
+                    "  prompt_len={} prefix_hit={} prefill_steps={} tokens={:?}\n",
+                    r.prompt_len, r.prefix_hit_tokens, r.prefill_steps, r.tokens
+                ));
+            }
+        }
+
+        let m = driver.metrics();
+        out.push_str(&format!(
+            "=== Driver metrics ===\n  batch_steps={} forward_steps={} (prefill={} decode={})\n  \
+             max_concurrent_inflight={} mixed_batch_steps={}\n  \
+             cuda_graph_captures={} cuda_graph_replays={}\n  total_compute_ms={:.1}\n",
+            m.batch_steps,
+            m.forward_steps,
+            m.prefill_forward_steps,
+            m.decode_forward_steps,
+            m.max_concurrent_inflight,
+            m.mixed_batch_steps,
+            m.graph_captures,
+            m.graph_replays,
+            m.total_compute_us / 1000.0,
+        ));
+        Ok(out)
+    })
+    .await
+    .map_err(|e| CliError::BadArgument(format!("batch demo task panicked: {e}")))?
+    .map_err(CliError::BadArgument)?;
+
+    println!("{report}");
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+async fn run_batch_demo(_args: ServeArgs) -> Result<(), CliError> {
+    Err(CliError::RequiresCuda {
+        what: "continuous-batching demo",
+        reason: "The continuous-batch driver runs CudaComputeRuntime on the GPU.",
+        suggested_fix: "Build with CUDA (default) and run: skein serve --batch-demo ...",
+    })
 }
 
 async fn run_single_process(args: ServeArgs, _output: OutputFormat) -> Result<(), CliError> {

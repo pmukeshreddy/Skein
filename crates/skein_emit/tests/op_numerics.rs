@@ -287,3 +287,128 @@ fn rmsnorm_matches_reference() {
     eprintln!("[op-numerics] rmsnorm MSE = {m:e}");
     assert!(m < 1e-6, "RMSNorm diverges from reference: MSE {m:e}");
 }
+
+/// tp=2 attention sharding decomposition (CPU). The full attention over
+/// n_heads/n_kv heads must equal the concatenation of the two per-device shards
+/// (device 0 = first half of heads + its kv heads, device 1 = second half),
+/// since attention is independent per (kv-head) group. `op_numerics` previously
+/// only tested full-width attention; this pins the tp=2 head/kv split that the
+/// real 2-GPU forward relies on (q/k/v column-parallel by head, o_proj
+/// row-parallel, AllReduce-summed).
+#[test]
+fn attention_fixed_cache_tp2_shard_matches_full() {
+    let (n_heads, n_kv, d, cap, pos) = (8usize, 2usize, 8usize, 4usize, 2i64);
+    let kv_groups = n_heads / n_kv; // 4
+    let qd = n_heads * d; // 64
+    let kvd = n_kv * d; // 16
+    let theta = 1.0e6f32;
+    let g = |seed: usize, n: usize| {
+        (0..n).map(move |i| (((i + seed) * 1103515245 % 997) as f32 / 997.0 - 0.5)).collect::<Vec<f32>>()
+    };
+    let q = g(1, qd);
+    let kn = g(2, kvd);
+    let vn = g(3, kvd);
+    let kc = g(4, cap * kvd);
+    let vc = g(5, cap * kvd);
+
+    // Run attention_fixed_cache for given local head counts + inputs.
+    let run_attn = |nh: usize, nkv: usize, q: &[f32], kn: &[f32], vn: &[f32], kc: &[f32], vc: &[f32]| -> Vec<f32> {
+        let mut cx = Graph::new();
+        let qg = cx.tensor((1, 1, nh * d));
+        let kng = cx.tensor((1, 1, nkv * d));
+        let vng = cx.tensor((1, 1, nkv * d));
+        let kcg = cx.tensor((1, cap, nkv * d));
+        let vcg = cx.tensor((1, cap, nkv * d));
+        let position = cx.tensor((1,));
+        let (attn, _ks, _vs) = attention_fixed_cache(qg, kng, vng, kcg, vcg, position, nh, nkv, d, cap, theta);
+        let out = attn.output();
+        run_native(&mut cx, out.id, &[
+            (qg.id, q.to_vec()), (kng.id, kn.to_vec()), (vng.id, vn.to_vec()),
+            (kcg.id, kc.to_vec()), (vcg.id, vc.to_vec()), (position.id, vec![pos as f32]),
+        ])
+    };
+
+    let full = run_attn(n_heads, n_kv, &q, &kn, &vn, &kc, &vc);
+
+    // Build device d's shard: heads [d*nh_loc, (d+1)*nh_loc), kv [d*nkv_loc, ...).
+    let nh_loc = n_heads / 2;
+    let nkv_loc = n_kv / 2;
+    let _ = kv_groups;
+    let mut sharded = Vec::new();
+    for dev in 0..2 {
+        let qh0 = dev * nh_loc * d;
+        let q_dev = q[qh0..qh0 + nh_loc * d].to_vec();
+        let kv0 = dev * nkv_loc * d;
+        let kn_dev = kn[kv0..kv0 + nkv_loc * d].to_vec();
+        let vn_dev = vn[kv0..kv0 + nkv_loc * d].to_vec();
+        // cache: per slot, take this device's kv-head columns.
+        let slice_cache = |c: &[f32]| -> Vec<f32> {
+            let mut out = Vec::with_capacity(cap * nkv_loc * d);
+            for s in 0..cap {
+                let base = s * kvd + dev * nkv_loc * d;
+                out.extend_from_slice(&c[base..base + nkv_loc * d]);
+            }
+            out
+        };
+        let kc_dev = slice_cache(&kc);
+        let vc_dev = slice_cache(&vc);
+        let out_dev = run_attn(nh_loc, nkv_loc, &q_dev, &kn_dev, &vn_dev, &kc_dev, &vc_dev);
+        sharded.extend_from_slice(&out_dev);
+    }
+
+    let m = mse(&full, &sharded);
+    eprintln!("[op-numerics] tp2 attention shard-vs-full MSE = {m:e} (full_len={}, sharded_len={})", full.len(), sharded.len());
+    assert_eq!(full.len(), sharded.len(), "shard concat length mismatch");
+    assert!(m < 1e-6, "tp=2 attention sharding diverges from full: MSE {m:e}");
+}
+
+/// Vocab-parallel embedding (tp=2) decomposition on CPU. The full single-table
+/// embedding of a token must equal the AllReduce-sum of the two per-device
+/// vocab-parallel lookups (each masks out-of-range tokens to zero). This pins
+/// the masking/clamp the real 2-GPU embedding relies on; `op_numerics`
+/// previously only tested the full single-device gather.
+#[test]
+fn vocab_parallel_embed_tp2_matches_full() {
+    use skein_emit::op_wiring::{embedding_lookup, vocab_parallel_embed};
+    let vocab = 64usize;
+    let hidden = 8usize;
+    let table: Vec<f32> = (0..vocab * hidden).map(|i| (i % 31) as f32 * 0.1 - 1.5).collect();
+    for &token in &[20i32, 37i32, 0i32, 63i32] {
+        // Full single-device lookup.
+        let mut cx = Graph::new();
+        let w = cx.tensor((vocab, hidden));
+        let toks = cx.tensor((1, 1));
+        cx.get_op_mut::<luminal::hlir::Input>(toks.id).dtype = luminal::prelude::DType::Int;
+        let out = embedding_lookup(toks.as_dtype(luminal::prelude::DType::Int), w, 1, 1, hidden).output();
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+        rt.set_data(w.id, table.clone());
+        rt.set_data(toks.id, vec![token]);
+        rt.execute(&cx.dyn_map);
+        let full = rt.get_f32(out.id).clone();
+
+        // Two vocab-parallel shards, summed (= the AllReduce the runtime does).
+        let half = vocab / 2;
+        let run_shard = |start: usize| -> Vec<f32> {
+            let mut cx = Graph::new();
+            let w = cx.tensor((half, hidden));
+            let toks = cx.tensor((1, 1));
+            cx.get_op_mut::<luminal::hlir::Input>(toks.id).dtype = luminal::prelude::DType::Int;
+            let out = vocab_parallel_embed(
+                toks.as_dtype(luminal::prelude::DType::Int), w, start, half, 1, 1, hidden,
+            ).output();
+            cx.build_search_space::<NativeRuntime>();
+            let mut rt = cx.search(NativeRuntime::default(), 1);
+            rt.set_data(w.id, table[start * hidden..(start + half) * hidden].to_vec());
+            rt.set_data(toks.id, vec![token]);
+            rt.execute(&cx.dyn_map);
+            rt.get_f32(out.id).clone()
+        };
+        let d0 = run_shard(0);
+        let d1 = run_shard(half);
+        let summed: Vec<f32> = d0.iter().zip(&d1).map(|(a, b)| a + b).collect();
+        let m = mse(&full, &summed);
+        eprintln!("[op-numerics] vocab-parallel embed token={token} MSE={m:e}");
+        assert!(m < 1e-8, "vocab-parallel embed diverges from full for token {token}: MSE {m:e}");
+    }
+}

@@ -163,6 +163,9 @@ impl<'a> TopologyExecutor<'a> {
             tokens.to_vec()
         };
 
+        // Op-by-op bisection dump target (debug only; see `dump_capture`).
+        let dump_dir = std::env::var_os("SKEIN_DUMP_DIR").map(std::path::PathBuf::from);
+
         // Per-(device, kvcache-name) accumulated past, grown by one token/step.
         let mut kv: HashMap<(usize, String), Vec<f32>> = HashMap::new();
         let mut final_logits = Vec::new();
@@ -243,6 +246,16 @@ impl<'a> TopologyExecutor<'a> {
 
                         // Capture per-layer activations only on the last token.
                         if position == last_pos {
+                            // Op-by-op layer-0 bisection dump (gated by env): write
+                            // every `dbg_*` tap this segment exposes to disk as raw
+                            // little-endian f32, suffixed by device so sharded
+                            // (TP-split) tensors can be reassembled in the comparison.
+                            if let Some(dump_dir) = dump_dir.as_deref() {
+                                for name in &segment.capture_names {
+                                    let data = segment.runtime.get_tensor_by_name(name)?;
+                                    dump_capture(dump_dir, name, device_idx, &data);
+                                }
+                            }
                             if let Some(captures) = captures.as_deref_mut() {
                                 for name in &segment.capture_names {
                                     if let Some(layer_idx) = parse_hidden_after_block(name) {
@@ -282,6 +295,13 @@ impl<'a> TopologyExecutor<'a> {
                         )?;
                         for (rank, &device) in participants.iter().enumerate() {
                             let data = refs[rank].get_tensor_by_name(tensor)?;
+                            // The logits AllGather concatenates the per-rank vocab
+                            // shards into the full vocab; `final_logits` was set
+                            // from the pre-gather shard in the segment-output loop,
+                            // so refresh it with the gathered (full-width) result.
+                            if tensor == "logits" {
+                                final_logits = data.clone();
+                            }
                             handoffs.insert((device, tensor.clone()), data);
                         }
                     }
@@ -373,7 +393,7 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
     let capture_names = segment
         .op_nodes
         .keys()
-        .filter(|name| name.starts_with("hidden_after_block_"))
+        .filter(|name| name.starts_with("hidden_after_block_") || name.starts_with("dbg_"))
         .cloned()
         .collect();
     let weight_names = segment
@@ -484,6 +504,26 @@ fn weight_dtype(tensor: &str, dtype: SafeDtype) -> Result<WeightDtype, CompileEr
 
 fn parse_hidden_after_block(name: &str) -> Option<usize> {
     name.strip_prefix("hidden_after_block_")?.parse().ok()
+}
+
+/// Write a captured `dbg_*` tensor to `<dump_dir>/<name>.dev<device>.f32` as
+/// raw little-endian f32. Best-effort debug instrumentation for the HF
+/// parity bisection — failures are logged, never fatal.
+fn dump_capture(dump_dir: &Path, name: &str, device_idx: usize, data: &[f32]) {
+    if let Err(e) = std::fs::create_dir_all(dump_dir) {
+        tracing::warn!(?e, "dump_capture: create_dir_all failed");
+        return;
+    }
+    let path = dump_dir.join(format!("{name}.dev{device_idx}.f32"));
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        tracing::warn!(?e, path = %path.display(), "dump_capture: write failed");
+    } else {
+        tracing::info!(path = %path.display(), elems = data.len(), "dump_capture: wrote tap");
+    }
 }
 
 fn argmax(values: &[f32]) -> u32 {

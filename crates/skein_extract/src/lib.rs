@@ -43,6 +43,29 @@ use skein_ir::workload::Workload;
 /// On infeasibility (every global was rejected, every DP was infeasible),
 /// returns `ExtractError::NoFeasiblePlan` annotated with the constraint
 /// counter so callers can diagnose which constraint was the binding one.
+/// Debug parallelism pin: returns `true` if `p` should be skipped because it
+/// does not match a `SKEIN_FORCE_{TP,PP,EP}` environment override (each unset
+/// var matches anything). Lets a reproducer compile a specific placement.
+fn force_parallelism_skip(p: &ParallelismPlacement) -> bool {
+    let want = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok());
+    if let Some(tp) = want("SKEIN_FORCE_TP") {
+        if p.tp != tp {
+            return true;
+        }
+    }
+    if let Some(pp) = want("SKEIN_FORCE_PP") {
+        if p.pp != pp {
+            return true;
+        }
+    }
+    if let Some(ep) = want("SKEIN_FORCE_EP") {
+        if p.ep != ep {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn extract_plan(
     ir: &Graph,
     cluster: &Cluster,
@@ -63,6 +86,12 @@ pub fn extract_plan(
 
     for global in enumerate::enumerate_global_configs(cluster, ir) {
         counters.raw += 1;
+        // Debug override: SKEIN_FORCE_TP/PP/EP pin the parallelism so a specific
+        // placement (e.g. tp=2) can be compiled regardless of the cost ranking —
+        // used to reproduce a placement-specific bug on a small model.
+        if force_parallelism_skip(&global.parallelism) {
+            continue;
+        }
         if let Some(reason) = constraints::reject(&global, cluster, ir, cost_model) {
             counters.reject(reason);
             continue;

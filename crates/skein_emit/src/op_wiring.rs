@@ -188,6 +188,13 @@ struct DeviceWiring<'a> {
     seq: usize,
     hidden: usize,
     activation_dtype: skein_ir::types::Dtype,
+
+    // When `SKEIN_DEBUG_TAPS` is set in the environment, insert extra named
+    // `.output()` taps for layer-0 intermediates (post_input_ln, q/k proj,
+    // attn_out, post_attn_ln, router_logits, moe_out) so the parity walk can
+    // dump them op-by-op for HF bisection. Off by default: production graphs
+    // (the KL gate) are byte-identical to the untapped lowering.
+    debug_taps: bool,
 }
 
 impl<'a> DeviceWiring<'a> {
@@ -232,7 +239,25 @@ impl<'a> DeviceWiring<'a> {
             seq,
             hidden,
             activation_dtype,
+            debug_taps: std::env::var_os("SKEIN_DEBUG_TAPS").is_some(),
         })
+    }
+
+    /// Insert a named `.output()` tap so the parity walk can capture this
+    /// tensor by name. Only fires under `SKEIN_DEBUG_TAPS` (see field docs).
+    /// The `.output()` marks the node as a retained output, which suppresses
+    /// fusion across it — acceptable for the debug dump, never used in the
+    /// production graph.
+    fn debug_tap(&mut self, name: &str, t: GraphTensor) {
+        if !self.debug_taps {
+            return;
+        }
+        // Cast to f32 before .output(): the runtime f32 read path mis-reads some
+        // non-f32 op-output buffers (bf16 matmul output read raw → halved; f32
+        // output mis-tagged bf16 → interleaved zeros). An explicit f32 cast
+        // yields a buffer the read handles correctly, so taps are trustworthy.
+        let tapped = t.cast(DType::F32).output();
+        self.cur_op_nodes.insert(name.to_string(), tapped.id);
     }
 
     // -----------------------------------------------------------------------
@@ -283,6 +308,14 @@ impl<'a> DeviceWiring<'a> {
                 .named_tensor(spec.logical_name.clone(), dims)
                 .as_dtype(lum_dtype);
             self.cur_cx.get_op_mut::<Input>(t.id).dtype = lum_dtype;
+            // `named_tensor` stamps `input_meta` with the F32 default; the
+            // runtime narrows staged f32 host data to the input's dtype using
+            // *this* map, so it must reflect the real dtype — otherwise a bf16
+            // input keeps an f32 buffer that the bf16 codegen reads as
+            // interleaved (every-other-zero) garbage.
+            self.cur_cx
+                .input_meta
+                .insert(t.id, (spec.logical_name.clone(), lum_dtype));
             self.cur_input_handoff.push(HandoffTensor {
                 logical_name: spec.logical_name.clone(),
                 luminal_id: t.id,
@@ -319,11 +352,17 @@ impl<'a> DeviceWiring<'a> {
             .get(collective_tensor)
             .unwrap_or_else(|| panic!("collective tensor {collective_tensor} missing from live"));
         let coll_output = coll_live.tensor.output();
+        // The collective tensor's real handoff dtype (e.g. f32 for materialized
+        // matmul outputs), used both for the output handoff AND the
+        // re-introduction below so the receiving segment's Input matches the
+        // buffer the collective produced (point.dtype is the planner's original
+        // activation dtype and can disagree).
+        let coll_dtype = coll_live.dtype;
         output_handoff.push(HandoffTensor {
             logical_name: collective_tensor.to_string(),
             luminal_id: coll_output.id,
             shape: coll_live.shape.clone(),
-            dtype: coll_live.dtype,
+            dtype: coll_dtype,
         });
         let mut carry_specs: Vec<HandoffSpec> = Vec::new();
         for c in carries {
@@ -331,17 +370,24 @@ impl<'a> DeviceWiring<'a> {
                 .live
                 .get(*c)
                 .unwrap_or_else(|| panic!("carry {c} missing from live"));
-            let carry_output = live.tensor.output();
+            // Materialize the carry as f32 for the cross-segment handoff. A
+            // carry is a passed-through Input (the residual stream skipping the
+            // collective); the runtime's f32 read path does not recognize a
+            // bf16 passed-through Input as bf16 and reads its bytes as raw f32,
+            // halving it — corrupting the residual on the far side. An explicit
+            // f32 cast yields a buffer the read handles correctly; it is cast
+            // back to the activation dtype where the residual consumes it.
+            let carry_output = live.tensor.cast(DType::F32).output();
             output_handoff.push(HandoffTensor {
                 logical_name: (*c).to_string(),
                 luminal_id: carry_output.id,
                 shape: live.shape.clone(),
-                dtype: live.dtype,
+                dtype: skein_ir::types::Dtype::F32,
             });
             carry_specs.push(HandoffSpec {
                 logical_name: (*c).to_string(),
                 shape: live.shape.clone(),
-                dtype: live.dtype,
+                dtype: skein_ir::types::Dtype::F32,
             });
         }
 
@@ -360,7 +406,7 @@ impl<'a> DeviceWiring<'a> {
         next_inputs.push(HandoffSpec {
             logical_name: point.tensor.clone(),
             shape: point.shape.clone(),
-            dtype: point.dtype,
+            dtype: coll_dtype,
         });
         next_inputs.extend(carry_specs);
         self.open_new_segment(next_inputs);
@@ -381,6 +427,9 @@ impl<'a> DeviceWiring<'a> {
             .named_tensor(INPUT_TOKENS, (self.batch, self.seq));
         let tokens = tokens.as_dtype(DType::Int);
         self.cur_cx.get_op_mut::<Input>(tokens.id).dtype = DType::Int;
+        self.cur_cx
+            .input_meta
+            .insert(tokens.id, (INPUT_TOKENS.to_string(), DType::Int));
         self.cur_input_handoff.push(HandoffTensor {
             logical_name: INPUT_TOKENS.to_string(),
             luminal_id: tokens.id,
@@ -479,8 +528,13 @@ impl<'a> DeviceWiring<'a> {
         let placement = skein_cost::cluster::Placement::from_plan(self.plan);
         let lm_head_w = self.weight("lm_head.weight")?;
         // With a vocab-sharded LM head this produces `[batch, seq, vocab/tp]`;
-        // replicated, it produces the full `[batch, seq, vocab]`.
-        let logits_local = normed.matmul(lm_head_w.permute((1, 0)));
+        // replicated, it produces the full `[batch, seq, vocab]`. Materialize as
+        // f32: the logits are a bf16 *matmul* output read back through the
+        // runtime handoff path (`get_data_f32`), which does not recognize a raw
+        // matmul-output buffer as bf16 and would read the bytes as f32 — halving
+        // the vocab. An explicit f32 cast fixes the read (and the final logits
+        // should be f32 anyway, matching the HF reference).
+        let logits_local = normed.matmul(lm_head_w.permute((1, 0))).cast(DType::F32);
         let full_shape = vec![self.batch, self.seq, self.ir.meta.vocab];
 
         if placement.tp > 1 {
@@ -494,7 +548,7 @@ impl<'a> DeviceWiring<'a> {
                 LiveTensor {
                     tensor: logits_local,
                     shape: vec![self.batch, self.seq, vocab_local],
-                    dtype: self.activation_dtype,
+                    dtype: skein_ir::types::Dtype::F32,
                 },
             );
             // AllGather concatenates the per-rank logit shards (rank-major,
@@ -515,7 +569,7 @@ impl<'a> DeviceWiring<'a> {
                 logical_name: LOGITS.to_string(),
                 luminal_id: gathered.id,
                 shape: full_shape,
-                dtype: self.activation_dtype,
+                dtype: skein_ir::types::Dtype::F32,
             }]);
         } else {
             let logits = logits_local.output();
@@ -524,7 +578,7 @@ impl<'a> DeviceWiring<'a> {
                 logical_name: LOGITS.to_string(),
                 luminal_id: logits.id,
                 shape: full_shape,
-                dtype: self.activation_dtype,
+                dtype: skein_ir::types::Dtype::F32,
             }]);
         }
         Ok(())
@@ -563,19 +617,37 @@ impl<'a> DeviceWiring<'a> {
             .get(&carry_in)
             .expect("pre-block carry missing")
             .tensor;
+        if block == 0 {
+            self.debug_tap("dbg_l0_embed_in", hidden);
+        }
         let norm1_w = self.weight(&format!("model.layers.{block}.input_layernorm.weight"))?;
         let normed_1 = rms_norm(hidden, norm1_w, self.ir.meta.rms_norm_eps);
+        if block == 0 {
+            self.debug_tap("dbg_l0_post_input_ln", normed_1);
+        }
         let attn_out = self.wire_block_attention(block, normed_1)?;
 
         // Record attn_out as block_N_attn_out in live (will either be the
-        // collective tensor or just an internal name when tp=1).
+        // collective tensor or just an internal name when tp=1). When this is a
+        // cross-segment collective handoff (tp>1), materialize it as f32: the
+        // o_proj output is a bf16 *matmul* buffer, and the runtime handoff read
+        // (`get_data_f32`) does not recognize a raw matmul-output buffer as
+        // bf16, so it reads the raw bytes as f32 and HALVES the tensor —
+        // corrupting the AllReduce. An explicit f32 cast produces a buffer the
+        // read handles correctly; it is cast back to the activation dtype after
+        // the collective so the residual stays bf16.
         let attn_name = collective_attn_out(block);
+        let (attn_live, attn_handoff_dtype) = if placement.tp > 1 {
+            (attn_out.cast(DType::F32), skein_ir::types::Dtype::F32)
+        } else {
+            (attn_out, self.activation_dtype)
+        };
         self.live.insert(
             attn_name.clone(),
             LiveTensor {
-                tensor: attn_out,
+                tensor: attn_live,
                 shape: vec![self.batch, self.seq, self.hidden],
-                dtype: self.activation_dtype,
+                dtype: attn_handoff_dtype,
             },
         );
 
@@ -587,8 +659,26 @@ impl<'a> DeviceWiring<'a> {
         }
 
         // (4) Residual after attn (in the current segment, post-collective).
-        let attn_full = self.live.get(&attn_name).expect("attn out missing").tensor;
-        let carry_in_live = self.live.get(&carry_in).expect("carry missing").tensor;
+        let attn_full_raw = self.live.get(&attn_name).expect("attn out missing").tensor;
+        // Cast the f32 collective handoff back to the activation dtype for the
+        // bf16 residual add (no-op when tp==1).
+        let attn_full = if placement.tp > 1 {
+            attn_full_raw.cast(to_luminal_dtype(self.activation_dtype))
+        } else {
+            attn_full_raw
+        };
+        if block == 0 {
+            self.debug_tap("dbg_l0_attn_out", attn_full);
+        }
+        let carry_in_raw = self.live.get(&carry_in).expect("carry missing").tensor;
+        // When tp>1 the carry crossed the attn-collective cut and was carried as
+        // f32 (so the runtime read does not halve it); cast back to the
+        // activation dtype for the bf16 residual add.
+        let carry_in_live = if placement.tp > 1 {
+            carry_in_raw.cast(to_luminal_dtype(self.activation_dtype))
+        } else {
+            carry_in_raw
+        };
         let after_attn = carry_in_live + attn_full;
         let carry_post = carry_post_attn(block);
         self.live.insert(
@@ -605,6 +695,9 @@ impl<'a> DeviceWiring<'a> {
             "model.layers.{block}.post_attention_layernorm.weight"
         ))?;
         let normed_2 = rms_norm(after_attn, norm2_w, self.ir.meta.rms_norm_eps);
+        if block == 0 {
+            self.debug_tap("dbg_l0_post_attn_ln", normed_2);
+        }
         let ffn_out = if has_moe {
             self.wire_block_moe(block, normed_2)?
         } else if has_mlp {
@@ -614,13 +707,22 @@ impl<'a> DeviceWiring<'a> {
             // MoE in every block.
             normed_2
         };
+        // Same matmul-output handoff fix as attn: the MoE down-proj output is a
+        // bf16 matmul buffer; materialize it as f32 when it crosses a collective
+        // (EP combine or TP ffn AllReduce) so the runtime read does not halve it.
+        let ffn_is_collective = (placement.tp > 1 && (has_moe || has_mlp)) || (placement.ep > 1 && has_moe);
         let ffn_name = collective_ffn_out(block);
+        let (ffn_live, ffn_handoff_dtype) = if ffn_is_collective {
+            (ffn_out.cast(DType::F32), skein_ir::types::Dtype::F32)
+        } else {
+            (ffn_out, self.activation_dtype)
+        };
         self.live.insert(
             ffn_name.clone(),
             LiveTensor {
-                tensor: ffn_out,
+                tensor: ffn_live,
                 shape: vec![self.batch, self.seq, self.hidden],
-                dtype: self.activation_dtype,
+                dtype: ffn_handoff_dtype,
             },
         );
 
@@ -637,9 +739,9 @@ impl<'a> DeviceWiring<'a> {
             self.live.insert(
                 combine_name.clone(),
                 LiveTensor {
-                    tensor: ffn_out,
+                    tensor: ffn_live,
                     shape: vec![self.batch, self.seq, self.hidden],
-                    dtype: self.activation_dtype,
+                    dtype: ffn_handoff_dtype,
                 },
             );
             self.cut_segment_at_collective(point, &combine_name, &[&carry_post]);
@@ -656,7 +758,7 @@ impl<'a> DeviceWiring<'a> {
                 LiveTensor {
                     tensor: combined,
                     shape: vec![self.batch, self.seq, self.hidden],
-                    dtype: self.activation_dtype,
+                    dtype: ffn_handoff_dtype,
                 },
             );
         }
@@ -669,12 +771,29 @@ impl<'a> DeviceWiring<'a> {
         }
 
         // (8) Final residual + emit next-block carry.
-        let ffn_full = self.live.get(&ffn_name).expect("ffn out missing").tensor;
-        let carry_post_live = self
+        let ffn_full_raw = self.live.get(&ffn_name).expect("ffn out missing").tensor;
+        // Cast the f32 collective handoff back to the activation dtype for the
+        // bf16 residual add (no-op when ffn never crossed a collective).
+        let ffn_full = if ffn_is_collective {
+            ffn_full_raw.cast(to_luminal_dtype(self.activation_dtype))
+        } else {
+            ffn_full_raw
+        };
+        if block == 0 {
+            self.debug_tap("dbg_l0_moe_out", ffn_full);
+        }
+        let carry_post_raw = self
             .live
             .get(&carry_post)
             .expect("post-attn carry missing")
             .tensor;
+        // carry_post crossed the ffn (and/or EP) collective cut as f32; cast
+        // back to the activation dtype for the bf16 residual add.
+        let carry_post_live = if ffn_is_collective {
+            carry_post_raw.cast(to_luminal_dtype(self.activation_dtype))
+        } else {
+            carry_post_raw
+        };
         let after_block = carry_post_live + ffn_full;
         let next_carry = carry_pre_block(block + 1);
         self.live.insert(
@@ -732,6 +851,11 @@ impl<'a> DeviceWiring<'a> {
         let q = normed.matmul(q_w.permute((1, 0))).cast(DType::F32);
         let k_new = normed.matmul(k_w.permute((1, 0))).cast(DType::F32);
         let v_new = normed.matmul(v_w.permute((1, 0))).cast(DType::F32);
+        if block == 0 {
+            self.debug_tap("dbg_l0_q_proj", q);
+            self.debug_tap("dbg_l0_k_proj", k_new);
+            self.debug_tap("dbg_l0_v_proj", v_new);
+        }
 
         // Runtime-fed fixed-capacity cache [batch, KV_CACHE_CAP, kv_dim] (static,
         // never empty/null) + the absolute `position`. `SegmentRunner` feeds the
@@ -808,6 +932,9 @@ impl<'a> DeviceWiring<'a> {
             .named_tensor(name.to_string(), dims)
             .as_dtype(dtype);
         self.cur_cx.get_op_mut::<Input>(t.id).dtype = dtype;
+        self.cur_cx
+            .input_meta
+            .insert(t.id, (name.to_string(), dtype));
         self.cur_input_handoff.push(HandoffTensor {
             logical_name: name.to_string(),
             luminal_id: t.id,
@@ -867,6 +994,9 @@ impl<'a> DeviceWiring<'a> {
             "model.layers.{block}.block_sparse_moe.gate.weight"
         ))?;
         let routing_logits = normed.matmul(gate_w.permute((1, 0)));
+        if block == 0 {
+            self.debug_tap("dbg_l0_router_logits", routing_logits);
+        }
         let n = normed.dims().len();
         let top_k = self.ir.meta.top_k.unwrap_or(n_experts).clamp(1, n_experts);
         let routing_probs = top_k_route(routing_logits, top_k, n_experts, n - 1);
@@ -1100,7 +1230,7 @@ pub fn moe_dispatch_combine(
 }
 
 /// `x / sqrt(mean(x²) + eps) * weight` — i.e. RmsNorm.
-fn rms_norm(input: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
+pub fn rms_norm(input: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     let last = input.shape.last_axis();
     let normed = input.std_norm(last, eps);
     let dims = input.dims();
@@ -1111,7 +1241,7 @@ fn rms_norm(input: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
 /// Token-id `[batch, seq]` → embedded `[batch, seq, hidden]`. Static dims
 /// are passed in explicitly because segments use static shapes rather than
 /// dynamic `'b'` / `'s'` dimensions.
-fn embedding_lookup(
+pub fn embedding_lookup(
     tokens: GraphTensor,
     embed_weight: GraphTensor,
     batch: usize,
@@ -1795,6 +1925,11 @@ fn declare_param_into(
     let tensor = cx.named_tensor(param.name.clone(), dims_expr);
     let id = tensor.id;
     cx.get_op_mut::<Input>(id).dtype = dtype_lum;
+    // Keep input_meta consistent with the Input op dtype: the runtime narrows
+    // staged f32 weight data to this dtype, and the codegen reads the buffer at
+    // this dtype. A stale F32 entry (named_tensor's default) leaves a bf16
+    // weight as an f32 buffer that the bf16 codegen reads as interleaved zeros.
+    cx.input_meta.insert(id, (param.name.clone(), dtype_lum));
     Ok(DeclaredTensor {
         id,
         shape: dims_usize,

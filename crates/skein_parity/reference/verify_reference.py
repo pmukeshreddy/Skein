@@ -80,10 +80,17 @@ def forward(request: Dict[str, Any]) -> None:
     # forward of Mixtral is minutes/token and a CPU load spikes ~90GB host RAM;
     # pinning to cuda:1 (idle) makes the reference fast and avoids RAM pressure.
     import os
+    # The Skein candidate may be tensor-parallel across BOTH GPUs (tp=2), so a
+    # full 90 GB HF copy will not fit on a single card alongside it. When
+    # SKEIN_REF_DEVICE=auto, let accelerate shard the reference across all
+    # visible GPUs (~45 GB each) so it co-resides with the tp=2 candidate.
     ref_device = os.environ.get("SKEIN_REF_DEVICE", "cuda:1")
+    device_map: Any = "auto" if ref_device == "auto" else {"": ref_device}
     kwargs: Dict[str, Any] = {
-        "torch_dtype": dtype,
-        "device_map": {"": ref_device},
+        # transformers 5.x renamed `torch_dtype` -> `dtype` (the old name warns
+        # but still works); use the new name.
+        "dtype": dtype,
+        "device_map": device_map,
         "low_cpu_mem_usage": True,
     }
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)

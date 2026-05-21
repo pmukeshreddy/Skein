@@ -84,12 +84,63 @@ impl PagedKVAllocator {
         })
     }
 
+    /// Build an allocator with an explicit page geometry, bypassing the Plan's
+    /// `KVLayout`. Used by the runtime KV cache ([`crate::kv::PagedKvCache`]),
+    /// which manages KV bytes itself and picks a multi-token `page_size` for
+    /// real paging even when the Plan chose a contiguous layout. `total_pages`
+    /// is the device's page budget; `prefix_enable` turns on the radix tree.
+    pub fn with_capacity(
+        page_size: u32,
+        total_pages: u32,
+        prefix_enable: bool,
+        radix_max_depth: u32,
+    ) -> Result<Self, RuntimeError> {
+        if page_size == 0 || total_pages == 0 {
+            return Err(RuntimeError::KvUndersized {
+                capacity_pages: total_pages,
+                prompt_pages: 1,
+            });
+        }
+        let mut pages = Vec::with_capacity(total_pages as usize);
+        let mut free = VecDeque::with_capacity(total_pages as usize);
+        for i in 0..total_pages {
+            pages.push(Page::new(PageId(i), page_size));
+            free.push_back(PageId(i));
+        }
+        let radix = prefix_enable.then(|| RadixPrefixTree::new(page_size, radix_max_depth));
+        Ok(Self {
+            page_size,
+            pages,
+            free,
+            cached_lru: VecDeque::new(),
+            page_tables: HashMap::new(),
+            radix,
+        })
+    }
+
     pub fn page_size(&self) -> u32 {
         self.page_size
     }
 
     pub fn total_pages(&self) -> u32 {
         self.pages.len() as u32
+    }
+
+    /// Whether prefix caching (the radix tree) is enabled.
+    pub fn prefix_enabled(&self) -> bool {
+        self.radix.is_some()
+    }
+
+    /// The physical pages currently mapped for `request_id`, in logical token
+    /// order (page `i` covers tokens `[i*page_size, (i+1)*page_size)`).
+    pub fn pages_for(&self, request_id: RequestId) -> Option<Vec<PageId>> {
+        self.page_tables.get(&request_id).map(|pt| pt.pages.clone())
+    }
+
+    /// Number of free pages plus cached (reusable) pages — the headroom an
+    /// admission can draw on before hitting [`RuntimeError::KvExhausted`].
+    pub fn available_pages(&self) -> u32 {
+        (self.free.len() + self.cached_lru.len()) as u32
     }
 
     pub fn in_use_pages(&self) -> u32 {
@@ -240,6 +291,28 @@ impl PagedKVAllocator {
     /// Generation of a page. Tests verify this bumps after eviction.
     pub fn generation_of(&self, pid: PageId) -> Option<u64> {
         self.pages.get(pid.0 as usize).map(|p| p.generation)
+    }
+
+    /// Allocate a single page (refcount = 1), drawing from the free list or
+    /// evicting the LRU cached page. Used by the runtime KV cache for the
+    /// implicit single-stream request and for raw growth not tied to a radix
+    /// path. Pair with [`free_page`](Self::free_page).
+    pub fn allocate_page(&mut self) -> Result<PageId, RuntimeError> {
+        let pid = self.allocate_or_evict()?;
+        self.pages[pid.0 as usize].refcount = self.pages[pid.0 as usize].refcount.saturating_add(1);
+        Ok(pid)
+    }
+
+    /// Return a raw-allocated page. Decrements its refcount; at zero it goes
+    /// back to the free list (no radix involvement — the inverse of
+    /// [`allocate_page`](Self::allocate_page)).
+    pub fn free_page(&mut self, id: PageId) {
+        if let Some(page) = self.pages.get_mut(id.0 as usize) {
+            page.refcount = page.refcount.saturating_sub(1);
+            if page.refcount == 0 {
+                self.free.push_back(id);
+            }
+        }
     }
 
     fn allocate_or_evict(&mut self) -> Result<PageId, RuntimeError> {

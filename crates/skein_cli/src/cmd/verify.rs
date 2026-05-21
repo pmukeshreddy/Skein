@@ -33,6 +33,63 @@ pub fn run_verify_inner<R: ComputeRuntime + 'static>(
     args: VerifyArgs,
     _output: OutputFormat,
 ) -> Result<(), CliError> {
+    // ── Debug-only dump path: run one Skein forward over explicit tokens and
+    // dump layer-0 op taps (with SKEIN_DEBUG_TAPS + SKEIN_DUMP_DIR). No HF, no
+    // reference artifact, so it never co-resides another 90 GB model on GPU. ──
+    if args.dump_only {
+        use skein_parity::SkeinForward;
+        let tokens_path = args.tokens_file.as_ref().ok_or_else(|| {
+            CliError::BadArgument("--dump-only requires --tokens-file".to_string())
+        })?;
+        let raw = std::fs::read_to_string(tokens_path)?;
+        let tokens: Vec<u32> = raw
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u32>())
+            .collect::<Result<_, _>>()
+            .map_err(|e| CliError::BadArgument(format!("bad token id in {tokens_path:?}: {e}")))?;
+        eprintln!("dump-only: {} tokens = {:?}", tokens.len(), tokens);
+        // SKEIN_DUMP_NATIVE forces the CPU NativeComputeRuntime (no NVRTC
+        // codegen) so the SAME tp=2 lowering can be dumped on CPU and diffed
+        // against the CUDA dump: if they match, a divergence from HF is a
+        // wiring/lowering bug; if they differ, it is CUDA codegen of the
+        // composed graph.
+        let out = if std::env::var_os("SKEIN_DUMP_NATIVE").is_some() {
+            eprintln!("dump-only: using NativeComputeRuntime (CPU)");
+            let mut candidate = RealSkeinForward::load_native(&args.artifact)?;
+            candidate.forward_with_hooks(&tokens)?
+        } else {
+            let mut candidate = RealSkeinForward::load_with_runtime::<R>(
+                &args.artifact,
+                skein_compile::DEFAULT_SEARCH_BUDGET,
+            )?;
+            candidate.forward_with_hooks(&tokens)?
+        };
+        let argmax = out
+            .final_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        eprintln!(
+            "dump-only: final_logits len={} argmax={}",
+            out.final_logits.len(),
+            argmax
+        );
+        if let Some(dir) = std::env::var_os("SKEIN_DUMP_DIR") {
+            let path = std::path::Path::new(&dir).join("final_logits.f32");
+            let bytes: Vec<u8> = out
+                .final_logits
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let _ = std::fs::write(&path, bytes);
+            eprintln!("dump-only: wrote {}", path.display());
+        }
+        return Ok(());
+    }
+
     let artifact = SkeinArtifact::load(&args.artifact)?;
     let cost_model = load_cost_model(&args.cost)?;
     let tolerances = ToleranceTable::from_cost_constants(cost_model.constants());

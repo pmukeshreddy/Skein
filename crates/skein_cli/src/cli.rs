@@ -130,6 +130,15 @@ pub struct VerifyArgs {
     /// Reference dtype for the HF model: bfloat16 | float16 | float32.
     #[arg(long, default_value = "bfloat16")]
     pub reference_dtype: String,
+    /// Debug-only: load just the candidate artifact, run one forward over the
+    /// tokens in `--tokens-file`, and exit. Used with `SKEIN_DEBUG_TAPS=1` +
+    /// `SKEIN_DUMP_DIR=<dir>` to dump layer-0 op intermediates for HF
+    /// bisection. No HF subprocess, no reference artifact.
+    #[arg(long)]
+    pub dump_only: bool,
+    /// Whitespace/comma-separated token ids fed to the `--dump-only` forward.
+    #[arg(long)]
+    pub tokens_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -178,6 +187,23 @@ pub struct ServeArgs {
     /// Shared file path for the NCCL rendezvous id (multi-GPU path).
     #[arg(long, default_value = "/tmp/skein_rendezvous")]
     pub rendezvous: PathBuf,
+
+    /// Single-process continuous-batching demo: drive the `ContinuousBatcher`
+    /// over the paged-KV `ContinuousBatchDriver` with several prompts (admit →
+    /// mixed prefill/decode batch → retire), exercising prefix reuse and CUDA
+    /// graphs, then print per-request output + driver metrics. Runs instead of
+    /// the HTTP server.
+    #[arg(long)]
+    pub batch_demo: bool,
+
+    /// Comma-separated prompts for `--batch-demo` (defaults to a built-in set
+    /// that shares a prefix to exercise cross-request reuse).
+    #[arg(long)]
+    pub demo_prompts: Option<String>,
+
+    /// Enable CUDA-graph capture/replay for uniform decode steps in the demo.
+    #[arg(long)]
+    pub cuda_graphs: bool,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -98,6 +98,11 @@ impl RankServer {
         self.vocab
     }
 
+    /// The runtime KV paging page size (tokens per page) on this rank.
+    pub fn kv_page_size(&self) -> usize {
+        self.executor.runner().kv().page_size()
+    }
+
     /// Distribute the prompt from rank 0 to every rank so they decode in
     /// lockstep. Rank 0 passes `Some(prompt)`; the others pass `None` and
     /// receive it. Length is broadcast first (variable-length prompts), then
@@ -151,42 +156,62 @@ impl RankServer {
         Ok(logits)
     }
 
-    /// Greedy lockstep cached decode of `max_new_tokens` from `prompt_tokens`.
-    /// First prefills the prompt token-by-token (positions `0..prompt_len`,
-    /// building the KV cache); the logits after the last prompt token predict the
-    /// first generated token. Then decodes one token per step, feeding only the
-    /// newest token (the cache supplies the history). Every rank runs this
-    /// identically (same prompt → same logits → same argmax), so the ranks stay
-    /// in step without per-token communication.
+    /// Greedy lockstep cached decode of `max_new_tokens` from `prompt_tokens`,
+    /// backed by the **paged KV cache with cross-request prefix reuse**. The
+    /// request is admitted through the paged allocator: any prompt prefix whose
+    /// KV is still resident in cached pages (from an earlier request) is reused
+    /// — those tokens are NOT recomputed; prefill starts after the matched
+    /// prefix. The remaining prompt tokens are prefilled (writing their KV into
+    /// freshly allocated pages); the logits after the last prompt token predict
+    /// the first generated token. Decode then feeds one token per step, growing
+    /// pages as the sequence crosses page boundaries. Every rank runs this
+    /// identically (same prompt → same admit → same matched prefix → same
+    /// logits → same argmax), so ranks stay in lockstep without per-token
+    /// communication, and each rank's paged allocator evolves identically.
     pub fn generate(
         &mut self,
         prompt_tokens: &[u32],
         max_new_tokens: usize,
-    ) -> Result<Vec<u32>, RuntimeError> {
+    ) -> Result<GenResult, RuntimeError> {
+        // Release any prior active request (its pages stay cached for reuse).
         self.executor.runner_mut().reset_kv_cache();
         if prompt_tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok(GenResult::default());
         }
 
-        // Prefill: feed each prompt token in turn, accumulating the cache.
-        // Time it as TTFT (prompt seen -> first token's logits ready).
-        let mut position = 0usize;
+        // Admit through the paged allocator: prefix match + page allocation.
+        let request_id = crate::types::RequestId::next();
+        let matched = self
+            .executor
+            .runner_mut()
+            .begin_request(request_id, prompt_tokens)?;
+        // Always run at least the final prompt token so we get its logits, even
+        // if the whole prompt was prefix-matched.
+        let prefill_start_pos = matched.min(prompt_tokens.len() - 1);
+
+        // Prefill the un-cached suffix. Time it as TTFT (prompt seen -> first
+        // token's logits ready). Pages for the prompt were allocated at admit.
+        let mut position = prefill_start_pos;
         let mut logits = Vec::new();
         let prefill_start = Instant::now();
-        for &tok in prompt_tokens {
+        for &tok in &prompt_tokens[prefill_start_pos..] {
             logits = self.forward_step(tok, position)?;
             position += 1;
         }
         let ttft = prefill_start.elapsed();
+        let prefill_steps = prompt_tokens.len() - prefill_start_pos;
 
         // Decode: argmax the current logits, emit, and feed it back as the next
-        // token at the running position. Time each decode step (TPOT).
+        // token at the running position. Grow the request's pages by one token
+        // per step (paged KV). Time each decode step (TPOT).
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut step_times: Vec<Duration> = Vec::new();
         for i in 0..max_new_tokens {
             let next = argmax(&logits);
             generated.push(next);
             if i + 1 < max_new_tokens {
+                // Allocate the page covering this new token's slot before writing.
+                self.executor.runner_mut().advance_kv()?;
                 let t = Instant::now();
                 logits = self.forward_step(next, position)?;
                 step_times.push(t.elapsed());
@@ -194,35 +219,70 @@ impl RankServer {
             }
         }
 
-        if self.layout.is_leader() {
-            let mut ms: Vec<f64> = step_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
-            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let pct = |p: f64| -> f64 {
-                if ms.is_empty() {
-                    0.0
-                } else {
-                    ms[((p * (ms.len() as f64 - 1.0)).round() as usize).min(ms.len() - 1)]
-                }
-            };
-            let decode_total: f64 = ms.iter().sum::<f64>() / 1e3;
-            let decode_toks = step_times.len() as f64;
-            let tput = if decode_total > 0.0 {
-                decode_toks / decode_total
-            } else {
+        let pages_in_use = self.executor.runner().kv_pages_in_use();
+        // Release the request: its pages return to the cache so the next request
+        // sharing this prompt's prefix can reuse them.
+        self.executor.runner_mut().end_request();
+
+        let mut ms: Vec<f64> = step_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| -> f64 {
+            if ms.is_empty() {
                 0.0
-            };
+            } else {
+                ms[((p * (ms.len() as f64 - 1.0)).round() as usize).min(ms.len() - 1)]
+            }
+        };
+        let decode_total: f64 = ms.iter().sum::<f64>() / 1e3;
+        let decode_toks = step_times.len() as f64;
+        let tput = if decode_total > 0.0 {
+            decode_toks / decode_total
+        } else {
+            0.0
+        };
+        let result = GenResult {
+            tokens: generated,
+            prefix_hit_tokens: matched,
+            prefill_steps,
+            prompt_tokens: prompt_tokens.len(),
+            ttft_ms: ttft.as_secs_f64() * 1e3,
+            tpot_p50_ms: pct(0.50),
+            tpot_p95_ms: pct(0.95),
+            decode_tokens_per_s: tput,
+            kv_pages_in_use: pages_in_use,
+        };
+        if self.layout.is_leader() {
             tracing::info!(
-                prompt_tokens = prompt_tokens.len(),
-                ttft_ms = ttft.as_secs_f64() * 1e3,
+                prompt_tokens = result.prompt_tokens,
+                prefix_cache_hit_tokens = result.prefix_hit_tokens,
+                prefill_steps = result.prefill_steps,
+                kv_pages_in_use = result.kv_pages_in_use,
+                ttft_ms = result.ttft_ms,
                 decode_steps = step_times.len(),
-                tpot_p50_ms = pct(0.50),
-                tpot_p95_ms = pct(0.95),
-                decode_tokens_per_s = tput,
-                "SKEIN_PERF: cached-decode timing (single in-flight request, greedy)"
+                tpot_p50_ms = result.tpot_p50_ms,
+                tpot_p95_ms = result.tpot_p95_ms,
+                decode_tokens_per_s = result.decode_tokens_per_s,
+                "SKEIN_PERF: paged-KV cached-decode timing (single in-flight request, greedy)"
             );
         }
-        Ok(generated)
+        Ok(result)
     }
+}
+
+/// One generation's tokens plus paged-KV / timing telemetry.
+#[derive(Debug, Clone, Default)]
+pub struct GenResult {
+    pub tokens: Vec<u32>,
+    /// Prompt tokens reused from the prefix cache (0 = cold).
+    pub prefix_hit_tokens: usize,
+    /// Prompt tokens actually prefilled this run (= prompt_len - prefix-skipped).
+    pub prefill_steps: usize,
+    pub prompt_tokens: usize,
+    pub ttft_ms: f64,
+    pub tpot_p50_ms: f64,
+    pub tpot_p95_ms: f64,
+    pub decode_tokens_per_s: f64,
+    pub kv_pages_in_use: u32,
 }
 
 /// End-to-end distributed greedy generation for one prompt across the rank
@@ -259,12 +319,43 @@ pub fn run_generation(
         None
     })?;
 
-    let generated = server.generate(&prompt_tokens, max_new_tokens)?;
+    // Cold run (no prefix cache populated yet).
+    let cold = server.generate(&prompt_tokens, max_new_tokens)?;
+
+    // Prefix-cache demonstration: re-run the same prompt. The paged allocator's
+    // radix tree now holds the cold run's pages, so the shared prompt prefix is
+    // served from cache — fewer prefill steps — and the generated tokens are
+    // byte-identical, proving paged-KV prefix reuse is correct and active.
+    // (Page-granular: a hit needs a shared prefix >= page_size tokens.)
+    if std::env::var_os("SKEIN_PREFIX_DEMO").is_some() {
+        let warm = server.generate(&prompt_tokens, max_new_tokens)?;
+        if layout.is_leader() {
+            let identical = cold.tokens == warm.tokens;
+            tracing::info!(
+                prompt_tokens = cold.prompt_tokens,
+                page_size = server.kv_page_size(),
+                cold_prefix_hit = cold.prefix_hit_tokens,
+                cold_prefill_steps = cold.prefill_steps,
+                warm_prefix_hit = warm.prefix_hit_tokens,
+                warm_prefill_steps = warm.prefill_steps,
+                warm_kv_pages = warm.kv_pages_in_use,
+                tokens_identical = identical,
+                "SKEIN_PREFIX_DEMO: cold vs warm (prefix-cache reuse)"
+            );
+            if !identical {
+                tracing::error!(
+                    cold = ?cold.tokens,
+                    warm = ?warm.tokens,
+                    "SKEIN_PREFIX_DEMO: warm tokens differ from cold — reuse INCORRECT"
+                );
+            }
+        }
+    }
 
     if layout.is_leader() {
         let text = match tokenizer {
-            Some(tok) => tok.decode(&generated)?,
-            None => format!("{generated:?}"),
+            Some(tok) => tok.decode(&cold.tokens)?,
+            None => format!("{:?}", cold.tokens),
         };
         Ok(Some(text))
     } else {

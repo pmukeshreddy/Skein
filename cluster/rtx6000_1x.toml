@@ -1,0 +1,9 @@
+# Single-RTX-PRO-6000 cluster for clean tp=1 parity bisection (full-width ops,
+# no tensor-parallel sharding / collectives to confound op-by-op comparison).
+num_devices = 1
+
+[[node]]
+id               = "node0"
+devices          = ["d0"]
+device_kind      = "rtx_pro_6000_blackwell"
+device_memory_gb = 96

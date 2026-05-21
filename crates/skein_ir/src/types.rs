@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dtype {
+    /// Full-precision f32. NOT a planner-selectable layer dtype (absent from
+    /// [`Dtype::ALL`]); used by the emitter for cross-segment / final-output
+    /// handoffs that must round-trip through the runtime's `f32` read path
+    /// without the bf16-as-f32 halving that raw matmul-output buffers suffer.
+    F32,
     Bf16,
     Fp16,
     Fp8E4m3,
@@ -37,6 +42,7 @@ impl Dtype {
     /// byte — so this returns 4, not 8.
     pub const fn bits(self) -> u32 {
         match self {
+            Dtype::F32 => 32,
             Dtype::Bf16 | Dtype::Fp16 => 16,
             Dtype::Fp8E4m3 | Dtype::Fp8E5m2 | Dtype::Int8 => 8,
             Dtype::Int4 => 4,
@@ -55,7 +61,7 @@ impl Dtype {
     pub const fn is_float(self) -> bool {
         matches!(
             self,
-            Dtype::Bf16 | Dtype::Fp16 | Dtype::Fp8E4m3 | Dtype::Fp8E5m2
+            Dtype::F32 | Dtype::Bf16 | Dtype::Fp16 | Dtype::Fp8E4m3 | Dtype::Fp8E5m2
         )
     }
 

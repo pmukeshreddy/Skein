@@ -33,24 +33,43 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="cuda"
+        args.model, dtype=torch.bfloat16, device_map="cuda"
     )
     model.eval()
 
     ids = tok(args.prompt, return_tensors="pt").input_ids.to("cuda")
     last = ids.shape[1] - 1
+    # Persist the exact token ids so the Skein side feeds the identical sequence
+    # (skein verify --dump-only --tokens-file <out>/input_ids.txt).
+    ids_cpu = ids[0].detach().cpu().numpy().astype(np.int64)
+    np.save(os.path.join(args.out, "input_ids.npy"), ids_cpu)
+    with open(os.path.join(args.out, "input_ids.txt"), "w") as f:
+        f.write(" ".join(str(int(x)) for x in ids_cpu))
+    print(f"  input_ids = {ids_cpu.tolist()}")
     captured = {}
 
     def save(name, t):
-        # last-token row, float32 on host
+        # last-token row, float32 on host. Handles (batch, seq, *) tensors.
         arr = t[0, last].detach().to(torch.float32).cpu().numpy()
+        captured[name] = arr
+        np.save(os.path.join(args.out, f"{name}.npy"), arr)
+        print(f"  {name:24s} shape={tuple(arr.shape)}  norm={np.linalg.norm(arr):.4f}")
+
+    def save_flat(name, t):
+        # last-token row for a tensor already flattened to (seq, *) — e.g. the
+        # transformers-5.x router logits, which reshape to (-1, num_experts).
+        arr = t.reshape(t.shape[0], -1)[last].detach().to(torch.float32).cpu().numpy()
         captured[name] = arr
         np.save(os.path.join(args.out, f"{name}.npy"), arr)
         print(f"  {name:24s} shape={tuple(arr.shape)}  norm={np.linalg.norm(arr):.4f}")
 
     layer = model.model.layers[0]
     attn = layer.self_attn
-    moe = layer.block_sparse_moe
+    # transformers 5.x renamed Mixtral's MoE block: layer.mlp is the
+    # MixtralSparseMoeBlock; .gate is a MixtralTopKRouter whose forward returns
+    # (router_logits, router_scores, router_indices); the block returns a bare
+    # hidden-states tensor (not a tuple).
+    moe = layer.mlp
 
     hooks = []
     # Embedding output == decoder layer input.
@@ -62,12 +81,14 @@ def main():
         lambda m, i, o: save("q_proj_out", o)))
     hooks.append(attn.k_proj.register_forward_hook(
         lambda m, i, o: save("k_proj_out", o)))
+    hooks.append(attn.v_proj.register_forward_hook(
+        lambda m, i, o: save("v_proj_out", o)))
     hooks.append(attn.o_proj.register_forward_hook(
         lambda m, i, o: save("attn_out", o)))
     hooks.append(layer.post_attention_layernorm.register_forward_hook(
         lambda m, i, o: save("post_attn_layernorm", o)))
     hooks.append(moe.gate.register_forward_hook(
-        lambda m, i, o: save("router_logits", o)))
+        lambda m, i, o: save_flat("router_logits", o[0] if isinstance(o, tuple) else o)))
     hooks.append(moe.register_forward_hook(
         lambda m, i, o: save("moe_out", o[0] if isinstance(o, tuple) else o)))
     hooks.append(layer.register_forward_hook(
