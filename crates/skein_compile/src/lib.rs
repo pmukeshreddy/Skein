@@ -96,6 +96,15 @@ pub trait ComputeRuntime: Sized {
         self.set_data_f32(id, data);
     }
 
+    /// Like [`set_data_f32_as`](Self::set_data_f32_as) but marks the input
+    /// **persistent** — its GPU buffer is uploaded once and kept across forwards
+    /// rather than re-fed every step. Used for weights so they aren't re-uploaded
+    /// each forward. Default ignores persistence (the CPU runtime never consumes
+    /// input buffers); the CUDA backend overrides it to keep the buffer alive.
+    fn set_data_persistent_f32_as(&mut self, id: NodeIndex, data: Vec<f32>, dtype: DType) {
+        self.set_data_f32_as(id, data, dtype);
+    }
+
     /// Upload raw bf16 weight bytes straight into a bf16 input buffer, skipping
     /// the bf16->f32->bf16 round-trip the f32 path forces (which, on ~90 GB of
     /// weights, costs tens of seconds of CPU and 2x host RAM). Default decodes to
@@ -282,6 +291,14 @@ mod cuda_impl {
                 .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             self.inner.set_data(id, bf);
+        }
+
+        fn set_data_persistent_f32_as(&mut self, id: NodeIndex, data: Vec<f32>, dtype: DType) {
+            // Upload (with the bf16/f16 narrow) then mark persistent so luminal
+            // keeps the buffer across forwards instead of consuming it — weights
+            // are uploaded once, not re-fed every step.
+            self.set_data_f32_as(id, data, dtype);
+            self.inner.mark_hlir_persistent(id);
         }
 
         fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>) {

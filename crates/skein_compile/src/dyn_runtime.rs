@@ -151,6 +151,12 @@ pub struct DynRuntimeWrapper<R: ComputeRuntime> {
     staged_f32: HashMap<NodeIndex, Vec<f32>>,
     staged_i32: HashMap<NodeIndex, Vec<i32>>,
     external_f32: HashMap<NodeIndex, Vec<f32>>,
+    /// Weight tensors, staged once at load (set_tensor_bytes_by_name) and applied
+    /// to the runtime as PERSISTENT inputs on the first execute, then dropped.
+    /// Unlike `staged_f32` (per-step handoffs re-applied every forward), weights
+    /// are uploaded exactly once — avoiding a ~90 GB re-upload per forward.
+    staged_weights: HashMap<NodeIndex, Vec<f32>>,
+    weights_loaded: bool,
 }
 
 impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
@@ -177,6 +183,8 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
             staged_f32: HashMap::new(),
             staged_i32: HashMap::new(),
             external_f32: HashMap::new(),
+            staged_weights: HashMap::new(),
+            weights_loaded: false,
         }
     }
 
@@ -211,6 +219,22 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
 impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
         self.external_f32.clear();
+        // Weights: upload exactly once, as PERSISTENT inputs (kept across
+        // forwards), then drop the host copies. This is the difference between
+        // re-uploading ~90 GB every forward (~78s) and uploading it once.
+        if !self.weights_loaded {
+            let weights = std::mem::take(&mut self.staged_weights);
+            for (node, data) in weights {
+                let dtype = self
+                    .graph
+                    .input_meta
+                    .get(&node)
+                    .map(|(_, dt)| *dt)
+                    .unwrap_or(DType::F32);
+                self.inner.set_data_persistent_f32_as(node, data, dtype);
+            }
+            self.weights_loaded = true;
+        }
         for (node, data) in self.staged_f32.clone() {
             // Narrow to the input's declared dtype (bf16/f16) so a bf16 input
             // slot receives bf16, not raw f32 bytes. input_meta carries the
@@ -275,5 +299,21 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
 
     fn set_dyn_dim(&mut self, dim: char, val: usize) {
         self.graph.dyn_map.insert(dim, val);
+    }
+
+    fn set_tensor_bytes_by_name(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        dtype: WeightDtype,
+    ) -> Result<(), DynRuntimeError> {
+        // Only weights are loaded via raw bytes (from safetensors); handoffs and
+        // tokens use the f32/i32 setters. Stage weights separately so they are
+        // uploaded ONCE as persistent inputs on the first execute, instead of
+        // landing in staged_f32 and being re-uploaded every forward.
+        let node = self.input_node_for(name)?;
+        let data = decode_weight_bytes(name, bytes, dtype)?;
+        self.staged_weights.insert(node, data);
+        Ok(())
     }
 }

@@ -144,6 +144,10 @@ impl CompiledBucket {
 pub struct CudaRuntime {
     // Shared state across all buckets
     pub hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
+    /// HLIR input nodes (e.g. model weights) the caller has marked persistent:
+    /// they are uploaded once and must NOT be consumed/freed after each execute,
+    /// so they survive across forwards instead of being re-uploaded every step.
+    persistent_hlir_inputs: FxHashSet<NodeIndex>,
     cuda_stream: Arc<CudaStream>,
     changed_hlir: FxHashSet<NodeIndex>,
     pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
@@ -315,6 +319,13 @@ impl CudaRuntime {
         let cuda_input = data.to_cuda_input(&self.cuda_stream);
         self.hlir_buffers.insert(id, cuda_input);
         self.changed_hlir.insert(id);
+    }
+
+    /// Mark an HLIR input node (e.g. a model weight) as persistent: its buffer
+    /// is kept across executes instead of being consumed/freed afterwards, so it
+    /// is uploaded once rather than re-fed every forward. Call after `set_data`.
+    pub fn mark_hlir_persistent(&mut self, id: impl ToId) {
+        self.persistent_hlir_inputs.insert(id.to_id());
     }
 
     /// Allocate a zeroed GPU buffer for the given node. This is more efficient than
@@ -1244,6 +1255,7 @@ impl Runtime for CudaRuntime {
     fn initialize(stream: Self::CompileArg) -> Self {
         Self {
             hlir_buffers: FxHashMap::default(),
+            persistent_hlir_inputs: FxHashSet::default(),
             cuda_stream: stream,
             changed_hlir: FxHashSet::default(),
             cuda_graph_timings: vec![],
@@ -1619,7 +1631,12 @@ impl Runtime for CudaRuntime {
         let to_consume: Vec<NodeIndex> = self
             .hlir_buffers
             .keys()
-            .filter(|hlir_node| !inputs_with_outputs.contains(hlir_node))
+            .filter(|hlir_node| {
+                !inputs_with_outputs.contains(hlir_node)
+                    // Weights marked persistent are uploaded once and kept; not
+                    // consumed, so they are not re-uploaded every forward.
+                    && !self.persistent_hlir_inputs.contains(hlir_node)
+            })
             .copied()
             .collect();
 
