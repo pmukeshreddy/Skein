@@ -162,6 +162,36 @@ pub trait DynRuntime {
     /// `ptr` must be a valid device allocation of `n_bytes` kept alive for this
     /// runtime's lifetime.
     unsafe fn set_weight_device_ptr_by_name(&mut self, _name: &str, _ptr: u64, _n_bytes: usize) {}
+
+    /// Device buffer `(raw_ptr, byte_len)` backing a named **output** tensor, no
+    /// host copy — for a device-resident segment-to-segment handoff. CUDA only;
+    /// `None` by default (host path) or when the output isn't resident.
+    fn output_device_ptr_by_name(&self, _name: &str) -> Option<(u64, usize)> {
+        None
+    }
+
+    /// Bind a named input to an external device buffer (a producer segment's
+    /// output), transiently (re-bound each step — not persistent). CUDA only;
+    /// no-op default.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of at least `n_bytes` on this
+    /// runtime's device, alive until this segment finishes executing.
+    unsafe fn bind_input_device_by_name(&mut self, _name: &str, _ptr: u64, _n_bytes: usize) {}
+
+    /// Ensure a named KV-cache **input** is backed by a persistent on-GPU buffer
+    /// of `n_bytes` (allocated once, reused every step), returning its device
+    /// pointer — so the cache is never re-uploaded from host. CUDA only; `None`.
+    fn ensure_kv_input_device_by_name(&mut self, _name: &str, _n_bytes: usize) -> Option<u64> {
+        None
+    }
+
+    /// Copy a named **output** (a decode step's new K/V) to `dest_ptr`
+    /// (device→device), e.g. into its slot in the resident KV buffer. CUDA only.
+    ///
+    /// # Safety
+    /// `dest_ptr` must be a valid device allocation of at least `n_bytes`.
+    unsafe fn copy_output_to_device_by_name(&self, _name: &str, _dest_ptr: u64, _n_bytes: usize) {}
 }
 
 pub struct DynRuntimeWrapper<R: ComputeRuntime> {
@@ -361,6 +391,38 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             // it from staged_weights on first execute.
             self.staged_weights.remove(&node);
             self.weights_loaded = true;
+        }
+    }
+
+    fn output_device_ptr_by_name(&self, name: &str) -> Option<(u64, usize)> {
+        let node = self.node_for(name).ok()?;
+        self.inner.output_device_buffer(node)
+    }
+
+    unsafe fn bind_input_device_by_name(&mut self, name: &str, ptr: u64, n_bytes: usize) {
+        if let Ok(node) = self.input_node_for(name) {
+            unsafe { self.inner.bind_input_device_ptr(node, ptr, n_bytes) };
+            // A device binding supersedes any host-staged value for this input;
+            // drop it so execute() doesn't re-upload stale host bytes over it.
+            self.staged_f32.remove(&node);
+            self.external_f32.remove(&node);
+        }
+    }
+
+    fn ensure_kv_input_device_by_name(&mut self, name: &str, n_bytes: usize) -> Option<u64> {
+        let node = self.input_node_for(name).ok()?;
+        // Never host-upload this input again; it lives on the GPU.
+        self.staged_f32.remove(&node);
+        self.external_f32.remove(&node);
+        self.inner.alloc_persistent_input_zeros(node, n_bytes)
+    }
+
+    unsafe fn copy_output_to_device_by_name(&self, name: &str, dest_ptr: u64, n_bytes: usize) {
+        if let Ok(node) = self.node_for(name) {
+            unsafe {
+                self.inner
+                    .copy_output_to_device_ptr(node, dest_ptr, n_bytes)
+            };
         }
     }
 }

@@ -14,7 +14,7 @@
 //! the CPU build (with a mock `DynRuntime`); on the GPU host the identical code
 //! drives the real CUDA segments.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use skein_compile::RuntimeSegment;
 
@@ -23,6 +23,34 @@ use crate::error::RuntimeError;
 use crate::kv::PagedKvCache;
 use crate::kv_cache::parse_kvcache_name;
 use crate::types::RequestId;
+
+/// Element dtype of a device-resident handoff (segment activations are bf16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffDtype {
+    Bf16,
+}
+
+/// A borrowed device-resident tensor: a producer segment's output buffer handed
+/// to the next consuming segment **by device pointer** (no host round-trip).
+///
+/// Ownership/lifetime: the pointer is owned by the producer segment's Luminal
+/// runtime arena. It is valid within one forward pass (until the producer
+/// re-executes), and it is re-fetched + re-bound every decode step — so it never
+/// dangles across steps. Same-rank only (one physical GPU per rank process).
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceTensorHandle {
+    /// Process-local device ordinal that owns the buffer (CUDA_VISIBLE_DEVICES
+    /// maps device 0 to this rank's physical GPU).
+    pub device: usize,
+    /// Raw CUDA device pointer (borrowed from the producer's arena).
+    pub ptr: u64,
+    /// Byte size of the buffer.
+    pub n_bytes: usize,
+    /// Element count (`n_bytes / 2` for bf16).
+    pub elems: usize,
+    /// Element dtype.
+    pub dtype: HandoffDtype,
+}
 
 /// Default runtime KV paging geometry for the serve path. `page_size` tokens
 /// per page; `total_pages` is the per-device page budget (16 * 256 = 4096 token
@@ -43,11 +71,25 @@ fn env_u32(name: &str, default: u32) -> u32 {
 /// Drives one device's compiled segments + the rank-local handoff store.
 pub struct SegmentRunner {
     segments: Vec<RuntimeSegment>,
-    /// f32 handoff tensors keyed by logical name (segment outputs + collective
-    /// results).
+    /// f32 handoff tensors keyed by logical name (collective results, KV-adjacent
+    /// and final tensors). Internal activation handoffs use `handoffs_device`.
     handoffs: HashMap<String, Vec<f32>>,
     /// Integer handoff tensors (e.g. `input_tokens`).
     handoffs_i32: HashMap<String, Vec<i32>>,
+    /// Device-resident segment->segment activation handoffs: a producer's output
+    /// buffer bound directly into the consumer's input by device pointer (no
+    /// host round-trip). Refreshed each forward by the producing segment.
+    handoffs_device: HashMap<String, DeviceTensorHandle>,
+    /// Base device pointer of each KV-cache input's persistent on-GPU buffer
+    /// (logical name -> ptr). The cache lives on the GPU across decode steps; the
+    /// new token's K/V is written into slot `position` via a DtoD copy, so the KV
+    /// cache is never assembled or re-uploaded from host.
+    kv_device_base: HashMap<String, u64>,
+    /// Tensor names that must stay host: the all-gather (logits) / broadcast
+    /// collectives, whose host `read`/`write` path is kept. RingAllReduce
+    /// tensors are NOT here — they stay device-resident and are all-reduced in
+    /// place on the device. (KV is handled separately and also stays host.)
+    host_tensors: HashSet<String>,
     /// Paged per-layer KV cache. Handoffs named `kvcache_{k|v}_{layer}` are fed
     /// from the active request's pages (cached prefix + freshly written tokens)
     /// and each step's output is written into the page covering `position` — so
@@ -97,10 +139,27 @@ impl SegmentRunner {
             segments,
             handoffs: HashMap::new(),
             handoffs_i32: HashMap::new(),
+            handoffs_device: HashMap::new(),
+            kv_device_base: HashMap::new(),
+            host_tensors: HashSet::new(),
             kv,
             position: 0,
             prefill_capture: false,
         }
+    }
+
+    /// Tell the runner which tensor names must stay host (all-gather/broadcast
+    /// collectives). Everything else — internal activations AND RingAllReduce
+    /// tensors — stays device-resident; RingAllReduce is all-reduced in place on
+    /// the device by the rank executor.
+    pub fn set_host_tensors(&mut self, names: HashSet<String>) {
+        self.host_tensors = names;
+    }
+
+    /// Device handle for a named output, if it was produced device-resident this
+    /// forward (the brief's `output_device(name)`).
+    pub fn output_device(&self, name: &str) -> Option<DeviceTensorHandle> {
+        self.handoffs_device.get(name).copied()
     }
 
     /// Enable/disable batched-prefill capture: when on, `kvcache_*` outputs are
@@ -119,7 +178,13 @@ impl SegmentRunner {
     /// Write one token's K or V into this runner's paged cache at `slot` for
     /// `layer`. Used to land batched-prefill K/V (computed by the prefill graph)
     /// into the decode runner's cache before decoding continues.
-    pub fn write_kv_slot(&mut self, kind: crate::kv_cache::KvKind, layer: usize, slot: usize, data: &[f32]) {
+    pub fn write_kv_slot(
+        &mut self,
+        kind: crate::kv_cache::KvKind,
+        layer: usize,
+        slot: usize,
+        data: &[f32],
+    ) {
         self.kv.write_slot(kind, layer, slot, data);
     }
 
@@ -271,17 +336,40 @@ impl LocalSegments for SegmentRunner {
                     .get(name)
                     .copied()
                     .unwrap_or(0);
-                let buf = self.kv.buffer(kind, layer, full);
-                self.segments[segment_idx]
+                // Device-resident KV: bind a persistent on-GPU buffer (full
+                // capacity, bf16) once and reuse it every step — NO assemble, NO
+                // H2D. The new token's K/V is written into it via DtoD below.
+                let base = self.segments[segment_idx]
                     .runtime
-                    .set_tensor_by_name(name, buf)
-                    .map_err(&err)?;
+                    .ensure_kv_input_device_by_name(name, full * 2);
+                if let Some(b) = base {
+                    self.kv_device_base.insert(name.clone(), b);
+                } else {
+                    // Host fallback (CPU backend / no device buffer): assemble the
+                    // contiguous buffer and upload it (the old path).
+                    let buf = self.kv.buffer(kind, layer, full);
+                    crate::perf_counters::record_h2d(buf.len() * std::mem::size_of::<f32>());
+                    self.segments[segment_idx]
+                        .runtime
+                        .set_tensor_by_name(name, buf)
+                        .map_err(&err)?;
+                }
+            } else if let Some(h) = self.handoffs_device.get(name).copied() {
+                // Device-resident activation handoff: bind the producer segment's
+                // output buffer directly by device pointer — NO host Vec, no H2D.
+                unsafe {
+                    self.segments[segment_idx]
+                        .runtime
+                        .bind_input_device_by_name(name, h.ptr, h.n_bytes)
+                };
             } else if let Some(data) = self.handoffs_i32.get(name).cloned() {
+                crate::perf_counters::record_h2d(data.len() * std::mem::size_of::<i32>());
                 self.segments[segment_idx]
                     .runtime
                     .set_tensor_i32_by_name(name, data)
                     .map_err(&err)?;
             } else if let Some(data) = self.handoffs.get(name).cloned() {
+                crate::perf_counters::record_h2d(data.len() * std::mem::size_of::<f32>());
                 self.segments[segment_idx]
                     .runtime
                     .set_tensor_by_name(name, data)
@@ -294,6 +382,7 @@ impl LocalSegments for SegmentRunner {
         let host_in_us = t_in.elapsed().as_micros();
 
         let t_gpu = std::time::Instant::now();
+        crate::perf_counters::record_segment_launch();
         self.segments[segment_idx]
             .runtime
             .execute_segment()
@@ -306,20 +395,75 @@ impl LocalSegments for SegmentRunner {
         // attends over it; everything else goes to the handoff store for
         // downstream segments / collectives.
         for name in &output_names {
-            let data = self.segments[segment_idx]
-                .runtime
-                .get_tensor_by_name(name)
-                .map_err(&err)?;
+            // KV outputs and collective tensors stay host (write_slot needs host
+            // bytes; the collective read/write path is host). Every other
+            // segment->segment activation output is kept DEVICE-RESIDENT: record
+            // only the producer's output device buffer (ptr+size) and bind it into
+            // the consumer next step — no get_tensor_by_name, no D2H.
             if let Some((kind, layer)) = parse_kvcache_name(name) {
+                // Device-resident KV write (steady-state decode): DtoD-copy the
+                // new token's K/V into slot `position` of the resident buffer.
+                // No get_tensor (D2H), no host write_slot.
+                if !self.prefill_capture {
+                    if let Some(&base) = self.kv_device_base.get(name) {
+                        if let Some((_, out_bytes)) = self.segments[segment_idx]
+                            .runtime
+                            .output_device_ptr_by_name(name)
+                        {
+                            let dest = base + (self.position * out_bytes) as u64;
+                            unsafe {
+                                self.segments[segment_idx]
+                                    .runtime
+                                    .copy_output_to_device_by_name(name, dest, out_bytes)
+                            };
+                            self.handoffs_device.remove(name);
+                            continue;
+                        }
+                    }
+                }
+                // Host path: batched-prefill capture, or CPU fallback.
+                let data = self.segments[segment_idx]
+                    .runtime
+                    .get_tensor_by_name(name)
+                    .map_err(&err)?;
+                crate::perf_counters::record_d2h(data.len() * std::mem::size_of::<f32>());
                 if self.prefill_capture {
-                    // Batched prefill: keep the whole [seq, kv_dim] tensor so the
-                    // caller writes the N tokens into the decode runner's cache.
                     let _ = (kind, layer);
                     self.handoffs.insert(name.clone(), data);
                 } else {
                     self.kv.write_slot(kind, layer, self.position, &data);
                 }
+                self.handoffs_device.remove(name);
+            } else if self.host_tensors.contains(name) {
+                let data = self.segments[segment_idx]
+                    .runtime
+                    .get_tensor_by_name(name)
+                    .map_err(&err)?;
+                crate::perf_counters::record_d2h(data.len() * std::mem::size_of::<f32>());
+                self.handoffs.insert(name.clone(), data);
+                self.handoffs_device.remove(name);
+            } else if let Some((ptr, n_bytes)) = self.segments[segment_idx]
+                .runtime
+                .output_device_ptr_by_name(name)
+            {
+                self.handoffs_device.insert(
+                    name.clone(),
+                    DeviceTensorHandle {
+                        device: 0,
+                        ptr,
+                        n_bytes,
+                        elems: n_bytes / 2,
+                        dtype: HandoffDtype::Bf16,
+                    },
+                );
+                self.handoffs.remove(name);
             } else {
+                // Fallback (CPU backend / no device buffer yet): host handoff.
+                let data = self.segments[segment_idx]
+                    .runtime
+                    .get_tensor_by_name(name)
+                    .map_err(&err)?;
+                crate::perf_counters::record_d2h(data.len() * std::mem::size_of::<f32>());
                 self.handoffs.insert(name.clone(), data);
             }
         }
@@ -344,6 +488,10 @@ impl LocalSegments for SegmentRunner {
     fn write(&mut self, name: &str, data: Vec<f32>) -> Result<(), RankExecError> {
         self.handoffs.insert(name.to_string(), data);
         Ok(())
+    }
+
+    fn output_device_ptr(&self, name: &str) -> Option<(u64, usize)> {
+        self.handoffs_device.get(name).map(|h| (h.ptr, h.elems))
     }
 }
 
@@ -373,7 +521,11 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| DynRuntimeError::UnknownTensor(name.to_string()))
         }
-        fn set_tensor_by_name(&mut self, name: &str, data: Vec<f32>) -> Result<(), DynRuntimeError> {
+        fn set_tensor_by_name(
+            &mut self,
+            name: &str,
+            data: Vec<f32>,
+        ) -> Result<(), DynRuntimeError> {
             self.tensors.insert(name.to_string(), data);
             Ok(())
         }
@@ -382,8 +534,10 @@ mod tests {
             name: &str,
             data: Vec<i32>,
         ) -> Result<(), DynRuntimeError> {
-            self.tensors
-                .insert(name.to_string(), data.into_iter().map(|v| v as f32).collect());
+            self.tensors.insert(
+                name.to_string(),
+                data.into_iter().map(|v| v as f32).collect(),
+            );
             Ok(())
         }
     }

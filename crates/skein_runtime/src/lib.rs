@@ -32,6 +32,7 @@ pub mod kv;
 pub mod kv_cache;
 pub mod kv_transport;
 pub mod observability;
+pub mod perf_counters;
 pub mod server;
 pub mod speculative;
 pub mod token_stream;
@@ -41,11 +42,11 @@ pub mod types;
 pub use batcher::{AdmissionDecision, ContinuousBatcher, RejectReason, StepBatch};
 pub use collectives::{CollectiveBackend, CollectiveError, InProcessCollective};
 pub use dispatch::{DispatchError, DispatchOutcome, EagerDispatcher, KernelDispatcher};
-pub use drift_monitor::{DriftAssessment, DriftMonitor, WorkloadProfile};
 pub use distributed::{
     BarrierCollective, CollectiveError as RankCollectiveError, LocalSegments, RankCollective,
     RankExecutor, SegmentRunner, WorldLayout,
 };
+pub use drift_monitor::{DriftAssessment, DriftMonitor, WorkloadProfile};
 pub use error::RuntimeError;
 pub use hotswap::HotSwap;
 pub use kv::{PagedKVAllocator, RadixPrefixTree};

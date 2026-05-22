@@ -51,6 +51,10 @@ pub struct NcclCollective {
     stream: Arc<CudaStream>,
     rank: usize,
     world_size: usize,
+    /// Reused device recv buffer for the in-place bf16 device all-reduce, so the
+    /// steady-state path does no per-call `alloc_zeros`. Interior-mutable because
+    /// the collective is borrowed `&self` per step (single rank thread).
+    recv_cache: std::cell::RefCell<Option<cudarc::driver::CudaSlice<half::bf16>>>,
 }
 
 impl NcclCollective {
@@ -79,6 +83,7 @@ impl NcclCollective {
             stream,
             rank,
             world_size,
+            recv_cache: std::cell::RefCell::new(None),
         })
     }
 }
@@ -134,6 +139,48 @@ impl RankCollective for NcclCollective {
         self.stream.synchronize().map_err(cuda_err)?;
         let host = self.stream.memcpy_dtov(&recv).map_err(cuda_err)?;
         buf.copy_from_slice(&host);
+        Ok(())
+    }
+
+    unsafe fn all_reduce_sum_device_bf16(
+        &self,
+        ptr: u64,
+        elems: usize,
+    ) -> Result<(), CollectiveError> {
+        use std::mem::ManuallyDrop;
+        if ptr == 0 || elems == 0 {
+            return Ok(());
+        }
+        // View the producer segment's output buffer as bf16 WITHOUT taking
+        // ownership (ManuallyDrop ⇒ no cuMemFree on drop; the Luminal arena owns
+        // it). NCCL all-reduces device→device; the result is copied back into the
+        // same buffer so the consumer that binds this pointer reads the reduced
+        // activation. No host staging anywhere on this path.
+        let mut send =
+            ManuallyDrop::new(unsafe { self.stream.upgrade_device_ptr::<half::bf16>(ptr, elems) });
+        // Reuse a cached recv buffer (cudarc all_reduce uses recv.len() as the
+        // element count, so it must match `elems` exactly). All RingAllReduce
+        // activations in decode share the same hidden width, so this reallocs
+        // ~once and then reuses every step.
+        let mut cache = self.recv_cache.borrow_mut();
+        if cache.as_ref().map(|b| b.len()) != Some(elems) {
+            *cache = Some(
+                self.stream
+                    .alloc_zeros::<half::bf16>(elems)
+                    .map_err(cuda_err)?,
+            );
+        }
+        let recv = cache.as_mut().unwrap();
+        self.comm
+            .all_reduce(&*send, recv, &ReduceOp::Sum)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclAllReduce(bf16): {e:?}")))?;
+        // In-place result: copy the reduced buffer back over the producer buffer
+        // (device→device). All of all-reduce, this copy, and the consumer segment
+        // run on the legacy default stream, so they are ordered without a
+        // per-call host synchronize; the forward flushes at the logits all-gather.
+        self.stream
+            .memcpy_dtod(recv, &mut *send)
+            .map_err(cuda_err)?;
         Ok(())
     }
 }

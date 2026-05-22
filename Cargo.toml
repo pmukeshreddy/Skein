@@ -81,7 +81,12 @@ cudarc = { version = "=0.16.6", default-features = false, features = [
     # used by `skein_runtime::cuda::nccl::NcclCollective`. Same toolchain
     # requirement as the rest of cudarc.
     "nccl",
+    # `f16` enables `NcclType for half::bf16` so the collective can all-reduce
+    # bf16 activation buffers ON DEVICE (no host f32 round-trip).
+    "f16",
 ] }
+# bf16 element type for device-resident NCCL collectives.
+half        = "2"
 
 [profile.release]
 opt-level     = 3

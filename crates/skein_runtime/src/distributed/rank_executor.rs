@@ -41,6 +41,14 @@ pub trait LocalSegments {
 
     /// Store a collective's result back under `name` for downstream segments.
     fn write(&mut self, name: &str, data: Vec<f32>) -> Result<(), RankExecError>;
+
+    /// Device buffer `(raw_ptr, bf16_elems)` of a named handoff that is held
+    /// device-resident, if any. Returns `Some` for tensors kept on-device (so a
+    /// collective can all-reduce them in place without host staging), `None`
+    /// otherwise (host path). Default: `None`.
+    fn output_device_ptr(&self, _name: &str) -> Option<(u64, usize)> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,9 +135,29 @@ impl<S: LocalSegments> RankExecutor<S> {
                 } => {
                     if participants.iter().any(|p| *p as usize == self.rank) {
                         let t = std::time::Instant::now();
-                        let mut buf = self.runner.read(tensor)?;
-                        apply_collective(collective, *kind, participants, &mut buf)?;
-                        self.runner.write(tensor, buf)?;
+                        // Device-resident steady-state path: a RingAllReduce of a
+                        // bf16 activation kept on-device is all-reduced IN PLACE by
+                        // device pointer — no host Vec, no D2H/H2D. The producer's
+                        // buffer holds the reduced result; the consumer binds it.
+                        let device = match kind {
+                            CollectiveKind::RingAllReduce => self.runner.output_device_ptr(tensor),
+                            _ => None,
+                        };
+                        if let Some((ptr, elems)) = device {
+                            unsafe { collective.all_reduce_sum_device_bf16(ptr, elems) }?;
+                        } else {
+                            // Host fallback: all_gather (logits), broadcast, or a
+                            // tensor not held device-resident.
+                            let mut buf = self.runner.read(tensor)?;
+                            crate::perf_counters::record_d2h(
+                                buf.len() * std::mem::size_of::<f32>(),
+                            );
+                            apply_collective(collective, *kind, participants, &mut buf)?;
+                            crate::perf_counters::record_h2d(
+                                buf.len() * std::mem::size_of::<f32>(),
+                            );
+                            self.runner.write(tensor, buf)?;
+                        }
                         comm_us += t.elapsed().as_micros();
                     }
                 }

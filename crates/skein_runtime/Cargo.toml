@@ -12,7 +12,7 @@ default = []
 # CUDA-gated paths: NCCL between graph runs, CUDA Graphs capture/dispatch,
 # RDMA for prefill/decode KV transfer. Pulls in `cudarc` (with its `nccl`
 # bindings); requires an NVIDIA toolchain, so it is off in the CPU/CI build.
-cuda = ["dep:cudarc", "skein_compile/cuda"]
+cuda = ["dep:cudarc", "dep:half", "skein_compile/cuda"]
 
 [lib]
 path = "src/lib.rs"
@@ -37,6 +37,8 @@ tokenizers = { workspace = true }
 # (`src/cuda/nccl.rs`). Optional + cuda-gated; the same pinned cudarc the
 # Luminal CUDA backend uses, so the stream/buffer types interoperate.
 cudarc     = { workspace = true, optional = true }
+# bf16 element type for device-resident NCCL all-reduce (cuda-gated).
+half       = { workspace = true, optional = true }
 
 [dev-dependencies]
 safetensors = { workspace = true }

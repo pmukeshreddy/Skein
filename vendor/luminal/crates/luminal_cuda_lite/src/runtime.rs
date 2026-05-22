@@ -498,6 +498,20 @@ impl CudaRuntime {
         }
     }
 
+    /// Device buffer `(raw_ptr, byte_len)` backing an output tensor, with **no
+    /// host copy**. `None` if the id is not a known output of the active bucket.
+    /// Used to hand one segment's output to the next segment by device pointer
+    /// (paired with [`set_device_ptr`](Self::set_device_ptr) on the consumer),
+    /// eliminating the GPU->host->GPU activation round-trip.
+    pub fn output_device_buffer(&self, id: impl ToId) -> Option<(u64, usize)> {
+        let id = id.to_id();
+        if !self.active().output_producers.contains_key(&id) {
+            return None;
+        }
+        let buf = self.resolve_output_buffer(id);
+        Some((buf.ptr(), buf.len()))
+    }
+
     /// Resolve the device-side buffer for an output tensor without copying to host.
     /// Used by copy_output_to_device_ptr for DtoD transfers.
     fn resolve_output_buffer(&self, id: impl ToId) -> DeviceBuffer {

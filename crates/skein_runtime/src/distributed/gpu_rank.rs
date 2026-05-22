@@ -19,6 +19,7 @@
 //! `#[cfg(feature = "cuda")]`-gated: it needs `CudaComputeRuntime` + NCCL, so
 //! it is built and validated on the GPU host.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ use skein_compile::{
     CudaComputeRuntime, DEFAULT_SEARCH_BUDGET, SkeinArtifact, cuda_graph_exec_stats,
     load_device_prefill_segments, load_device_runtime_segments,
 };
+use skein_cost::collectives::CollectiveKind;
 use skein_emit::segment::SequenceStep;
 
 use crate::kv_cache::KvKind;
@@ -92,6 +94,22 @@ impl RankServer {
 
         let mut executor = RankExecutor::new(layout.rank, SegmentRunner::new(segments));
 
+        // Only all-gather / broadcast collective tensors stay host (size-changing
+        // / final; their read/write host path is kept). RingAllReduce tensors and
+        // every internal activation handoff stay device-resident — RingAllReduce
+        // is all-reduced in place on the device by the rank executor.
+        let host_tensors: HashSet<String> = artifact
+            .sequencing
+            .iter()
+            .filter_map(|s| match s {
+                SequenceStep::Collective {
+                    collective, tensor, ..
+                } if !matches!(collective, CollectiveKind::RingAllReduce) => Some(tensor.clone()),
+                _ => None,
+            })
+            .collect();
+        executor.runner_mut().set_host_tensors(host_tensors.clone());
+
         // Batched prefill (gated): build a seq=N prefill graph that SHARES the
         // decode graph's resident weights by device pointer (no 2nd 47GB copy).
         // The decode + prefill graphs have the same segmentation, so they reuse
@@ -114,6 +132,7 @@ impl RankServer {
             )
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
             let mut pe = RankExecutor::new(layout.rank, SegmentRunner::new(prefill_segs));
+            pe.runner_mut().set_host_tensors(host_tensors.clone());
             pe.runner_mut().clear_intermediates(); // free prefill search arenas
             Some(pe)
         } else {
@@ -328,6 +347,9 @@ impl RankServer {
         // per step (paged KV). Time each decode step (TPOT).
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut step_times: Vec<Duration> = Vec::new();
+        // Snapshot host<->device traffic counters across the decode loop so we
+        // can report H2D/D2H bytes + host materializations PER GENERATED TOKEN.
+        let perf_before = crate::perf_counters::snapshot();
         for i in 0..max_new_tokens {
             let next = argmax(&logits);
             generated.push(next);
@@ -340,6 +362,11 @@ impl RankServer {
                 position += 1;
             }
         }
+
+        // Per-token host<->device traffic over the decode loop (the round-trips
+        // the device-resident handoff work will remove).
+        let perf_pt =
+            crate::perf_counters::snapshot().per_token(perf_before, step_times.len() as u64);
 
         let pages_in_use = self.executor.runner().kv_pages_in_use();
         // Release the request: its pages return to the cache so the next request
@@ -397,6 +424,10 @@ impl RankServer {
                 decode_tokens_per_s = result.decode_tokens_per_s,
                 cuda_graph_instantiations = result.graph_instantiates,
                 cuda_graph_replays = result.graph_launches,
+                h2d_bytes_per_token = perf_pt.h2d_bytes,
+                d2h_bytes_per_token = perf_pt.d2h_bytes,
+                host_materializations_per_token = perf_pt.host_materializations,
+                segment_launches_per_token = perf_pt.segment_launches,
                 "SKEIN_PERF: paged-KV cached-decode timing (single in-flight request, greedy)"
             );
         }

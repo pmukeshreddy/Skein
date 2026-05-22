@@ -113,6 +113,37 @@ pub trait ComputeRuntime: Sized {
         None
     }
 
+    /// Device buffer `(raw_ptr, byte_len)` backing a computed **output** tensor,
+    /// without a host copy — so one segment's output can be handed to the next
+    /// segment by device pointer (via [`set_input_device_ptr`]) instead of the
+    /// GPU->host->GPU round-trip. CUDA only; `None` on backends without device
+    /// pointers or if the tensor has no resident output buffer yet.
+    fn output_device_buffer(&self, id: NodeIndex) -> Option<(u64, usize)> {
+        let _ = id;
+        None
+    }
+
+    /// Allocate (once) a persistent, zero-initialized **device** buffer of
+    /// `n_bytes` for input `id` and return its device pointer; if `id` already
+    /// has a resident buffer, return that (idempotent). Used to hold a KV-cache
+    /// input on the GPU across decode steps so it is never re-uploaded from host.
+    /// CUDA only; `None` default.
+    fn alloc_persistent_input_zeros(&mut self, id: NodeIndex, n_bytes: usize) -> Option<u64> {
+        let _ = (id, n_bytes);
+        None
+    }
+
+    /// Copy output tensor `id`'s data to an external device pointer (device→
+    /// device, no host). Used to write a decode step's new K/V into its slot in
+    /// the resident KV buffer. CUDA only; no-op default.
+    ///
+    /// # Safety
+    /// `dest_ptr` must be a valid device allocation of at least `n_bytes` on this
+    /// runtime's device.
+    unsafe fn copy_output_to_device_ptr(&self, id: NodeIndex, dest_ptr: u64, n_bytes: usize) {
+        let _ = (id, dest_ptr, n_bytes);
+    }
+
     /// Free this runtime's intermediate-buffer arena (re-allocated lazily on the
     /// next execute). Persistent inputs/weights are untouched. Called after
     /// load/search and between the prefill and decode graphs so two graphs'
@@ -126,6 +157,19 @@ pub trait ComputeRuntime: Sized {
     /// `ptr` must be a valid device allocation of at least `n_bytes` on this
     /// runtime's device, kept alive for the runtime's lifetime.
     unsafe fn set_input_device_ptr(&mut self, id: NodeIndex, ptr: u64, n_bytes: usize) {
+        let _ = (id, ptr, n_bytes);
+    }
+
+    /// Point an input at an external device buffer **without** marking it
+    /// persistent — for a transient segment-to-segment activation handoff that is
+    /// re-bound every decode step (the producer overwrites its output buffer each
+    /// step). Unlike [`set_input_device_ptr`] (weights, bound once, persistent).
+    /// CUDA only; no-op default.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of at least `n_bytes` on this
+    /// runtime's device, kept alive until this segment finishes executing.
+    unsafe fn bind_input_device_ptr(&mut self, id: NodeIndex, ptr: u64, n_bytes: usize) {
         let _ = (id, ptr, n_bytes);
     }
 
@@ -331,13 +375,11 @@ mod cuda_impl {
             // bf16 (matching get_f32's bf16->f32 widening on the read side).
             match dtype {
                 DType::Bf16 => {
-                    let bf: Vec<half::bf16> =
-                        data.into_iter().map(half::bf16::from_f32).collect();
+                    let bf: Vec<half::bf16> = data.into_iter().map(half::bf16::from_f32).collect();
                     self.inner.set_data(id, bf);
                 }
                 DType::F16 => {
-                    let h: Vec<half::f16> =
-                        data.into_iter().map(half::f16::from_f32).collect();
+                    let h: Vec<half::f16> = data.into_iter().map(half::f16::from_f32).collect();
                     self.inner.set_data(id, h);
                 }
                 _ => self.inner.set_data(id, data),
@@ -375,6 +417,32 @@ mod cuda_impl {
             // (decode) graph, and mark it persistent so it is never consumed.
             unsafe { self.inner.set_device_ptr(id, ptr, n_bytes) };
             self.inner.mark_hlir_persistent(id);
+        }
+
+        unsafe fn bind_input_device_ptr(&mut self, id: NodeIndex, ptr: u64, n_bytes: usize) {
+            // Transient activation handoff: bind to the producer segment's output
+            // buffer, NOT persistent — re-bound every decode step. `set_device_ptr`
+            // marks the node `changed_hlir`, so the new pointer takes effect.
+            unsafe { self.inner.set_device_ptr(id, ptr, n_bytes) };
+        }
+
+        fn output_device_buffer(&self, id: NodeIndex) -> Option<(u64, usize)> {
+            self.inner.output_device_buffer(id)
+        }
+
+        fn alloc_persistent_input_zeros(&mut self, id: NodeIndex, n_bytes: usize) -> Option<u64> {
+            // Idempotent: only allocate on first sight; later steps reuse the
+            // resident buffer (so the KV cache lives on the GPU, not re-uploaded).
+            if let Some(p) = self.inner.hlir_device_ptr(id) {
+                return Some(p);
+            }
+            self.inner.set_zeros(id, n_bytes);
+            self.inner.mark_hlir_persistent(id);
+            self.inner.hlir_device_ptr(id)
+        }
+
+        unsafe fn copy_output_to_device_ptr(&self, id: NodeIndex, dest_ptr: u64, n_bytes: usize) {
+            unsafe { self.inner.copy_output_to_device_ptr(id, dest_ptr, n_bytes) };
         }
 
         fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>) {

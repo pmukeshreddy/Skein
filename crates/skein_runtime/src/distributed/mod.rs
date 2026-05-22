@@ -154,4 +154,23 @@ pub trait RankCollective {
 
     /// Broadcast `root`'s buffer to every rank in place.
     fn broadcast(&self, buf: &mut [f32], root: usize) -> Result<(), CollectiveError>;
+
+    /// In-place sum all-reduce directly on a **device** bf16 buffer — no host
+    /// round-trip. `ptr` is a raw CUDA device pointer holding `elems` bf16
+    /// elements on this rank's GPU; on return it holds the elementwise sum across
+    /// ranks. Default: unsupported (host-only backends like the CPU barrier);
+    /// the NCCL backend overrides it.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `elems` bf16 elements on this
+    /// rank's device, alive for the duration of the call.
+    unsafe fn all_reduce_sum_device_bf16(
+        &self,
+        _ptr: u64,
+        _elems: usize,
+    ) -> Result<(), CollectiveError> {
+        Err(CollectiveError::Nccl(
+            "device bf16 all_reduce not supported on this backend".to_string(),
+        ))
+    }
 }
