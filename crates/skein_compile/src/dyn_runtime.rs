@@ -308,11 +308,22 @@ pub struct DynRuntimeWrapper<R: ComputeRuntime> {
     graph: Graph,
     name_to_node: HashMap<String, NodeIndex>,
     input_name_to_node: HashMap<String, NodeIndex>,
-    /// `HandoffId -> NodeIndex` for this segment's handoff tensors, built once by
-    /// [`DynRuntime::register_handoff_ids`]. Indexed by `HandoffId.idx()`; `None`
-    /// for ids belonging to other segments. Lets the decode hot path resolve a
-    /// handoff to its graph node with a `Vec` index, no `name_to_node` hashing.
-    id_to_node: Vec<Option<NodeIndex>>,
+    /// `HandoffId -> NodeIndex` tables for this segment's handoff tensors, built
+    /// once by [`DynRuntime::register_handoff_ids`]. Indexed by `HandoffId.idx()`;
+    /// `None` for ids belonging to other segments. Lets the decode hot path
+    /// resolve a handoff to its graph node with a `Vec` index, no `name_to_node`
+    /// hashing.
+    ///
+    /// Two tables, mirroring the by-name resolvers `node_for` and
+    /// `input_node_for`: a handoff name can be *both* an input and an output of
+    /// the same segment (e.g. `kvcache_{k,v}_{L}`: past KV read in, new KV written
+    /// out). Reads / `output_device_ptr` / `copy_output` need the **output**
+    /// (producing) node (`name_to_node`); writes / binds need the **input** node
+    /// (`input_name_to_node`). A single input-overriding table sent output reads
+    /// to the input node, panicking `find_producer_node` ("Cannot find output
+    /// tensor!") on the device-resident KV write path.
+    id_to_output_node: Vec<Option<NodeIndex>>,
+    id_to_input_node: Vec<Option<NodeIndex>>,
     input_nodes: HashSet<NodeIndex>,
     staged_f32: HashMap<NodeIndex, Vec<f32>>,
     staged_i32: HashMap<NodeIndex, Vec<i32>>,
@@ -345,7 +356,8 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
             graph,
             name_to_node,
             input_name_to_node,
-            id_to_node: Vec::new(),
+            id_to_output_node: Vec::new(),
+            id_to_input_node: Vec::new(),
             input_nodes,
             staged_f32: HashMap::new(),
             staged_i32: HashMap::new(),
@@ -382,12 +394,22 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
             .ok_or_else(|| DynRuntimeError::UnknownTensor(name.to_string()))
     }
 
-    /// Resolve a [`HandoffId`] to this segment's graph node via the table
-    /// [`DynRuntime::register_handoff_ids`] built. `None` if the id is not one of
-    /// this segment's handoffs (registration left the slot empty / out of range).
+    /// Resolve a [`HandoffId`] to this segment's **output** (producing) node —
+    /// the by-id analogue of `node_for` (`name_to_node`). Used by reads /
+    /// `output_device_ptr` / `copy_output` / weight pointer lookups. `None` if the
+    /// id is not an output handoff of this segment.
     #[inline]
-    fn node_for_id(&self, id: HandoffId) -> Option<NodeIndex> {
-        self.id_to_node.get(id.idx()).copied().flatten()
+    fn node_for_output_id(&self, id: HandoffId) -> Option<NodeIndex> {
+        self.id_to_output_node.get(id.idx()).copied().flatten()
+    }
+
+    /// Resolve a [`HandoffId`] to this segment's **input** node — the by-id
+    /// analogue of `input_node_for` (`input_name_to_node`, falling back to
+    /// `name_to_node`). Used by `set`/`bind`/`ensure_kv` write paths. `None` if the
+    /// id is not a handoff of this segment.
+    #[inline]
+    fn node_for_input_id(&self, id: HandoffId) -> Option<NodeIndex> {
+        self.id_to_input_node.get(id.idx()).copied().flatten()
     }
 }
 
@@ -565,26 +587,42 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
                 any = true;
             }
         }
-        self.id_to_node = if any { vec![None; max_idx + 1] } else { Vec::new() };
-        // Outputs (producing nodes) first, then inputs override: an Input op is
-        // what `set_tensor`/`bind` must target, matching `input_node_for`'s
-        // preference, while `get`/`output_device_ptr` read output handoffs whose
-        // only entry is in `name_to_node`.
+        if !any {
+            self.id_to_output_node = Vec::new();
+            self.id_to_input_node = Vec::new();
+            return;
+        }
+        let mut out = vec![None; max_idx + 1];
+        let mut inp = vec![None; max_idx + 1];
+        // Output table mirrors `node_for`: `name_to_node` only (the producing
+        // node). Used by reads / `output_device_ptr` / `copy_output` / weights.
         for (name, &node) in &self.name_to_node {
             if let Some(id) = id_for_name(name) {
-                self.id_to_node[id.idx()] = Some(node);
+                out[id.idx()] = Some(node);
+            }
+        }
+        // Input table mirrors `input_node_for`: `input_name_to_node` preferred,
+        // `name_to_node` as fallback (so an Input op is what `set`/`bind` target).
+        // A name that is both an input and an output (e.g. `kvcache_*`) resolves
+        // here to the input node and in `out` to the output node — the two reads
+        // no longer collide.
+        for (name, &node) in &self.name_to_node {
+            if let Some(id) = id_for_name(name) {
+                inp[id.idx()] = Some(node);
             }
         }
         for (name, &node) in &self.input_name_to_node {
             if let Some(id) = id_for_name(name) {
-                self.id_to_node[id.idx()] = Some(node);
+                inp[id.idx()] = Some(node);
             }
         }
+        self.id_to_output_node = out;
+        self.id_to_input_node = inp;
     }
 
     fn set_tensor_by_id(&mut self, id: HandoffId, data: Vec<f32>) -> Result<(), DynRuntimeError> {
         let node = self
-            .node_for_id(id)
+            .node_for_input_id(id)
             .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
         if self.input_nodes.contains(&node) {
             self.staged_f32.insert(node, data);
@@ -600,7 +638,7 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
         data: Vec<i32>,
     ) -> Result<(), DynRuntimeError> {
         let node = self
-            .node_for_id(id)
+            .node_for_input_id(id)
             .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
         if self.input_nodes.contains(&node) {
             self.staged_i32.insert(node, data);
@@ -613,7 +651,7 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
 
     fn get_tensor_by_id(&self, id: HandoffId) -> Result<Vec<f32>, DynRuntimeError> {
         let node = self
-            .node_for_id(id)
+            .node_for_output_id(id)
             .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
         if let Some(data) = self.external_f32.get(&node) {
             return Ok(data.clone());
@@ -622,24 +660,24 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     }
 
     fn output_device_ptr_by_id(&self, id: HandoffId) -> Option<(u64, usize)> {
-        let node = self.node_for_id(id)?;
+        let node = self.node_for_output_id(id)?;
         self.inner.output_device_buffer(node)
     }
 
     fn weight_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
-        let node = self.node_for_id(id)?;
+        let node = self.node_for_output_id(id)?;
         self.inner.input_device_ptr(node)
     }
 
     fn ensure_kv_input_device_by_id(&mut self, id: HandoffId, n_bytes: usize) -> Option<u64> {
-        let node = self.node_for_id(id)?;
+        let node = self.node_for_input_id(id)?;
         self.staged_f32.remove(&node);
         self.external_f32.remove(&node);
         self.inner.alloc_persistent_input_zeros(node, n_bytes)
     }
 
     unsafe fn bind_input_device_by_id(&mut self, id: HandoffId, ptr: u64, n_bytes: usize) {
-        if let Some(node) = self.node_for_id(id) {
+        if let Some(node) = self.node_for_input_id(id) {
             unsafe { self.inner.bind_input_device_ptr(node, ptr, n_bytes) };
             self.staged_f32.remove(&node);
             self.external_f32.remove(&node);
@@ -647,7 +685,7 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     }
 
     unsafe fn set_input_device_persistent_by_id(&mut self, id: HandoffId, ptr: u64, n_bytes: usize) {
-        if let Some(node) = self.node_for_id(id) {
+        if let Some(node) = self.node_for_input_id(id) {
             // Persistent (marks the node so its buffer is never consumed): the
             // gate buffer is bound once and lives for the runtime's lifetime.
             unsafe { self.inner.set_input_device_ptr(node, ptr, n_bytes) };
@@ -657,7 +695,7 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     }
 
     unsafe fn copy_output_to_device_by_id(&self, id: HandoffId, dest_ptr: u64, n_bytes: usize) {
-        if let Some(node) = self.node_for_id(id) {
+        if let Some(node) = self.node_for_output_id(id) {
             unsafe {
                 self.inner
                     .copy_output_to_device_ptr(node, dest_ptr, n_bytes)
