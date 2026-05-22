@@ -177,12 +177,17 @@ pub struct CudaRuntime {
 }
 
 impl CudaRuntime {
-    /// Creates a new CudaRuntime with default configuration:
-    /// - Device 0
-    /// - Blocking sync scheduling
-    /// - Default stream
+    /// Creates a new CudaRuntime on device 0 (blocking-sync, default stream).
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
-        let ctx = cudarc::driver::CudaContext::new(0)?;
+        Self::new_on(0)
+    }
+
+    /// Creates a CudaRuntime bound to a specific CUDA device ordinal. Used to
+    /// place tensor-parallel shards on distinct GPUs within one process (each
+    /// runtime owns its device's context; per-op `bind_to_thread` keeps the
+    /// correct context current when several runtimes share a thread).
+    pub fn new_on(device: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let ctx = cudarc::driver::CudaContext::new(device)?;
         ctx.bind_to_thread()?;
         ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
         let stream = ctx.default_stream();

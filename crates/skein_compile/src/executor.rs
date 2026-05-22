@@ -439,6 +439,14 @@ pub fn load_runtime_segments<R: crate::ComputeRuntime + 'static>(
     let timing = std::env::var_os("SKEIN_TIMING").is_some();
     let mut all_devices = Vec::with_capacity(artifact.devices.len());
     for device in &artifact.devices {
+        // Opt-in single-process multi-GPU: place tp shard `d` on physical GPU
+        // `d` so the full model isn't pinned to one card (frees per-GPU memory
+        // for concurrent batching). The in-process collective is host-mediated,
+        // so cross-GPU reduction/gather works without peer access. Default
+        // (unset) keeps every shard on device 0 — the layout verify relies on.
+        if std::env::var_os("SKEIN_SPREAD_DEVICES").is_some() {
+            crate::set_build_device(device.device_idx);
+        }
         let t_emit = std::time::Instant::now();
         let lowered = device.rebuild_graphs()?;
         let emit_ms = t_emit.elapsed().as_secs_f64() * 1e3;

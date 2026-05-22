@@ -137,3 +137,31 @@ Two layers existed; one was genuine, one was a stub:
   scratch-zeroing graph, replayed *that*, ran the real forward eagerly anyway,
   and reported phantom `graph_captures/replays`. Deleted; `batch_driver` now
   reports the real Luminal instantiate/launch deltas instead.
+
+## Continuous batching + single-process multi-GPU (verified)
+
+Two findings, both real:
+
+- **Planner never selects `max_batch>1`.** `extract` minimizes per-step
+  `total_cost`, and a larger batch only *raises* it (more comm/memory), so
+  `max_batch=1` always wins — the chosen plan is byte-identical for a 5-request
+  and a 24-request burst trace. So produced artifacts never enable co-batching.
+
+- **The batching driver works, once given headroom.** The single-process
+  `--batch-demo` path loaded both tp shards on GPU 0 (~93 GB) and OOM'd the
+  moment ≥2 requests were in flight (1 in flight was fine). Root cause: luminal
+  hardcoded `CudaContext::new(0)`. Fix: `CudaRuntime::new_on(device)` +
+  `SKEIN_SPREAD_DEVICES=1` so `load_runtime_segments` places shard d on GPU d
+  (~47 GB each, the host-mediated in-process collective handles cross-GPU). With
+  that, real co-batching:
+
+  | Metric | before (both shards on GPU0) | after (shard-per-GPU) |
+  |---|---|---|
+  | max_concurrent_inflight | 1 | **4** |
+  | mixed_batch_steps | 0 | **18** |
+  | result | OOM at ≥2 reqs | 4 reqs co-batched, real tokens |
+
+  Caveat: this single-process spread path is **functional but slow**
+  (host-mediated collective, ~414 s for the demo batch). The fast path for real
+  throughput is continuous batching in the multi-process NCCL `--gpus` loop,
+  which is the remaining work — that loop is currently single-request lockstep.

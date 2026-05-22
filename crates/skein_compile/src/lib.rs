@@ -244,6 +244,31 @@ pub fn cuda_graph_exec_stats() -> (u64, u64) {
     luminal_cuda_lite::kernel::graph_exec_stats()
 }
 
+/// The CUDA device ordinal the next `CudaComputeRuntime` built on this thread
+/// binds to. `load_runtime_segments` sets this per device so a single process
+/// can place tensor-parallel shards on distinct GPUs (d0->GPU0, d1->GPU1),
+/// freeing per-GPU memory for concurrent batching. Defaults to 0 (single-GPU /
+/// multi-process ranks, where `CUDA_VISIBLE_DEVICES` already maps device 0).
+#[cfg(feature = "cuda")]
+thread_local! {
+    static BUILD_DEVICE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the device ordinal for the next CUDA runtime built on this thread.
+#[cfg(feature = "cuda")]
+pub fn set_build_device(device: usize) {
+    BUILD_DEVICE.with(|c| c.set(device));
+}
+
+#[cfg(feature = "cuda")]
+fn build_device() -> usize {
+    BUILD_DEVICE.with(|c| c.get())
+}
+
+/// No-op on the CPU build (kept so generic callers compile without `cuda`).
+#[cfg(not(feature = "cuda"))]
+pub fn set_build_device(_device: usize) {}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;
@@ -278,8 +303,10 @@ mod cuda_impl {
                 cache_dir,
                 "cuda",
                 || {
-                    CudaRuntime::new().map_err(|source| CompileError::CudaRuntimeInit {
-                        source: Box::new(source),
+                    CudaRuntime::new_on(build_device()).map_err(|source| {
+                        CompileError::CudaRuntimeInit {
+                            source: Box::new(source),
+                        }
                     })
                 },
                 // Stage zero buffers for every Input so the search's graph

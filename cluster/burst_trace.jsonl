@@ -1,0 +1,25 @@
+{"slo": {"ttft_p95_ms": 500, "tpot_p95_ms": 50, "max_accuracy_drift": 0.01, "recompile_drift_threshold_kl": 0.05}}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
+{"prompt_tokens": 128, "output_tokens": 128, "arrival_ms": 0}
