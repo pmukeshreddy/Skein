@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use half::{bf16, f16};
 use luminal::{
@@ -1104,16 +1104,38 @@ fn epilogue_uses_bias(epilogue: cublasLtEpilogue_t) -> bool {
     )
 }
 
+/// One shared `CudaBlasLT` per device (keyed by CUDA device ordinal), reused by
+/// every cuBLASLt op. cudarc's `CudaBlasLT::new` allocates a ~33 MB workspace, so
+/// a per-op handle would cost ~33 MB × (hundreds of matmuls) ≈ tens of GB of
+/// idle workspace per graph — enough to OOM when two graphs (decode + prefill)
+/// are resident. A cuBLASLt handle is fine to share across matmuls (the per-call
+/// workspace is passed separately to `cublasLtMatmul`).
+static SHARED_CUBLASLT: OnceLock<Mutex<std::collections::HashMap<usize, Arc<CudaBlasLT>>>> =
+    OnceLock::new();
+
 impl CuBlasLt {
     fn get_cublaslt(&self, stream: &Arc<CudaStream>) -> anyhow::Result<Arc<CudaBlasLT>> {
         if let Some(cublaslt) = self.cublaslt.get() {
             return Ok(cublaslt.clone());
         }
-        let created = try_create_cublaslt(stream.clone()).map_err(|message| {
-            anyhow::anyhow!("cuBLASLt unavailable on this machine: {message}")
-        })?;
-        let _ = self.cublaslt.set(created.clone());
-        Ok(created)
+        // Reuse this device's shared handle (create once); cache it in this op's
+        // OnceLock so subsequent executes skip the map lookup.
+        let ordinal = stream.context().ordinal();
+        let map = SHARED_CUBLASLT.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let inst = {
+            let mut guard = map.lock().unwrap();
+            if let Some(existing) = guard.get(&ordinal) {
+                existing.clone()
+            } else {
+                let created = try_create_cublaslt(stream.clone()).map_err(|message| {
+                    anyhow::anyhow!("cuBLASLt unavailable on this machine: {message}")
+                })?;
+                guard.insert(ordinal, created.clone());
+                created
+            }
+        };
+        let _ = self.cublaslt.set(inst.clone());
+        Ok(inst)
     }
 
     #[cfg(test)]
