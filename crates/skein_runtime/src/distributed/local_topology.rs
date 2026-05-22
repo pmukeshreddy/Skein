@@ -161,14 +161,17 @@ fn elementwise_sum(bufs: &[Vec<f32>]) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::distributed::SegmentRunner;
-    use skein_compile::{DynRuntime, DynRuntimeError, RuntimeSegment};
+    use skein_compile::{DynRuntime, DynRuntimeError, HandoffId, RuntimeSegment};
     use skein_ir::types::Dtype;
     use std::collections::HashMap;
 
     /// Per-device mock runtime: on execute it emits this device's partial
-    /// contribution `[device+1, device+1]` for the collective tensor `x`.
+    /// contribution `[device+1, device+1]` for the collective tensor `x`. Drives
+    /// the real `SegmentRunner`, so it implements the `_by_id` hot-path methods
+    /// (delegating to `_by_name` via the interned id → name table).
     struct RankPartial {
         device: usize,
+        ids: HashMap<HandoffId, String>,
     }
     impl DynRuntime for RankPartial {
         fn execute_segment(&mut self) -> Result<(), DynRuntimeError> {
@@ -187,11 +190,39 @@ mod tests {
         fn set_tensor_i32_by_name(&mut self, _: &str, _: Vec<i32>) -> Result<(), DynRuntimeError> {
             Ok(())
         }
+        fn register_handoff_ids(&mut self, id_for_name: &dyn Fn(&str) -> Option<HandoffId>) {
+            if let Some(id) = id_for_name("x") {
+                self.ids.insert(id, "x".to_string());
+            }
+        }
+        fn get_tensor_by_id(&self, id: HandoffId) -> Result<Vec<f32>, DynRuntimeError> {
+            let name = self
+                .ids
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
+            self.get_tensor_by_name(&name)
+        }
+        fn set_tensor_by_id(
+            &mut self,
+            id: HandoffId,
+            data: Vec<f32>,
+        ) -> Result<(), DynRuntimeError> {
+            let name = self
+                .ids
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
+            self.set_tensor_by_name(&name, data)
+        }
     }
 
     fn runner(device: usize) -> SegmentRunner {
         let seg = RuntimeSegment {
-            runtime: Box::new(RankPartial { device }),
+            runtime: Box::new(RankPartial {
+                device,
+                ids: HashMap::new(),
+            }),
             input_names: vec![],
             output_names: vec!["x".to_string()],
             capture_names: vec![],

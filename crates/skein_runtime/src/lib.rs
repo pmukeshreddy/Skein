@@ -19,6 +19,14 @@
 //! `--no-default-features` selects the in-process collective + eager
 //! dispatch path used for single-node serving, CI, and runtime-logic
 //! development.
+//!
+//! ## Profiling
+//!
+//! Per-segment and per-forward decode timing lives in [`perf_timing`] and is
+//! gated by the `perf-trace` Cargo feature. Production builds omit it for zero
+//! overhead (no `Instant::now()` in the decode hot loop); enable it
+//! (`--features perf-trace`) to emit `SKEIN_SEG` / `SKEIN_PERF_STEP`
+//! `tracing::debug!` records when profiling.
 
 pub mod batcher;
 pub mod collectives;
@@ -33,6 +41,7 @@ pub mod kv_cache;
 pub mod kv_transport;
 pub mod observability;
 pub mod perf_counters;
+pub mod perf_timing;
 pub mod server;
 pub mod speculative;
 pub mod token_stream;

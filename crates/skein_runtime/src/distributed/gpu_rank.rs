@@ -34,7 +34,8 @@ use crate::kv_cache::KvKind;
 
 use crate::cuda::nccl::NcclCollective;
 use crate::distributed::{
-    CollectiveError, LocalSegments, RankCollective, RankExecutor, SegmentRunner, WorldLayout,
+    CollectiveError, LocalSegments, RankCollective, RankExecutor, ResolvedSequenceStep,
+    SegmentRunner, WorldLayout,
 };
 use crate::error::RuntimeError;
 use crate::speculative;
@@ -49,13 +50,19 @@ pub struct RankServer {
     layout: WorldLayout,
     executor: RankExecutor<SegmentRunner>,
     collective: NcclCollective,
-    schedule: Vec<SequenceStep>,
+    /// Decode schedule with all names pre-resolved to ids (artifact stays
+    /// String-keyed; this is built once at bootstrap). The hot path walks this.
+    schedule_resolved: Vec<ResolvedSequenceStep>,
     vocab: u32,
     /// Optional batched-prefill executor (seq=N graph sharing the decode graph's
     /// weights by device pointer). Gated by `SKEIN_BATCHED_PREFILL=<seq>`. When
     /// present and the prompt length matches `prefill_seq`, the whole prompt is
     /// prefilled in ONE forward instead of token-by-token.
     prefill: Option<RankExecutor<SegmentRunner>>,
+    /// The prefill executor's own resolved schedule (same names → same ids, but
+    /// resolved against the prefill runner's resident weights). `Some` iff
+    /// `prefill` is `Some`.
+    prefill_schedule_resolved: Option<Vec<ResolvedSequenceStep>>,
     prefill_seq: usize,
     num_layers: usize,
 }
@@ -141,7 +148,7 @@ impl RankServer {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 1)
             .unwrap_or(0);
-        let prefill = if prefill_seq > 1 {
+        let mut prefill = if prefill_seq > 1 {
             // Decode weights must be GPU-resident before the prefill graph shares
             // their pointers.
             executor.runner_mut().materialize_weights();
@@ -168,13 +175,47 @@ impl RankServer {
             executor.runner_mut().clear_intermediates();
         }
 
+        // Resolve the String-keyed schedule to ids ONCE, now that names are
+        // interned and (for sparse MoE) weights are resident — so the decode hot
+        // path does zero string hashing per token. Decode and prefill resolve
+        // against their own runners (same names → same ids; expert weight
+        // pointers resolved per runner).
+        let schedule_resolved = executor
+            .runner_mut()
+            .resolve_schedule(&schedule)
+            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+        let prefill_schedule_resolved = match prefill.as_mut() {
+            Some(pe) => Some(
+                pe.runner_mut()
+                    .resolve_schedule(&schedule)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?,
+            ),
+            None => None,
+        };
+
+        // Sparse MoE: install one resident bf16 gate-scalar buffer per runner and
+        // bind each FFN segment's gate inputs to fixed offsets ONCE. After this,
+        // route_moe writes a layer's gates with one async H2D instead of a tiny
+        // per-slot H2D each (no MoeRoute steps on the dense path → no buffer).
+        let num_layers = artifact.plan.model_meta.num_layers;
+        let rank = layout.rank as u32;
+        if let Some(top_k) = schedule_top_k(&schedule_resolved) {
+            install_gate_buffer(executor.runner_mut(), &schedule_resolved, rank, num_layers, top_k)?;
+        }
+        if let (Some(pe), Some(pr)) = (prefill.as_mut(), prefill_schedule_resolved.as_ref()) {
+            if let Some(top_k) = schedule_top_k(pr) {
+                install_gate_buffer(pe.runner_mut(), pr, rank, num_layers, top_k)?;
+            }
+        }
+
         Ok(Self {
             layout,
             executor,
             collective,
-            schedule,
+            schedule_resolved,
             vocab: artifact.plan.model_meta.vocab as u32,
             prefill,
+            prefill_schedule_resolved,
             prefill_seq,
             num_layers: artifact.plan.model_meta.num_layers,
         })
@@ -225,7 +266,7 @@ impl RankServer {
         runner.set_input_tokens(INPUT_TOKENS, vec![token as i32]);
         runner.set_position(position);
         self.executor
-            .run(&self.schedule, &self.collective)
+            .run(&self.schedule_resolved, &self.collective)
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
         self.executor
             .runner()
@@ -241,8 +282,8 @@ impl RankServer {
     /// `prompt_tokens.len() == self.prefill_seq`.
     fn forward_prefill(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>, RuntimeError> {
         let n = prompt_tokens.len();
-        // Take the prefill executor out so its &mut doesn't alias self.schedule /
-        // self.executor below; put it back before returning.
+        // Take the prefill executor out so its &mut doesn't alias self.executor
+        // below; put it back before returning.
         let mut prefill = self.prefill.take().expect("prefill executor present");
         {
             let runner = prefill.runner_mut();
@@ -252,8 +293,12 @@ impl RankServer {
             );
             runner.set_prefill_capture(true);
         }
+        let prefill_schedule = self
+            .prefill_schedule_resolved
+            .as_ref()
+            .expect("prefill schedule present when prefill executor is");
         let run_res = prefill
-            .run(&self.schedule, &self.collective)
+            .run(prefill_schedule, &self.collective)
             .map_err(|e| RuntimeError::ServerInit(e.to_string()));
         if let Err(e) = run_res {
             self.prefill = Some(prefill);
@@ -648,6 +693,38 @@ pub fn run_speculative_generation(
 
 fn to_rt(e: CollectiveError) -> RuntimeError {
     RuntimeError::ServerInit(e.to_string())
+}
+
+/// The MoE `top_k` from a resolved schedule (all MoeRoute steps share it), or
+/// `None` on the dense path (no MoeRoute steps → no gate buffer needed).
+fn schedule_top_k(schedule: &[ResolvedSequenceStep]) -> Option<usize> {
+    schedule.iter().find_map(|s| match s {
+        ResolvedSequenceStep::MoeRoute { top_k, .. } => Some(*top_k),
+        _ => None,
+    })
+}
+
+/// Allocate this runner's resident bf16 gate buffer (`num_layers * top_k` slots)
+/// on a fresh default-stream and bind its FFN gate inputs to fixed offsets once.
+fn install_gate_buffer(
+    runner: &mut SegmentRunner,
+    schedule: &[ResolvedSequenceStep],
+    rank: u32,
+    num_layers: usize,
+    top_k: usize,
+) -> Result<(), RuntimeError> {
+    let total = num_layers * top_k;
+    let ctx = cudarc::driver::CudaContext::new(0)
+        .map_err(|e| RuntimeError::ServerInit(format!("gate buffer ctx: {e}")))?;
+    let stream = ctx.default_stream();
+    let buf = stream
+        .alloc_zeros::<half::bf16>(total)
+        .map_err(|e| RuntimeError::ServerInit(format!("gate buffer alloc: {e}")))?;
+    runner.set_gate_buffer(stream, buf, top_k);
+    runner
+        .bind_gate_inputs(schedule, rank)
+        .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+    Ok(())
 }
 
 fn argmax(values: &[f32]) -> u32 {

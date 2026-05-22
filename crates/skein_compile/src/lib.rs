@@ -31,7 +31,7 @@ pub use artifact::{
     SegmentMetadata, SkeinArtifact,
 };
 pub use dyn_runtime::{
-    DynRuntime, DynRuntimeError, DynRuntimeWrapper, WeightDtype, decode_weight_bytes,
+    DynRuntime, DynRuntimeError, DynRuntimeWrapper, HandoffId, WeightDtype, decode_weight_bytes,
 };
 pub use error::CompileError;
 pub use executor::{

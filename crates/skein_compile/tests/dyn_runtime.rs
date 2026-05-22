@@ -22,7 +22,13 @@ fn dyn_runtime_wrapper_sets_executes_and_gets_by_name() {
     names.insert("weights".to_string(), weights.id);
     names.insert("out".to_string(), out.id);
 
-    let mut dyn_rt = DynRuntimeWrapper::new(runtime, cx, names);
+    // Input-handoff name → Input node map (the 4th `new` arg). `input` and
+    // `weights` are this graph's inputs.
+    let mut input_names = HashMap::new();
+    input_names.insert("input".to_string(), input.id);
+    input_names.insert("weights".to_string(), weights.id);
+
+    let mut dyn_rt = DynRuntimeWrapper::new(runtime, cx, names, input_names);
     dyn_rt
         .set_tensor_by_name("input", vec![1.0, 2.0, 3.0, 4.0])
         .expect("set input");
@@ -43,8 +49,9 @@ fn cuda_dyn_runtime_wrapper_typechecks() {
         runtime: skein_compile::CudaComputeRuntime,
         graph: luminal::prelude::Graph,
         names: HashMap<String, luminal::prelude::NodeIndex>,
+        input_names: HashMap<String, luminal::prelude::NodeIndex>,
     ) -> Box<dyn DynRuntime> {
-        Box::new(DynRuntimeWrapper::new(runtime, graph, names))
+        Box::new(DynRuntimeWrapper::new(runtime, graph, names, input_names))
     }
-    let _f: fn(_, _, _) -> Box<dyn DynRuntime> = _accept;
+    let _f: fn(_, _, _, _) -> Box<dyn DynRuntime> = _accept;
 }

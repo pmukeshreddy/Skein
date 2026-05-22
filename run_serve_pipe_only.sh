@@ -4,7 +4,8 @@ export LD_LIBRARY_PATH=/home/ubuntu/cuda12/lib:${LD_LIBRARY_PATH:-}
 export CUDA_HOME=/home/ubuntu/cuda12/nvidia/cuda_runtime; export CUDA_PATH=$CUDA_HOME; export CUDA_ROOT=$CUDA_HOME
 export RUST_LOG=warn,skein_runtime=info,skein_cli=info
 export SKEIN_PERF=1
-export SKEIN_PIPELINE=1
+# Pipelined execution (segments run back-to-back on the rank's shared default
+# stream with no redundant per-segment sync) is now the only mode — no env flag.
 ART=artifacts/mixtral_rtx6000_fixed_cache/7923e3a4a6acb152f3856e4bd3ad7d69530433508ec92b04243f002453dc5012
 LOG=/tmp/serve_pipe_only.log; : > "$LOG"
 for attempt in $(seq 1 6); do

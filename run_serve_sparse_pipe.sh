@@ -11,7 +11,8 @@ export CUDA_ROOT=$CUDA_HOME
 export RUST_LOG=warn,skein_runtime=info,skein_cli=info
 export SKEIN_PERF=1
 export SKEIN_SPARSE_MOE=1
-export SKEIN_PIPELINE=1
+# Pipelined execution is now the only mode (no redundant per-segment stream
+# sync); no env flag is needed to enable it.
 
 ART=artifacts/mixtral_rtx6000_fixed_cache/7923e3a4a6acb152f3856e4bd3ad7d69530433508ec92b04243f002453dc5012
 MAX_NEW=${1:-32}

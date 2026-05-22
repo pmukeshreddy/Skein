@@ -22,10 +22,46 @@
 //! per-participant-set collective registry; that extension is noted at
 //! [`RankExecutor::run`] and does not change the orchestration here.
 
+use skein_compile::HandoffId;
 use skein_cost::collectives::CollectiveKind;
-use skein_emit::segment::SequenceStep;
 
 use super::{CollectiveError, RankCollective};
+
+/// A [`SequenceStep`](skein_emit::segment::SequenceStep) with all logical tensor
+/// names pre-resolved to [`HandoffId`]s (and MoE expert weights pre-resolved to
+/// resident device pointers). Produced once at bootstrap by
+/// [`SegmentRunner::resolve_schedule`](super::SegmentRunner::resolve_schedule)
+/// from the artifact's `Vec<SequenceStep>` (which stays String-keyed on disk), so
+/// the decode hot path — segments, collectives, and MoE routing — performs zero
+/// string hashing per token.
+#[derive(Clone, Debug)]
+pub enum ResolvedSequenceStep {
+    /// Run segment `segment_idx` of device `device_idx`.
+    ExecuteSegment { device_idx: u32, segment_idx: usize },
+    /// Issue a collective over the handoff tensor `tensor`.
+    Collective {
+        collective: CollectiveKind,
+        participants: Vec<u32>,
+        tensor: HandoffId,
+    },
+    /// Sparse-MoE route+bind. `router_id` is the gate segment's router-logits
+    /// handoff; `block` is the transformer block index (the gate buffer's layer
+    /// slab); `expert_weights[e] = [(ptr, n_bytes); 3]` are the owned experts'
+    /// resident weight buffers (resolved once at bootstrap); `slot_ids[s]` are the
+    /// FFN segment's per-slot weight inputs; `gate_ids[s]` are the FFN gate-scalar
+    /// inputs (bound once at bootstrap to fixed offsets of the resident gate
+    /// buffer — see [`SegmentRunner::bind_gate_inputs`](super::SegmentRunner)).
+    MoeRoute {
+        device_idx: u32,
+        ffn_segment_idx: usize,
+        router_id: HandoffId,
+        top_k: usize,
+        block: usize,
+        expert_weights: Vec<[(u64, usize); 3]>,
+        slot_ids: Vec<[HandoffId; 3]>,
+        gate_ids: Vec<HandoffId>,
+    },
+}
 
 /// This rank's local segment runtimes. The real implementation wraps the
 /// device's compiled `RuntimeSegment`s (feeding named inputs, executing, and
@@ -36,32 +72,54 @@ pub trait LocalSegments {
     /// named handoff inputs it needs and storing its named outputs.
     fn run_segment(&mut self, segment_idx: usize) -> Result<(), RankExecError>;
 
-    /// Read a named handoff tensor's current value (handed to a collective).
+    /// Read a named handoff tensor's current value. Off the hot path (external
+    /// accessors, the single-process `LocalTopology` walker, tests); the
+    /// `RankExecutor` decode loop uses [`LocalSegments::read_by_id`].
     fn read(&self, name: &str) -> Result<Vec<f32>, RankExecError>;
 
-    /// Store a collective's result back under `name` for downstream segments.
+    /// Store a value under a named handoff. Off-hot-path counterpart of
+    /// [`LocalSegments::write_by_id`].
     fn write(&mut self, name: &str, data: Vec<f32>) -> Result<(), RankExecError>;
 
-    /// Device buffer `(raw_ptr, bf16_elems)` of a named handoff that is held
-    /// device-resident, if any. Returns `Some` for tensors kept on-device (so a
-    /// collective can all-reduce them in place without host staging), `None`
-    /// otherwise (host path). Default: `None`.
+    /// Device buffer `(raw_ptr, bf16_elems)` of a named handoff held
+    /// device-resident, if any. Off-hot-path; default `None`.
     fn output_device_ptr(&self, _name: &str) -> Option<(u64, usize)> {
         None
     }
 
-    /// Sparse-MoE route+bind: read `router_tensor`, pick top-k experts, and bind
-    /// the FFN segment's weight slots to those experts' resident device buffers
-    /// (+ softmax-over-top-k gate scalars). Default: no-op (dense path). See
-    /// [`SequenceStep::MoeRoute`].
-    fn route_moe(
+    /// Read a handoff by pre-resolved id (the collective hot path). Default
+    /// errors: only the real runner is on the id path. Mocks override.
+    fn read_by_id(&self, id: HandoffId) -> Result<Vec<f32>, RankExecError> {
+        Err(RankExecError::UnknownTensor(format!("id {}", id.0)))
+    }
+
+    /// Write a collective's result back by pre-resolved id (the collective hot
+    /// path). Default errors. Mocks override.
+    fn write_by_id(&mut self, id: HandoffId, _data: Vec<f32>) -> Result<(), RankExecError> {
+        Err(RankExecError::UnknownTensor(format!("id {}", id.0)))
+    }
+
+    /// Device buffer `(raw_ptr, bf16_elems)` of a device-resident handoff by id,
+    /// for in-place all-reduce. Default `None`.
+    fn output_device_ptr_by_id(&self, _id: HandoffId) -> Option<(u64, usize)> {
+        None
+    }
+
+    /// Sparse-MoE route+bind with everything pre-resolved (zero string hashing):
+    /// read the `router_id` logits, pick top-k experts, bind the FFN segment's
+    /// `slot_ids` to the selected experts' resident `expert_weights` device
+    /// buffers, and write the softmax-over-top-k gate scalars into block `block`'s
+    /// slab of the resident gate buffer (whose offsets the FFN gate inputs were
+    /// bound to once at bootstrap). Default: no-op (dense path). See
+    /// [`ResolvedSequenceStep::MoeRoute`].
+    fn route_moe_resolved(
         &mut self,
         _ffn_segment_idx: usize,
-        _router_tensor: &str,
+        _router_id: HandoffId,
         _top_k: usize,
-        _expert_weight_names: &[[String; 3]],
-        _slot_weight_names: &[[String; 3]],
-        _slot_gate_names: &[String],
+        _block: usize,
+        _expert_weights: &[[(u64, usize); 3]],
+        _slot_ids: &[[HandoffId; 3]],
     ) -> Result<(), RankExecError> {
         Ok(())
     }
@@ -122,95 +180,93 @@ impl<S: LocalSegments> RankExecutor<S> {
     /// per block would key a collective per participant set here instead.
     pub fn run<C: RankCollective>(
         &mut self,
-        schedule: &[SequenceStep],
+        schedule: &[ResolvedSequenceStep],
         collective: &C,
     ) -> Result<(), RankExecError> {
-        // --- profiling: total time in local segment execution vs in NCCL
-        // collectives (host read -> NCCL -> host write), summed over one forward
-        // pass. Tests whether the bottleneck is compute/host staging (segments)
-        // or the collective/communication path.
-        let mut seg_us: u128 = 0;
-        let mut comm_us: u128 = 0;
+        // --- profiling (compile-time gated by `perf-trace`): total time in local
+        // segment execution vs in collectives (host read -> NCCL -> host write) /
+        // MoE routing, summed over one forward. With the feature off, `StepTimer`
+        // is a no-op and `time_seg`/`time_comm` just run the closure.
+        let mut timer = crate::perf_timing::StepTimer::new();
         for step in schedule {
             match step {
-                SequenceStep::ExecuteSegment {
+                ResolvedSequenceStep::ExecuteSegment {
                     device_idx,
                     segment_idx,
                 } => {
                     if *device_idx as usize == self.rank {
-                        let t = std::time::Instant::now();
-                        self.runner.run_segment(*segment_idx)?;
-                        seg_us += t.elapsed().as_micros();
+                        timer.time_seg(|| self.runner.run_segment(*segment_idx))?;
                     }
                 }
-                SequenceStep::Collective {
+                ResolvedSequenceStep::Collective {
                     collective: kind,
                     participants,
                     tensor,
-                    ..
                 } => {
                     if participants.iter().any(|p| *p as usize == self.rank) {
-                        let t = std::time::Instant::now();
-                        // Device-resident steady-state path: a RingAllReduce of a
-                        // bf16 activation kept on-device is all-reduced IN PLACE by
-                        // device pointer — no host Vec, no D2H/H2D. The producer's
-                        // buffer holds the reduced result; the consumer binds it.
-                        let device = match kind {
-                            CollectiveKind::RingAllReduce => self.runner.output_device_ptr(tensor),
-                            _ => None,
-                        };
-                        if let Some((ptr, elems)) = device {
-                            unsafe { collective.all_reduce_sum_device_bf16(ptr, elems) }?;
-                        } else {
-                            // Host fallback: all_gather (logits), broadcast, or a
-                            // tensor not held device-resident.
-                            let mut buf = self.runner.read(tensor)?;
-                            crate::perf_counters::record_d2h(
-                                buf.len() * std::mem::size_of::<f32>(),
-                            );
-                            apply_collective(collective, *kind, participants, &mut buf)?;
-                            crate::perf_counters::record_h2d(
-                                buf.len() * std::mem::size_of::<f32>(),
-                            );
-                            self.runner.write(tensor, buf)?;
-                        }
-                        comm_us += t.elapsed().as_micros();
+                        let runner = &mut self.runner;
+                        timer.time_comm(|| -> Result<(), RankExecError> {
+                            // Device-resident steady-state path: a RingAllReduce of
+                            // a bf16 activation kept on-device is all-reduced IN
+                            // PLACE by device pointer — no host Vec, no D2H/H2D. The
+                            // producer's buffer holds the reduced result; the
+                            // consumer binds it.
+                            let device = match kind {
+                                CollectiveKind::RingAllReduce => {
+                                    runner.output_device_ptr_by_id(*tensor)
+                                }
+                                _ => None,
+                            };
+                            if let Some((ptr, elems)) = device {
+                                unsafe { collective.all_reduce_sum_device_bf16(ptr, elems) }?;
+                            } else {
+                                // Host fallback: all_gather (logits), broadcast, or
+                                // a tensor not held device-resident.
+                                let mut buf = runner.read_by_id(*tensor)?;
+                                crate::perf_counters::record_d2h(
+                                    buf.len() * std::mem::size_of::<f32>(),
+                                );
+                                apply_collective(collective, *kind, participants, &mut buf)?;
+                                crate::perf_counters::record_h2d(
+                                    buf.len() * std::mem::size_of::<f32>(),
+                                );
+                                runner.write_by_id(*tensor, buf)?;
+                            }
+                            Ok(())
+                        })?;
                     }
                 }
                 // Sparse-MoE route+bind (gated by SKEIN_SPARSE_MOE at compile);
                 // dense artifacts emit no MoeRoute steps.
-                SequenceStep::MoeRoute {
+                ResolvedSequenceStep::MoeRoute {
                     device_idx,
                     ffn_segment_idx,
-                    router_tensor,
+                    router_id,
                     top_k,
-                    expert_weight_names,
-                    slot_weight_names,
-                    slot_gate_names,
-                    ..
+                    block,
+                    expert_weights,
+                    slot_ids,
+                    // `gate_ids` are bound to the gate buffer once at bootstrap;
+                    // the per-token write keys off `block`, not the ids.
+                    gate_ids: _,
                 } => {
                     if *device_idx as usize == self.rank {
-                        let t = std::time::Instant::now();
-                        self.runner.route_moe(
-                            *ffn_segment_idx,
-                            router_tensor,
-                            *top_k,
-                            expert_weight_names,
-                            slot_weight_names,
-                            slot_gate_names,
-                        )?;
-                        comm_us += t.elapsed().as_micros();
+                        timer.time_comm(|| {
+                            self.runner.route_moe_resolved(
+                                *ffn_segment_idx,
+                                *router_id,
+                                *top_k,
+                                *block,
+                                expert_weights,
+                                slot_ids,
+                            )
+                        })?;
                     }
                 }
             }
         }
-        // Per-forward profiling: debug-level to keep it out of the steady-state
-        // decode hot loop at the default info level.
-        tracing::debug!(
-            seg_us,
-            comm_us,
-            "SKEIN_PERF_STEP: segment-exec vs collective time for one forward pass"
-        );
+        // Emit the per-forward record (no-op unless `perf-trace` is compiled in).
+        timer.finish();
         Ok(())
     }
 }
@@ -241,16 +297,39 @@ fn apply_collective<C: RankCollective>(
 mod tests {
     use super::*;
     use crate::distributed::BarrierCollective;
-    use skein_ir::types::Dtype;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
 
+    /// Tensor "x" is interned to this id in these tests (the executor consumes a
+    /// pre-resolved schedule; the runner resolves names → ids at bootstrap).
+    const X: HandoffId = HandoffId(0);
+
     /// In-memory rank runner: `run_segment` writes this rank's partial
-    /// contribution for tensor "x"; `read`/`write` hit a name→buffer map.
+    /// contribution for tensor "x"; the id-based hot-path accessors map the
+    /// interned id back to the name → buffer store.
     struct MockSegments {
         rank: usize,
         store: HashMap<String, Vec<f32>>,
+        ids: HashMap<HandoffId, String>,
+    }
+
+    impl MockSegments {
+        fn new(rank: usize) -> Self {
+            let mut ids = HashMap::new();
+            ids.insert(X, "x".to_string());
+            Self {
+                rank,
+                store: HashMap::new(),
+                ids,
+            }
+        }
+        fn name_of(&self, id: HandoffId) -> Result<String, RankExecError> {
+            self.ids
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| RankExecError::UnknownTensor(format!("id {}", id.0)))
+        }
     }
 
     impl LocalSegments for MockSegments {
@@ -270,6 +349,13 @@ mod tests {
             self.store.insert(name.to_string(), data);
             Ok(())
         }
+        fn read_by_id(&self, id: HandoffId) -> Result<Vec<f32>, RankExecError> {
+            self.read(&self.name_of(id)?)
+        }
+        fn write_by_id(&mut self, id: HandoffId, data: Vec<f32>) -> Result<(), RankExecError> {
+            let name = self.name_of(id)?;
+            self.write(&name, data)
+        }
     }
 
     #[test]
@@ -277,20 +363,18 @@ mod tests {
         // Global schedule: each rank runs its own segment producing a partial,
         // then a RingAllReduce over both ranks sums the partials into "x".
         let schedule = Arc::new(vec![
-            SequenceStep::ExecuteSegment {
+            ResolvedSequenceStep::ExecuteSegment {
                 device_idx: 0,
                 segment_idx: 0,
             },
-            SequenceStep::ExecuteSegment {
+            ResolvedSequenceStep::ExecuteSegment {
                 device_idx: 1,
                 segment_idx: 0,
             },
-            SequenceStep::Collective {
+            ResolvedSequenceStep::Collective {
                 collective: CollectiveKind::RingAllReduce,
                 participants: vec![0, 1],
-                tensor: "x".to_string(),
-                shape: vec![2],
-                dtype: Dtype::Bf16,
+                tensor: X,
             },
         ]);
 
@@ -299,10 +383,7 @@ mod tests {
         for (rank, coll) in handles.into_iter().enumerate() {
             let schedule = schedule.clone();
             joins.push(thread::spawn(move || {
-                let runner = MockSegments {
-                    rank,
-                    store: HashMap::new(),
-                };
+                let runner = MockSegments::new(rank);
                 let mut exec = RankExecutor::new(rank, runner);
                 exec.run(&schedule, &coll).expect("rank run");
                 exec.into_runner().read("x").expect("x present")
@@ -317,18 +398,13 @@ mod tests {
 
     #[test]
     fn unsupported_collective_is_a_clear_error() {
-        let schedule = vec![SequenceStep::Collective {
+        let schedule = vec![ResolvedSequenceStep::Collective {
             collective: CollectiveKind::AllToAll,
             participants: vec![0],
-            tensor: "x".to_string(),
-            shape: vec![1],
-            dtype: Dtype::Bf16,
+            tensor: X,
         }];
         let coll = BarrierCollective::group(1).unwrap().pop().unwrap();
-        let mut runner = MockSegments {
-            rank: 0,
-            store: HashMap::new(),
-        };
+        let mut runner = MockSegments::new(0);
         runner.store.insert("x".to_string(), vec![1.0]);
         let mut exec = RankExecutor::new(0, runner);
         let err = exec.run(&schedule, &coll).unwrap_err();

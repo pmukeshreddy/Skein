@@ -13,6 +13,11 @@ default = []
 # RDMA for prefill/decode KV transfer. Pulls in `cudarc` (with its `nccl`
 # bindings); requires an NVIDIA toolchain, so it is off in the CPU/CI build.
 cuda = ["dep:cudarc", "dep:half", "skein_compile/cuda"]
+# Development-only per-segment / per-step decode timing (see `perf_timing`).
+# OFF in production: with the feature off, the `SegTimer`/`StepTimer` types are
+# zero-sized no-ops, so a release build has zero `Instant::now()` calls in the
+# per-segment decode hot loop. Turn on to profile (`--features perf-trace`).
+perf-trace = []
 
 [lib]
 path = "src/lib.rs"

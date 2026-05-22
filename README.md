@@ -51,6 +51,13 @@ runtime paths. Building with `--no-default-features` selects the CPU
 for developing the planning + runtime logic without a GPU. See `docs/` for the
 detailed design of each stage.
 
+For profiling, the `skein_runtime` `perf-trace` feature
+(`cargo build --features skein_runtime/perf-trace`) emits per-segment
+(`SKEIN_SEG`) and per-forward (`SKEIN_PERF_STEP`) `tracing::debug!` timing in the
+decode loop. It is **off in production**: with the feature off the timers are
+zero-sized no-ops, so there are no `Instant::now()` calls in the per-segment hot
+loop.
+
 ## Validation metrics (vs vLLM on 2× H100 SXM5, Mixtral 8x7B)
 
 1. **Throughput at P99 SLO** — sustained tokens/sec at P99 TTFT ≤ 500 ms AND

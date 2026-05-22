@@ -1,4 +1,6 @@
 /target
+# vendored Luminal is its own cargo workspace; ignore its build output too
+/vendor/luminal/target
 /artifacts
 **/*.rs.bk
 .DS_Store

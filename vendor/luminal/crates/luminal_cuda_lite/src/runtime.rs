@@ -34,15 +34,6 @@ use uuid::Uuid;
 
 const ARENA_ALIGNMENT: usize = 256;
 
-/// Whether to skip the redundant per-`execute` stream synchronize so segments on
-/// a rank's shared per-thread default stream pipeline back-to-back (the host
-/// stays unblocked; host reads still sync). Read once from `SKEIN_PIPELINE`.
-fn pipeline_mode() -> bool {
-    use std::sync::OnceLock;
-    static PIPELINE: OnceLock<bool> = OnceLock::new();
-    *PIPELINE.get_or_init(|| std::env::var_os("SKEIN_PIPELINE").is_some())
-}
-
 pub enum CudaInput {
     Buffer(CudaSlice<u8>),
     Ptr(u64),
@@ -571,12 +562,8 @@ impl CudaRuntime {
             )
             .expect("cuMemcpyDtoDAsync failed");
         }
-        // The DtoD copy is ordered on the per-thread default stream with the
-        // consumer that later reads it, so the sync is redundant under
-        // SKEIN_PIPELINE (it otherwise stalls the host on every KV write).
-        if !pipeline_mode() {
-            self.cuda_stream.synchronize().unwrap();
-        }
+        // The DtoD copy is stream-ordered on the rank's shared default stream
+        // with the consumer that later reads it, so no host sync is needed here.
     }
 
     /// Resolve pending output pointer registrations into external_output_buffers.
@@ -1522,6 +1509,11 @@ impl Runtime for CudaRuntime {
         (duration, display)
     }
 
+    /// Execute the compiled graph. Does NOT synchronize the stream on exit.
+    /// Callers that read outputs to host (via clone_dtoh / get_data_f32) get
+    /// an implicit sync there. Callers that consume outputs device-resident
+    /// (zero-copy handoff to the next segment on the same stream) rely on
+    /// stream ordering and must not require host-visible completion.
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
         // Dispatch to correct bucket if multi-bucket mode
@@ -1643,15 +1635,6 @@ impl Runtime for CudaRuntime {
                         exec_op.internal.stats_name().unwrap_or("unknown")
                     );
                 });
-        }
-        // Single sync at end — CUDA stream ordering guarantees sequential
-        // execution. Under SKEIN_PIPELINE this per-execute sync is skipped: every
-        // segment runtime on a rank shares the per-thread default stream, so
-        // cross-segment ordering already holds; the host stays unblocked and the
-        // GPU runs segments back-to-back. Host reads (clone_dtoh for router logits
-        // / logits) still synchronize, which is the only point correctness needs.
-        if !pipeline_mode() {
-            self.cuda_stream.synchronize().unwrap();
         }
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
 

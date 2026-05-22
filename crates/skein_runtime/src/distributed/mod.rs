@@ -53,7 +53,7 @@ pub use barrier_collective::BarrierCollective;
 #[cfg(feature = "cuda")]
 pub use batch_driver::{BatchOutput, ContinuousBatchDriver, DriverMetrics};
 pub use local_topology::LocalTopology;
-pub use rank_executor::{LocalSegments, RankExecError, RankExecutor};
+pub use rank_executor::{LocalSegments, RankExecError, RankExecutor, ResolvedSequenceStep};
 pub use segment_runner::SegmentRunner;
 
 /// This process's place in the rank world.

@@ -123,6 +123,10 @@ fn handoff_names_match_across_segments() {
                     "collective on '{tensor}' but downstream segment {downstream_idx} doesn't list it",
                 );
             }
+            // This test checks Collective handoff-name alignment only; MoeRoute
+            // steps (sparse path) carry no cross-segment Collective handoff, so
+            // they don't participate in this invariant.
+            SequenceStep::MoeRoute { .. } => {}
         }
     }
 }
