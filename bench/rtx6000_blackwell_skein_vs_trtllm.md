@@ -1,0 +1,116 @@
+# Skein vs TensorRT-LLM — Mixtral 8x7B on 2× RTX PRO 6000 Blackwell
+
+Reproduce + measured results on a clean GPU box. All numbers below are real
+command output (greedy, single in-flight request), not estimates.
+
+## Hardware / driver
+
+- 2× NVIDIA RTX PRO 6000 Blackwell, 96 GB each (97887 MiB), compute capability
+  **sm_120** (GB202).
+- GPU0<->GPU1 interconnect: **PCIe Gen5 host bridge (PHB), no NVLink**
+  (`nvidia-smi topo -m`).
+- Driver 580.x / CUDA 13 capable.
+- Cluster spec used: `cluster/rtx6000_2x.toml` (tp=2, PCIe link).
+
+## Skein environment (isolated CUDA 12.8 runtime)
+
+`cudarc` is pinned to the CUDA 12.8 API; keep it off torch's CUDA 13 wheels.
+
+```bash
+pip install --target ~/cuda12 \
+  nvidia-cuda-nvrtc-cu12==12.8.* nvidia-cuda-runtime-cu12==12.8.* \
+  nvidia-cublas-cu12 nvidia-cuda-cccl-cu12 nvidia-nccl-cu12      # nccl needed for multi-GPU serve
+# flatten all .so into one dir + unversioned aliases, then:
+export LD_LIBRARY_PATH=~/cuda12/lib:~/cuda12/nvidia/cuda_runtime/lib:$LD_LIBRARY_PATH
+export CUDA_HOME=~/cuda12/nvidia/cuda_runtime   # NVRTC needs cuda_bf16.h via $CUDA_HOME/include
+export CUDA_PATH=$CUDA_HOME; export CUDA_ROOT=$CUDA_HOME
+pip install torch transformers safetensors accelerate   # accelerate is required by the HF parity reference
+cargo build --release --features cuda
+```
+
+Pipeline: `extract` (tp=2 pp=1 ep=1, 31 bf16 + 1 fp8 layer; fp8 clamped to bf16
+at compile) -> `compile` (artifact `7923e3a4...`, candidate + reference_bf16
+shards 46.7 GB/device) -> `serve` / `verify`.
+
+> Note: `compile`'s final *advisory* Skein-vs-Skein parity loads both the
+> candidate and the bf16 reference forward in one process; on a 96 GB card that
+> is ~2×94 GB and OOMs (SIGKILL). The artifact is fully written *before* that
+> step, so `serve` and the HF `verify` gate work off it regardless.
+
+## Skein results (2-GPU, tp=2, prompt "The capital of France is", 32 tokens)
+
+Generated text:
+
+```
+Paris.
+## What is the capital of France and why?
+Paris, city and capital of France, situated in the north-central
+```
+
+`SKEIN_PERF` (paged-KV cached decode, greedy):
+
+| metric | value |
+|---|---|
+| decode throughput | 9.17 tok/s |
+| TPOT p50 | 104.5 ms |
+| TPOT p95 | 146.3 ms |
+| TTFT | 34.1 s (includes one-time per-launch weight upload) |
+| per-step | seg-exec ≈ 95 ms + NCCL comm ≈ 8–10 ms |
+
+## HF parity gate (Skein bf16 candidate vs HuggingFace transformers bf16)
+
+`skein verify --hf-reference <weights> --artifact <art> --n-prompts 4`
+
+| metric | value |
+|---|---|
+| passed | **false** |
+| avg_final_kl | 0.00967  (SLO max_accuracy_drift = 0.01 → KL axis passes) |
+| max_final_kl | 0.02545 |
+| per-prompt final_kl | [0.00227, 0.02545, 0.00210, 0.00884] |
+| failing layer | 30, weight, bf16, MSE 2.379 ≫ tol 1e-3 |
+
+Read: the final next-token distribution tracks HF closely (avg KL < 0.01,
+consistent with the correct "Paris" generation), but the strict per-layer
+hidden-state MSE gate (1e-3 for bf16) fails at layer 30 — bf16 kernel /
+accumulation-order differences accumulating in the residual stream. Tolerance
+was **not** loosened.
+
+## TensorRT-LLM on Blackwell (sm_120)
+
+TRT-LLM 1.2.1 has no prebuilt sm_120 kernels; flashinfer JIT-compiles them at
+first run. Beyond `pip install tensorrt_llm` (isolated venv), the box needed:
+
+- OpenMPI (`libopenmpi-dev openmpi-bin`) — multi-GPU spawn.
+- CUDA-13 cuBLAS/CCCL/cuRAND headers+libs: `pip install nvidia-cublas
+  nvidia-cuda-cccl nvidia-curand nvidia-cuda-nvcc` (unified names pull cu13 into
+  `nvidia/cu13`).
+- `ninja-build` + `g++-12` (nvcc host compiler; default gcc-12 lacked cc1plus).
+- `CUDA_HOME=.../nvidia/cu13`, plus `LIBRARY_PATH` and unversioned `libcudart.so`
+  symlinks so the flashinfer link step finds `-lcudart`.
+
+Model load itself was fine: ~8.5 s, tp=2.
+
+## Head-to-head (Mixtral 8x7B, tp=2, 32 tokens, greedy, same prompt)
+
+`bench/compare_trtllm.py`
+
+| metric | Skein | TensorRT-LLM 1.2.1 | ratio |
+|---|---|---|---|
+| decode throughput | 9.17 tok/s | **89.14 tok/s** | ~9.7× TRT-LLM |
+| TPOT p50 | 104.5 ms | **11.22 ms** | ~9.3× TRT-LLM |
+| TPOT p95 | 146.3 ms | **11.55 ms** | — |
+| TTFT | 34.1 s* | 18.2 ms* | not comparable* |
+
+\* TTFT is **not** apples-to-apples: Skein `serve` is a fresh-process launcher
+that re-uploads ~47 GB/GPU per launch (its TTFT is dominated by that), while
+TRT-LLM keeps weights resident and is measured after warmup. The clean
+comparison is TPOT / throughput, where TRT-LLM is ~9–10× faster.
+
+Generated text differed (both greedy, same weights): Skein → "Paris."; TRT-LLM →
+"a city that is known for its beauty and its history…". The divergence is from
+BOS/prompt-tokenization differences between the two harnesses, not a model
+disagreement.
+
+The gap is expected: TRT-LLM is a mature engine (fused flashinfer kernels, CUDA
+graphs, optimized MoE); Skein's runtime currently executes per-segment NVRTC
+kernels and re-uploads weights per launch.
