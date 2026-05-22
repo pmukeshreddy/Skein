@@ -49,6 +49,22 @@ pub trait LocalSegments {
     fn output_device_ptr(&self, _name: &str) -> Option<(u64, usize)> {
         None
     }
+
+    /// Sparse-MoE route+bind: read `router_tensor`, pick top-k experts, and bind
+    /// the FFN segment's weight slots to those experts' resident device buffers
+    /// (+ softmax-over-top-k gate scalars). Default: no-op (dense path). See
+    /// [`SequenceStep::MoeRoute`].
+    fn route_moe(
+        &mut self,
+        _ffn_segment_idx: usize,
+        _router_tensor: &str,
+        _top_k: usize,
+        _expert_weight_names: &[[String; 3]],
+        _slot_weight_names: &[[String; 3]],
+        _slot_gate_names: &[String],
+    ) -> Result<(), RankExecError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -161,9 +177,36 @@ impl<S: LocalSegments> RankExecutor<S> {
                         comm_us += t.elapsed().as_micros();
                     }
                 }
+                // Sparse-MoE route+bind (gated by SKEIN_SPARSE_MOE at compile);
+                // dense artifacts emit no MoeRoute steps.
+                SequenceStep::MoeRoute {
+                    device_idx,
+                    ffn_segment_idx,
+                    router_tensor,
+                    top_k,
+                    expert_weight_names,
+                    slot_weight_names,
+                    slot_gate_names,
+                    ..
+                } => {
+                    if *device_idx as usize == self.rank {
+                        let t = std::time::Instant::now();
+                        self.runner.route_moe(
+                            *ffn_segment_idx,
+                            router_tensor,
+                            *top_k,
+                            expert_weight_names,
+                            slot_weight_names,
+                            slot_gate_names,
+                        )?;
+                        comm_us += t.elapsed().as_micros();
+                    }
+                }
             }
         }
-        tracing::info!(
+        // Per-forward profiling: debug-level to keep it out of the steady-state
+        // decode hot loop at the default info level.
+        tracing::debug!(
             seg_us,
             comm_us,
             "SKEIN_PERF_STEP: segment-exec vs collective time for one forward pass"

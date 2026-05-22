@@ -434,7 +434,10 @@ impl LocalSegments for SegmentRunner {
                     self.kv.write_slot(kind, layer, self.position, &data);
                 }
                 self.handoffs_device.remove(name);
-            } else if self.host_tensors.contains(name) {
+            } else if self.host_tensors.contains(name) || name.starts_with("router_logits") {
+                // Collective tensors and the sparse-MoE router logits stay host:
+                // the router logits are read on the host (tiny tensor) to pick the
+                // top-k experts in the MoeRoute step.
                 let data = self.segments[segment_idx]
                     .runtime
                     .get_tensor_by_name(name)
@@ -468,7 +471,10 @@ impl LocalSegments for SegmentRunner {
             }
         }
         let host_out_us = t_out.elapsed().as_micros();
-        tracing::info!(
+        // Per-segment timing: debug-level so it doesn't run ~200 formatted log
+        // lines/token in the steady-state decode hot loop at the default info
+        // level (the SKEIN_PERF summary stays at info).
+        tracing::debug!(
             segment_idx,
             host_in_us,
             gpu_launch_us,
@@ -492,6 +498,91 @@ impl LocalSegments for SegmentRunner {
 
     fn output_device_ptr(&self, name: &str) -> Option<(u64, usize)> {
         self.handoffs_device.get(name).map(|h| (h.ptr, h.elems))
+    }
+
+    fn route_moe(
+        &mut self,
+        ffn_segment_idx: usize,
+        router_tensor: &str,
+        top_k: usize,
+        expert_weight_names: &[[String; 3]],
+        slot_weight_names: &[[String; 3]],
+        slot_gate_names: &[String],
+    ) -> Result<(), RankExecError> {
+        // The gate segment kept its router logits host (tiny tensor).
+        let logits = self
+            .handoffs
+            .get(router_tensor)
+            .cloned()
+            .ok_or_else(|| RankExecError::UnknownTensor(router_tensor.to_string()))?;
+        let n = logits.len();
+        let k = top_k.min(n).min(slot_weight_names.len());
+        if k == 0 {
+            return Ok(());
+        }
+        // Top-k expert indices by logit (descending), then softmax over just the
+        // top-k. This equals the dense `top_k_route` weighting, which masks
+        // non-top-k logits to ~0 before softmax — so the selected experts get
+        // softmax-over-top-k, giving identical output to the dense path.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let topk = &order[..k];
+        let maxl = topk
+            .iter()
+            .map(|&i| logits[i])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = topk.iter().map(|&i| (logits[i] - maxl).exp()).collect();
+        let sum: f32 = exps.iter().sum::<f32>().max(f32::MIN_POSITIVE);
+        let gates: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        let seg = self
+            .segments
+            .get_mut(ffn_segment_idx)
+            .ok_or_else(|| RankExecError::Segment {
+                segment_idx: ffn_segment_idx,
+                detail: "MoeRoute FFN segment index out of range".to_string(),
+            })?;
+        let seg_err = |detail: String| RankExecError::Segment {
+            segment_idx: ffn_segment_idx,
+            detail,
+        };
+        for (slot, &expert) in topk.iter().enumerate() {
+            let expert_names = expert_weight_names
+                .get(expert)
+                .ok_or_else(|| seg_err(format!("selected expert {expert} not in owned set")))?;
+            for w in 0..3 {
+                let expert_name = &expert_names[w];
+                let slot_name = &slot_weight_names[slot][w];
+                // Pointer of the selected expert's already-resident weight buffer.
+                let ptr = seg
+                    .runtime
+                    .weight_device_ptr_by_name(expert_name)
+                    .ok_or_else(|| seg_err(format!("expert weight {expert_name} not resident")))?;
+                // Byte size of the (sharded) bf16 expert buffer the slot must view.
+                let n_bytes = seg
+                    .weight_names
+                    .iter()
+                    .find(|(name, _)| name == expert_name)
+                    .map(|(_, shape)| shape.iter().product::<usize>() * 2)
+                    .ok_or_else(|| seg_err(format!("expert weight {expert_name} shape unknown")))?;
+                // Zero-copy: point the FFN slot at the selected expert's resident
+                // buffer. Re-bound every token (the selected experts change), so
+                // the FFN reads only the top-k experts' weights this step.
+                unsafe {
+                    seg.runtime
+                        .bind_input_device_by_name(slot_name, ptr, n_bytes);
+                }
+            }
+            // Gate scalar (softmax over top-k) for this slot.
+            seg.runtime
+                .set_tensor_by_name(&slot_gate_names[slot], vec![gates[slot]])
+                .map_err(|e| seg_err(format!("set gate scalar: {e:?}")))?;
+        }
+        Ok(())
     }
 }
 

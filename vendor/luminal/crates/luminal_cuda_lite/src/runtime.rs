@@ -34,6 +34,15 @@ use uuid::Uuid;
 
 const ARENA_ALIGNMENT: usize = 256;
 
+/// Whether to skip the redundant per-`execute` stream synchronize so segments on
+/// a rank's shared per-thread default stream pipeline back-to-back (the host
+/// stays unblocked; host reads still sync). Read once from `SKEIN_PIPELINE`.
+fn pipeline_mode() -> bool {
+    use std::sync::OnceLock;
+    static PIPELINE: OnceLock<bool> = OnceLock::new();
+    *PIPELINE.get_or_init(|| std::env::var_os("SKEIN_PIPELINE").is_some())
+}
+
 pub enum CudaInput {
     Buffer(CudaSlice<u8>),
     Ptr(u64),
@@ -562,7 +571,12 @@ impl CudaRuntime {
             )
             .expect("cuMemcpyDtoDAsync failed");
         }
-        self.cuda_stream.synchronize().unwrap();
+        // The DtoD copy is ordered on the per-thread default stream with the
+        // consumer that later reads it, so the sync is redundant under
+        // SKEIN_PIPELINE (it otherwise stalls the host on every KV write).
+        if !pipeline_mode() {
+            self.cuda_stream.synchronize().unwrap();
+        }
     }
 
     /// Resolve pending output pointer registrations into external_output_buffers.
@@ -1630,8 +1644,15 @@ impl Runtime for CudaRuntime {
                     );
                 });
         }
-        // Single sync at end - CUDA stream ordering guarantees sequential execution
-        self.cuda_stream.synchronize().unwrap();
+        // Single sync at end — CUDA stream ordering guarantees sequential
+        // execution. Under SKEIN_PIPELINE this per-execute sync is skipped: every
+        // segment runtime on a rank shares the per-thread default stream, so
+        // cross-segment ordering already holds; the host stays unblocked and the
+        // GPU runs segments back-to-back. Host reads (clone_dtoh for router logits
+        // / logits) still synchronize, which is the only point correctness needs.
+        if !pipeline_mode() {
+            self.cuda_stream.synchronize().unwrap();
+        }
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
 
         // Populate last_kernel_stats from HostOps that report stats

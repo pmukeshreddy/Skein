@@ -101,6 +101,15 @@ impl DeviceArtifactLoaded {
         self.rebuild_graphs_inner(None)
     }
 
+    /// Re-lower this device's full [`LoweredGraph`] (segments **and** sequencing)
+    /// from the recipe. Used to recover the per-device schedule when the lowering
+    /// is structurally different from what was serialized (e.g. the gated sparse
+    /// MoE path adds a gate/FFN split + `MoeRoute` steps), so the runtime can use
+    /// the schedule that matches the rebuilt segments without a recompile.
+    pub fn rebuild_lowered(&self) -> Result<LoweredGraph, CompileError> {
+        self.rebuild_lowered_inner(None)
+    }
+
     /// Rebuild this device's graph at an explicit sequence length (`seq > 1` =
     /// batched-prefill graph). The serve uses this to build a prefill graph
     /// alongside the seq=1 decode graph from the same artifact.
@@ -112,6 +121,10 @@ impl DeviceArtifactLoaded {
         &self,
         seq: Option<usize>,
     ) -> Result<Vec<LoweredSegment>, CompileError> {
+        Ok(self.rebuild_lowered_inner(seq)?.segments)
+    }
+
+    fn rebuild_lowered_inner(&self, seq: Option<usize>) -> Result<LoweredGraph, CompileError> {
         let recipe = self
             .segments
             .first()
@@ -136,15 +149,11 @@ impl DeviceArtifactLoaded {
                 let cluster = Cluster::from_spec(cluster);
                 let lowered = match seq {
                     Some(s) => skein_emit::build_device_graph_with_seq(
-                        &self.plan,
-                        &cluster,
-                        &ir,
-                        device_idx,
-                        s,
+                        &self.plan, &cluster, &ir, device_idx, s,
                     )?,
                     None => skein_emit::build_device_graph(&self.plan, &cluster, &ir, device_idx)?,
                 };
-                Ok(lowered.segments)
+                Ok(lowered)
             }
         }
     }
@@ -175,12 +184,38 @@ fn interleave_sequencing(per_device: &[&[SequenceStep]]) -> Vec<SequenceStep> {
                 }
             }
             SequenceStep::Collective { .. } => merged.push(step.clone()),
+            // Per-device (like ExecuteSegment): each rank binds its own FFN
+            // segment's slots, so emit every device's MoeRoute at this position.
+            SequenceStep::MoeRoute { .. } => {
+                for dev in per_device {
+                    if let Some(s) = dev.get(i) {
+                        merged.push(s.clone());
+                    }
+                }
+            }
         }
     }
     merged
 }
 
 impl SkeinArtifact {
+    /// Re-derive the global schedule by re-lowering every device and interleaving
+    /// their per-device sequencings (the same merge used at write time). Returns
+    /// a schedule that matches the *rebuilt* segments — needed when the lowering
+    /// differs structurally from what was serialized (gated sparse MoE), so serve
+    /// can route correctly without recompiling the artifact. Devices are sorted
+    /// by `device_idx` so the interleave order matches the write-time order.
+    pub fn rebuild_sequencing(&self) -> Result<Vec<SequenceStep>, CompileError> {
+        let mut devs: Vec<&DeviceArtifactLoaded> = self.devices.iter().collect();
+        devs.sort_by_key(|d| d.device_idx);
+        let mut per_device: Vec<Vec<SequenceStep>> = Vec::with_capacity(devs.len());
+        for d in devs {
+            per_device.push(d.rebuild_lowered()?.sequencing);
+        }
+        let refs: Vec<&[SequenceStep]> = per_device.iter().map(|s| s.as_slice()).collect();
+        Ok(interleave_sequencing(&refs))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn write(
         plan: &Plan,
@@ -272,7 +307,10 @@ impl SkeinArtifact {
     /// HF parity gate (`skein verify --hf-reference`) needs it to drive the
     /// `transformers` reference forward against the same architecture.
     pub fn ir(&self) -> Result<Graph, CompileError> {
-        let device = self.devices.first().ok_or(CompileError::ArtifactHasNoDevices)?;
+        let device = self
+            .devices
+            .first()
+            .ok_or(CompileError::ArtifactHasNoDevices)?;
         let seg = device
             .segments
             .first()

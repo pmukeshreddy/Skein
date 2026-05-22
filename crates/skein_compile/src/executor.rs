@@ -266,6 +266,9 @@ impl<'a> TopologyExecutor<'a> {
                             handoffs.insert((device, tensor.clone()), data);
                         }
                     }
+                    // Sparse-MoE routing is handled in the multi-process serve
+                    // executor; the single-process parity path runs dense.
+                    SequenceStep::MoeRoute { .. } => {}
                 }
             }
             // The prefill graph slices to the last token before the LM head, so
@@ -407,6 +410,7 @@ impl<'a> TopologyExecutor<'a> {
                             handoffs.insert((device, tensor.clone()), data);
                         }
                     }
+                    SequenceStep::MoeRoute { .. } => {}
                 }
             }
         }
@@ -454,7 +458,11 @@ pub fn load_runtime_segments<R: crate::ComputeRuntime + 'static>(
         let mut runtime_segments = Vec::with_capacity(lowered.len());
         let n_seg = lowered.len();
         for segment in lowered {
-            runtime_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
+            runtime_segments.push(compile_segment::<R>(
+                segment,
+                search_budget,
+                Some(&cache_dir),
+            )?);
         }
         let replay_ms = t_replay.elapsed().as_secs_f64() * 1e3;
         let t_w = std::time::Instant::now();
@@ -493,7 +501,11 @@ pub fn load_device_runtime_segments<R: crate::ComputeRuntime + 'static>(
     let lowered = device.rebuild_graphs()?;
     let mut runtime_segments = Vec::with_capacity(lowered.len());
     for segment in lowered {
-        runtime_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
+        runtime_segments.push(compile_segment::<R>(
+            segment,
+            search_budget,
+            Some(&cache_dir),
+        )?);
     }
     load_weights_into_segments(&device.weights_path, runtime_segments.as_mut_slice())?;
     Ok(runtime_segments)
@@ -538,7 +550,11 @@ pub fn load_device_prefill_segments<R: crate::ComputeRuntime + 'static>(
     let lowered = device.rebuild_graphs_with_seq(seq)?;
     let mut prefill_segments = Vec::with_capacity(lowered.len());
     for segment in lowered {
-        prefill_segments.push(compile_segment::<R>(segment, search_budget, Some(&cache_dir))?);
+        prefill_segments.push(compile_segment::<R>(
+            segment,
+            search_budget,
+            Some(&cache_dir),
+        )?);
     }
     // Share weights into the prefill graph (no second copy loaded).
     for seg in &mut prefill_segments {

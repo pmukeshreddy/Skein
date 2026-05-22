@@ -90,8 +90,7 @@ use crate::error::EmitError;
 use crate::graph_builder::{DeclaredTensor, shard_param_dims, to_luminal_dtype};
 use crate::handoff::{
     CollectivePoint, EMBED_OUT, INPUT_TOKENS, LOGITS, carry_post_attn, carry_pre_block,
-    collective_attn_out, collective_ffn_out, collective_moe_combine,
-    device_collective_points,
+    collective_attn_out, collective_ffn_out, collective_moe_combine, device_collective_points,
 };
 use crate::segment::{HandoffTensor, Segment, SequenceStep};
 use crate::shard_role::{ShardRole, shard_role_for_param};
@@ -428,6 +427,71 @@ impl<'a> DeviceWiring<'a> {
         self.open_new_segment(next_inputs);
     }
 
+    /// Cut after the MoE gate (sparse path): close the current (gate) segment
+    /// with `router_logits` + `carries` as outputs, push a [`SequenceStep::MoeRoute`]
+    /// (the runtime reads router_logits, picks top-k, and binds the FFN segment's
+    /// expert weight slots + gate scalars to the selected experts), then open the
+    /// FFN segment re-introducing only the `carries` (the FFN graph reads the
+    /// bound slots, not the logits).
+    #[allow(clippy::too_many_arguments)]
+    fn cut_segment_at_moe_route(
+        &mut self,
+        block: usize,
+        router_name: &str,
+        n_experts: usize,
+        top_k: usize,
+        expert_weight_names: Vec<[String; 3]>,
+        slot_weight_names: Vec<[String; 3]>,
+        slot_gate_names: Vec<String>,
+        carries: &[&str],
+    ) {
+        let mut output_handoff = Vec::new();
+        let router_live = self
+            .live
+            .get(router_name)
+            .unwrap_or_else(|| panic!("router tensor {router_name} missing from live"));
+        output_handoff.push(HandoffTensor {
+            logical_name: router_name.to_string(),
+            luminal_id: router_live.tensor.output().id,
+            shape: router_live.shape.clone(),
+            dtype: router_live.dtype,
+        });
+        let mut carry_specs: Vec<HandoffSpec> = Vec::new();
+        for c in carries {
+            let live = self
+                .live
+                .get(*c)
+                .unwrap_or_else(|| panic!("moe carry {c} missing from live"));
+            output_handoff.push(HandoffTensor {
+                logical_name: (*c).to_string(),
+                luminal_id: live.tensor.output().id,
+                shape: live.shape.clone(),
+                dtype: live.dtype,
+            });
+            carry_specs.push(HandoffSpec {
+                logical_name: (*c).to_string(),
+                shape: live.shape.clone(),
+                dtype: live.dtype,
+            });
+        }
+        self.close_current_segment(output_handoff);
+        // close_current_segment incremented cur_idx; the FFN segment about to be
+        // opened is the one this route binds.
+        let ffn_segment_idx = self.cur_idx;
+        self.sequencing.push(SequenceStep::MoeRoute {
+            device_idx: self.device_idx,
+            block,
+            ffn_segment_idx,
+            router_tensor: router_name.to_string(),
+            n_experts,
+            top_k,
+            expert_weight_names,
+            slot_weight_names,
+            slot_gate_names,
+        });
+        self.open_new_segment(carry_specs);
+    }
+
     // -----------------------------------------------------------------------
     // Initial / final segments
     // -----------------------------------------------------------------------
@@ -543,9 +607,7 @@ impl<'a> DeviceWiring<'a> {
         // [.,1,vocab] layout decode uses (a per-position gather would interleave
         // wrong). out_seq is the logits sequence length (always 1 here).
         let final_hidden = if self.seq > 1 {
-            final_hidden_live
-                .tensor
-                .slice((.., self.seq - 1.., ..))
+            final_hidden_live.tensor.slice((.., self.seq - 1.., ..))
         } else {
             final_hidden_live.tensor
         };
@@ -988,6 +1050,13 @@ impl<'a> DeviceWiring<'a> {
             .meta
             .num_experts
             .expect("wire_block_moe called on non-MoE block");
+        // Sparse path (gated): split gate|FFN so the runtime binds only the
+        // top-k experts' resident weights into the FFN, reading 2-of-N instead
+        // of all N every token. Default stays the dense all-experts path.
+        let top_k_sel = self.ir.meta.top_k.unwrap_or(n_experts).clamp(1, n_experts);
+        if std::env::var("SKEIN_SPARSE_MOE").is_ok() && top_k_sel < n_experts {
+            return self.wire_block_moe_sparse(block, normed, n_experts, top_k_sel);
+        }
         let gate_w = self.weight(&format!(
             "model.layers.{block}.block_sparse_moe.gate.weight"
         ))?;
@@ -1029,6 +1098,163 @@ impl<'a> DeviceWiring<'a> {
             });
         }
         Ok(acc.expect("at least one expert owned"))
+    }
+
+    /// Sparse top-k MoE: split the block at the router so the runtime reads only
+    /// the selected experts' weights.
+    ///
+    /// 1. Gate (`normed @ gate.T → router_logits`) in the current segment.
+    /// 2. [`Self::cut_segment_at_moe_route`] closes here; the runtime reads
+    ///    `router_logits`, picks top-k, and binds the FFN slots to those experts'
+    ///    resident weight buffers + the softmax-over-top-k gate scalars.
+    /// 3. The FFN segment declares all owned experts (so they load GPU-resident
+    ///    and have device pointers to bind) but computes only `k` SwiGLU slots,
+    ///    summing `gate_s * down_s`. Because [`top_k_route`] masks non-top-k
+    ///    logits to ~0 before softmax, the dense weighting equals softmax over the
+    ///    top-k — so this produces identical output while reading k-of-N experts.
+    fn wire_block_moe_sparse(
+        &mut self,
+        block: usize,
+        normed: GraphTensor,
+        n_experts: usize,
+        top_k: usize,
+    ) -> Result<GraphTensor, EmitError> {
+        // --- (1) Gate, in the current segment ---
+        let gate_w = self.weight(&format!(
+            "model.layers.{block}.block_sparse_moe.gate.weight"
+        ))?;
+        let routing_logits = normed.matmul(gate_w.permute((1, 0)));
+        if block == 0 {
+            self.debug_tap("dbg_l0_router_logits", routing_logits);
+        }
+        let router_name = format!("router_logits_{block}");
+        self.live.insert(
+            router_name.clone(),
+            LiveTensor {
+                tensor: routing_logits,
+                shape: vec![self.batch, self.seq, n_experts],
+                dtype: self.activation_dtype,
+            },
+        );
+        // Carry the FFN input (normed) across the route boundary.
+        let normed_name = format!("moe_normed_{block}");
+        self.live.insert(
+            normed_name.clone(),
+            LiveTensor {
+                tensor: normed,
+                shape: vec![self.batch, self.seq, self.hidden],
+                dtype: self.activation_dtype,
+            },
+        );
+        let carry_post = carry_post_attn(block);
+
+        // Names: experts this device owns (tp: all), plus FFN slot/gate inputs.
+        let mut expert_weight_names: Vec<[String; 3]> = Vec::new();
+        for e in 0..n_experts {
+            if !self.owns_expert(block, e) {
+                continue;
+            }
+            expert_weight_names.push([
+                format!("model.layers.{block}.block_sparse_moe.experts.{e}.w1.weight"),
+                format!("model.layers.{block}.block_sparse_moe.experts.{e}.w2.weight"),
+                format!("model.layers.{block}.block_sparse_moe.experts.{e}.w3.weight"),
+            ]);
+        }
+        let k = top_k.min(expert_weight_names.len());
+        let mut slot_weight_names: Vec<[String; 3]> = Vec::new();
+        let mut slot_gate_names: Vec<String> = Vec::new();
+        for s in 0..k {
+            slot_weight_names.push([
+                format!("moe_slot{s}_w1_{block}"),
+                format!("moe_slot{s}_w2_{block}"),
+                format!("moe_slot{s}_w3_{block}"),
+            ]);
+            slot_gate_names.push(format!("moe_gate{s}_{block}"));
+        }
+
+        // --- (2) Cut: gate segment -> MoeRoute -> FFN segment ---
+        self.cut_segment_at_moe_route(
+            block,
+            &router_name,
+            n_experts,
+            k,
+            expert_weight_names.clone(),
+            slot_weight_names.clone(),
+            slot_gate_names.clone(),
+            &[&normed_name, &carry_post],
+        );
+
+        // --- (3) FFN segment ---
+        let normed = self
+            .live
+            .get(&normed_name)
+            .expect("moe normed carry")
+            .tensor;
+
+        // Declare all owned experts so they load GPU-resident (the route binds
+        // their device pointers into the slots); capture w-shapes/dtype.
+        let mut shapes: Option<([Vec<usize>; 3], skein_ir::types::Dtype)> = None;
+        for names in &expert_weight_names {
+            let _ = self.weight(&names[0])?;
+            let _ = self.weight(&names[1])?;
+            let _ = self.weight(&names[2])?;
+            if shapes.is_none() {
+                let d1 = self
+                    .cur_declared
+                    .get(&names[0])
+                    .expect("expert w1 declared");
+                let d2 = self
+                    .cur_declared
+                    .get(&names[1])
+                    .expect("expert w2 declared");
+                let d3 = self
+                    .cur_declared
+                    .get(&names[2])
+                    .expect("expert w3 declared");
+                shapes = Some((
+                    [d1.shape.clone(), d2.shape.clone(), d3.shape.clone()],
+                    d1.dtype,
+                ));
+            }
+        }
+        let (s, wdt) = shapes.expect("at least one owned expert");
+        let [s1, s2, s3] = s;
+        let lum_dt = to_luminal_dtype(wdt);
+        let dims = |shape: &[usize]| -> Vec<Expression> {
+            shape.iter().copied().map(Expression::from).collect()
+        };
+
+        // k SwiGLU slots, runtime-bound to the selected experts.
+        let mut acc: Option<GraphTensor> = None;
+        for slot in 0..k {
+            let w1 = self.runtime_input(&slot_weight_names[slot][0], dims(&s1), s1.clone(), lum_dt);
+            let w2 = self.runtime_input(&slot_weight_names[slot][1], dims(&s2), s2.clone(), lum_dt);
+            let w3 = self.runtime_input(&slot_weight_names[slot][2], dims(&s3), s3.clone(), lum_dt);
+            let gate_s = self.runtime_input(
+                &slot_gate_names[slot],
+                vec![
+                    Expression::from(1usize),
+                    Expression::from(1usize),
+                    Expression::from(1usize),
+                ],
+                vec![1, 1, 1],
+                // Activation dtype (bf16) so it matches `down` — the dense path
+                // weights by the bf16 softmax `routing_probs`. The runtime narrows
+                // the f32 gate value to this dtype when it binds the scalar.
+                to_luminal_dtype(self.activation_dtype),
+            );
+            let gate_val = normed.matmul(w1.permute((1, 0))).silu();
+            let up_val = normed.matmul(w3.permute((1, 0)));
+            let down = (gate_val * up_val).matmul(w2.permute((1, 0)));
+            let mut g = gate_s;
+            g.shape.expand(down.dims());
+            let weighted = down * g;
+            acc = Some(match acc {
+                None => weighted,
+                Some(a) => a + weighted,
+            });
+        }
+        Ok(acc.expect("at least one slot"))
     }
 
     fn wire_block_mlp(
@@ -1116,7 +1342,6 @@ impl<'a> DeviceWiring<'a> {
         }
         Err(EmitError::UnknownParamPattern { name: name.into() })
     }
-
 }
 
 /// Shape + dtype + logical name spec for a tensor to introduce as an
@@ -1628,8 +1853,16 @@ pub fn attention_fixed_cache(
     // Rotate q and k_new at `position`.
     let q_hs = q.split_dims(2, head_dim); // [b,1,n_heads,d]
     let qd = q_hs.dims();
-    let q_cos = emb.cos().expand_dim(0, qd[0]).expand_dim(2, qd[2]).cast(q.dtype);
-    let q_sin = emb.sin().expand_dim(0, qd[0]).expand_dim(2, qd[2]).cast(q.dtype);
+    let q_cos = emb
+        .cos()
+        .expand_dim(0, qd[0])
+        .expand_dim(2, qd[2])
+        .cast(q.dtype);
+    let q_sin = emb
+        .sin()
+        .expand_dim(0, qd[0])
+        .expand_dim(2, qd[2])
+        .cast(q.dtype);
     let q_hs = q_hs * q_cos + rotate_half(q_hs, head_dim) * q_sin;
 
     let k_hs = k_new.split_dims(2, head_dim); // [b,1,n_kv,d]

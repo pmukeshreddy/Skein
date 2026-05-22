@@ -79,6 +79,7 @@ impl LocalTopology {
                 } => {
                     self.run_collective(*collective, participants, tensor)?;
                 }
+                SequenceStep::MoeRoute { .. } => {}
             }
         }
         Ok(())

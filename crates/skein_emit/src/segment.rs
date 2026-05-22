@@ -97,4 +97,28 @@ pub enum SequenceStep {
         shape: Vec<usize>,
         dtype: Dtype,
     },
+    /// Sparse-MoE routing (gated by `SKEIN_SPARSE_MOE`): after the gate segment
+    /// produces `router_logits`, the runtime reads it, picks the top-`top_k`
+    /// experts, and binds the FFN segment's expert weight *slots* to those
+    /// selected experts' resident weight buffers by device pointer (plus the
+    /// renormalized gate scalars). This is what makes decode read only the
+    /// selected experts' weights instead of all `n_experts`.
+    MoeRoute {
+        device_idx: u32,
+        block: usize,
+        /// Index of the FFN segment whose expert weight slots this route binds
+        /// (the segment that runs immediately after this step).
+        ffn_segment_idx: usize,
+        /// Logical name of the gate-segment's router-logits output (`[n_experts]`).
+        router_tensor: String,
+        n_experts: usize,
+        top_k: usize,
+        /// Per-expert resident weight names to bind from, indexed by expert:
+        /// `expert_weight_names[e] = [w1, w2, w3]`.
+        expert_weight_names: Vec<[String; 3]>,
+        /// FFN-segment slot input names to bind into, indexed by slot:
+        /// `slot_weight_names[s] = [w1, w2, w3]`, and the gate-scalar input.
+        slot_weight_names: Vec<[String; 3]>,
+        slot_gate_names: Vec<String>,
+    },
 }

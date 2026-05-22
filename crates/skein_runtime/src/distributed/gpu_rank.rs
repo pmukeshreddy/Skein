@@ -94,12 +94,23 @@ impl RankServer {
 
         let mut executor = RankExecutor::new(layout.rank, SegmentRunner::new(segments));
 
+        // With sparse MoE the segments are re-lowered with a gate/FFN split +
+        // MoeRoute steps the serialized (dense) schedule lacks, so re-derive the
+        // schedule to match the rebuilt segments — no recompile, existing weights
+        // are reused. Dense path uses the stored schedule unchanged.
+        let schedule: Vec<SequenceStep> = if std::env::var_os("SKEIN_SPARSE_MOE").is_some() {
+            artifact
+                .rebuild_sequencing()
+                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?
+        } else {
+            artifact.sequencing.clone()
+        };
+
         // Only all-gather / broadcast collective tensors stay host (size-changing
         // / final; their read/write host path is kept). RingAllReduce tensors and
         // every internal activation handoff stay device-resident — RingAllReduce
         // is all-reduced in place on the device by the rank executor.
-        let host_tensors: HashSet<String> = artifact
-            .sequencing
+        let host_tensors: HashSet<String> = schedule
             .iter()
             .filter_map(|s| match s {
                 SequenceStep::Collective {
@@ -109,6 +120,17 @@ impl RankServer {
             })
             .collect();
         executor.runner_mut().set_host_tensors(host_tensors.clone());
+
+        // Sparse MoE: the FFN segments declare every expert (so they load
+        // GPU-resident) but compute only the bound slots, so lazy-on-execute
+        // would never upload the experts. Free the per-segment search arenas
+        // FIRST (otherwise they coexist with the ~46 GB/card of weights and OOM),
+        // then materialize so the MoeRoute step can resolve each selected
+        // expert's resident device pointer.
+        if std::env::var_os("SKEIN_SPARSE_MOE").is_some() {
+            executor.runner_mut().clear_intermediates();
+            executor.runner_mut().materialize_weights();
+        }
 
         // Batched prefill (gated): build a seq=N prefill graph that SHARES the
         // decode graph's resident weights by device pointer (no 2nd 47GB copy).
@@ -150,7 +172,7 @@ impl RankServer {
             layout,
             executor,
             collective,
-            schedule: artifact.sequencing.clone(),
+            schedule,
             vocab: artifact.plan.model_meta.vocab as u32,
             prefill,
             prefill_seq,
