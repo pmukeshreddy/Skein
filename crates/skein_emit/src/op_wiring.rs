@@ -1054,6 +1054,13 @@ impl<'a> DeviceWiring<'a> {
         // top-k experts' resident weights into the FFN, reading 2-of-N instead
         // of all N every token. Default stays the dense all-experts path.
         let top_k_sel = self.ir.meta.top_k.unwrap_or(n_experts).clamp(1, n_experts);
+        // On-device sparse path (gated): top-k selection + `gather` of only the
+        // selected experts' weights, entirely on the GPU — no per-layer host
+        // router D2H sync (the cap of the host-routed sparse path). Reads k-of-N
+        // experts' weights via `gather`, identical math to dense top-k weighting.
+        if std::env::var("SKEIN_ONDEVICE_MOE").is_ok() && top_k_sel < n_experts {
+            return self.wire_block_moe_ondevice(block, normed, n_experts, top_k_sel);
+        }
         if std::env::var("SKEIN_SPARSE_MOE").is_ok() && top_k_sel < n_experts {
             return self.wire_block_moe_sparse(block, normed, n_experts, top_k_sel);
         }
@@ -1098,6 +1105,85 @@ impl<'a> DeviceWiring<'a> {
             });
         }
         Ok(acc.expect("at least one expert owned"))
+    }
+
+    /// On-device top-k sparse MoE. Selection (`topk_indexes`) and weight
+    /// selection (`gather`) run on the GPU, so the router never round-trips to
+    /// the host — eliminating the per-layer `router_logits` D2H sync that caps
+    /// the host-routed sparse path. Reads only the k selected experts' weights
+    /// (via `gather`) instead of all N, and is mathematically identical to dense
+    /// top-k weighting (gates renormalized over the selected k).
+    fn wire_block_moe_ondevice(
+        &mut self,
+        block: usize,
+        normed: GraphTensor,
+        n_experts: usize,
+        top_k: usize,
+    ) -> Result<GraphTensor, EmitError> {
+        let gate_w = self.weight(&format!(
+            "model.layers.{block}.block_sparse_moe.gate.weight"
+        ))?;
+        // Collapse to 2D `[s, H]` FIRST, then compute BOTH routing and experts in
+        // 2D — byte-identical to the GLUMoE SwiGLU reference. Computing routing in
+        // 3D then merging leaves `merge` ops in the op lineage, so the rewrite's
+        // pattern never matches and the naive (slow) gather path runs.
+        let dims = normed.dims();
+        let n_in = dims.len();
+        let s_dim = dims[n_in - 2];
+        let x2d = if n_in > 2 {
+            normed.merge_dims(0, n_in - 2)
+        } else {
+            normed
+        };
+        let axis = 1usize; // [s, *]
+        let _ = n_experts;
+
+        let routing_logits = x2d.matmul(gate_w.permute((1, 0))); // [s, E]
+        if block == 0 {
+            self.debug_tap("dbg_l0_router_logits", routing_logits);
+        }
+        // Route in F32 so the normalized gate weights are F32 *without* a separate
+        // Cast op: GLUMoE's mode-2 fusion matches `normed_topk = Mul(topk_vals,
+        // Recip(Sum(topk_vals)))` directly, and a Cast wrapping that Mul (which we
+        // previously added to reconcile dtypes against the F32 `down_out`) breaks
+        // the match. F32 routing keeps the whole weighted-sum bare and matchable.
+        let probs = routing_logits.softmax(axis).cast(DType::F32); // routing_weights [s, E], F32
+        let topk_idx = routing_logits.topk_indexes(top_k, axis); // [s, K]
+        // Gate weights via the FLAT gather the GLUMoE final-fusion rule expects:
+        // Gather(Iota_row_offsets + topk_idx, routing_weights). `gather_elements`
+        // lowers differently and breaks the match. Mirror the test exactly.
+        let e_dim = probs.dims()[axis]; // E
+        let k_expr = Expression::from(top_k);
+        let cx0 = probs.graph();
+        let row_offsets = cx0.iota(Expression::from('z') / k_expr * e_dim, topk_idx.dims());
+        // Pure-integer routing index (both operands are Int): matches GLUMoE's
+        // final-fusion `Add(row_offsets, topk_idx)` marker directly, no F32 round-
+        // trip / cast-collapse race. See `gather_experts` for the full rationale.
+        let routing_flat_idx = row_offsets + topk_idx;
+        let topk_vals = probs.gather(routing_flat_idx); // [s, K], F32
+        let topk_norm = topk_vals.sum(axis).expand_dim(axis, top_k);
+        // Bare `Mul(topk_vals, Recip(Sum(topk_vals)))` (no Cast) — GLUMoE mode-2.
+        let gate_norm = topk_vals / topk_norm; // [s, K], F32
+
+        // Resident stacked weights: fused gate+up `[E, 2*inter, hidden]`, down
+        // `[E, hidden, inter]`. Match the GLUMoE rewrite EXACTLY:
+        //   gather(w).Cast(F32) -> ONE gate_up matmul -> slice -> SwiGLU ->
+        //   gather(down).Cast(F32) -> down matmul -> weighted sum.
+        let (gate_up_all, down_all, inter) = self.stacked_moe_weights(block)?;
+
+        let x_exp = x2d.cast(DType::F32).expand_dim(axis, top_k).unsqueeze(2); // [s,K,1,H]
+        let gu_g = gather_experts(topk_idx, gate_up_all).cast(DType::F32); // [s,K,2*inter,H]
+        let gu_out = x_exp.matmul(gu_g.transpose(2, 3)).squeeze(2); // [s,K,2*inter]
+        let gate = gu_out.slice((.., .., ..inter)); // [s,K,inter]
+        let up = gu_out.slice((.., .., inter..)); // [s,K,inter]
+        let hid = gate.silu() * up; // SwiGLU -> [s,K,inter]
+        let down_g = gather_experts(topk_idx, down_all).cast(DType::F32); // [s,K,H,inter]
+        let down_out = hid.unsqueeze(2).matmul(down_g.transpose(2, 3)).squeeze(2); // [s,K,H]
+        let mut gate_exp = gate_norm.unsqueeze(2); // [s,K,1]
+        gate_exp.shape.expand(down_out.dims());
+        let out2d = (down_out * gate_exp).sum(axis).cast(DType::Bf16); // [s, H]
+        // Restore [B,S,H].
+        Ok(if n_in > 2 { out2d.split_dims(0, s_dim) } else { out2d })
     }
 
     /// Sparse top-k MoE: split the block at the router so the runtime reads only
@@ -1342,6 +1428,118 @@ impl<'a> DeviceWiring<'a> {
         }
         Err(EmitError::UnknownParamPattern { name: name.into() })
     }
+
+    /// Owned-expert count, sharded dims, and shard role for expert projection
+    /// `wtype` in `block`. Mirrors `weight`'s lookup (search every layer; skip
+    /// experts not on this device under ep/pp).
+    fn expert_proj_info(
+        &self,
+        block: usize,
+        wtype: &str,
+        n_experts: usize,
+    ) -> Result<(usize, Vec<usize>, ShardRole), EmitError> {
+        let mut count = 0usize;
+        let mut dims: Option<Vec<usize>> = None;
+        let mut rl: Option<ShardRole> = None;
+        for e in 0..n_experts {
+            let pname =
+                format!("model.layers.{block}.block_sparse_moe.experts.{e}.{wtype}.weight");
+            for layer in &self.ir.layers {
+                if let Some(param) = layer.params.iter().find(|p| p.name == pname) {
+                    let role = shard_role_for_param(
+                        self.plan,
+                        self.cluster,
+                        self.ir,
+                        self.device_idx,
+                        layer,
+                        param,
+                    );
+                    if !matches!(
+                        role,
+                        ShardRole::ExpertElsewhere { .. }
+                            | ShardRole::PipelineStageElsewhere
+                            | ShardRole::NoParams
+                    ) {
+                        if dims.is_none() {
+                            dims = Some(shard_param_dims(param, &role)?);
+                            rl = Some(role);
+                        }
+                        count += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        Ok((
+            count,
+            dims.ok_or_else(|| EmitError::UnknownParamPattern {
+                name: format!("model.layers.{block}.block_sparse_moe.experts.*.{wtype}.weight"),
+            })?,
+            rl.expect("owned expert role"),
+        ))
+    }
+
+    /// Declare a stacked resident weight input of `shape` named `name`; filled by
+    /// `load_weights_into_segments`'s expert-concat path.
+    fn declare_stacked_weight(
+        &mut self,
+        name: String,
+        shape: Vec<usize>,
+        role: ShardRole,
+        block: usize,
+    ) -> GraphTensor {
+        if let Some(d) = self.cur_declared.get(&name) {
+            return handle_for_declared(&mut self.cur_cx, d);
+        }
+        let dims_expr: Vec<Expression> = shape.iter().copied().map(Expression::from).collect();
+        let dtype_skein = skein_cost::compute::weight_dtype(self.plan, Some(block));
+        let dtype_lum = to_luminal_dtype(dtype_skein);
+        let tensor = self.cur_cx.named_tensor(name.clone(), dims_expr);
+        let id = tensor.id;
+        self.cur_cx.get_op_mut::<Input>(id).dtype = dtype_lum;
+        self.cur_cx.input_meta.insert(id, (name.clone(), dtype_lum));
+        let d = DeclaredTensor {
+            id,
+            shape,
+            dtype: dtype_skein,
+            role,
+        };
+        let handle = handle_for_declared(&mut self.cur_cx, &d);
+        self.cur_declared.insert(name, d);
+        handle
+    }
+
+    /// Declare this block's experts as two resident stacked weights matching the
+    /// GLUMoE rewrite: fused gate+up `[E, 2*inter, hidden]` (rows `[..inter]`=w1
+    /// gate, `[inter..]`=w3 up) and down `[E, hidden, inter]`. Returns
+    /// `(gate_up, down, inter)` with `inter` the sharded intermediate size.
+    fn stacked_moe_weights(
+        &mut self,
+        block: usize,
+    ) -> Result<(GraphTensor, GraphTensor, usize), EmitError> {
+        let n_experts = self
+            .ir
+            .meta
+            .num_experts
+            .expect("stacked_moe_weights on non-MoE block");
+        let (e_owned, gate_dims, gate_role) = self.expert_proj_info(block, "w1", n_experts)?;
+        let (_e_down, down_dims, down_role) = self.expert_proj_info(block, "w2", n_experts)?;
+        let inter = gate_dims[0]; // w1 is [inter, hidden]; sharded intermediate
+        let hidden = gate_dims[1];
+        let gate_up = self.declare_stacked_weight(
+            format!("model.layers.{block}.block_sparse_moe.experts.stacked_gate_up"),
+            vec![e_owned, 2 * inter, hidden],
+            gate_role,
+            block,
+        );
+        let down = self.declare_stacked_weight(
+            format!("model.layers.{block}.block_sparse_moe.experts.stacked_down"),
+            vec![e_owned, down_dims[0], down_dims[1]],
+            down_role,
+            block,
+        );
+        Ok((gate_up, down, inter))
+    }
 }
 
 /// Shape + dtype + logical name spec for a tensor to introduce as an
@@ -1407,6 +1605,39 @@ pub fn top_k_route(logits: GraphTensor, k: usize, n_experts: usize, axis: usize)
 /// per-EP-rank math: across `ep` devices the `[n_experts*capacity, hidden]`
 /// buffer is reshaped to `[ep, …]` and AllToAll'd so each rank receives the
 /// tokens destined for its expert shard.
+/// Gather the per-token top-k experts' weights from a stacked `[E, d1, d2]`
+/// weight tensor. `top_k_indices` is `[.., K]` (expert ids); returns
+/// `[.., K, d1, d2]` containing only the selected experts' weights — so the
+/// downstream matmul reads k-of-E experts, not all E. Builds a flat gather index
+/// `expert_id*d1*d2 + iota(d1,d2)` (mirrors the reference in the search-equiv
+/// fuzz test).
+fn gather_experts(top_k_indices: GraphTensor, weights: GraphTensor) -> GraphTensor {
+    let (_, d1, d2) = weights.dims3();
+    let io = d1 * d2;
+    // PURE-INTEGER flat gather index. luminal's canonical `MoE::forward` casts
+    // base/within through F32 then back to Int. For Mixtral the flat index reaches
+    // ~5e8 (e.g. expert_id * 2*inter*hidden), far beyond F32's exact-integer range
+    // (2^24 ~= 1.7e7) — so the F32 round-trip CORRUPTS the index, producing
+    // out-of-bounds gathers (SIGSEGV) on the naive path. It also leaves the gather
+    // consuming `Cast(Int)(f32_add)` while GLUMoE's expert-index marker tags the
+    // *collapsed* integer `Add`; they unify only if egglog's cast-collapse happens
+    // to propagate, which is flaky in deep models (so the fusion fired for only
+    // ~half the layers). `cx.iota` is already Int, so building the index directly
+    // in Int is both numerically correct and makes the gather consume exactly the
+    // marked `Add` — firing GLUMoE deterministically.
+    let base = top_k_indices * io; // [.., K], Int
+    let cx = weights.graph();
+    let within = cx.iota(Expression::from('z'), (d1, d2)); // [d1, d2], Int
+    let n_base = base.dims().len();
+    let exp_base = base.expand_dim(n_base, d1).expand_dim(n_base + 1, d2);
+    let mut exp_within = within;
+    for (axis, dim) in base.dims().iter().enumerate() {
+        exp_within = exp_within.expand_dim(axis, *dim);
+    }
+    let expert_flat_idx = exp_base + exp_within; // [.., K, d1, d2], Int
+    weights.gather(expert_flat_idx)
+}
+
 pub fn moe_dispatch_combine(
     gate_logits: GraphTensor,
     top_k: usize,

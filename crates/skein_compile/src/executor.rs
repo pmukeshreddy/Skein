@@ -630,6 +630,26 @@ fn compile_segment<R: crate::ComputeRuntime + 'static>(
             .map(|h| (h.logical_name.clone(), h.luminal_id)),
     );
 
+    // Bind luminal's sequence dim `s` to this segment's concrete token count.
+    // Host ops authored against luminal's `s`-convention (notably the fused
+    // GLUMoE MoE op) shape their output buffer as `[s, hidden]` with a symbolic
+    // `s`. Skein's segments are otherwise fully static, so without this nothing
+    // resolves `s` and `plan_intermediate_buffers` cannot size the buffer (the
+    // search then "fails to find a viable initial genome"). luminal's own GLUMoE
+    // path requires the same `set_dim('s', SEQ)` before searching. The token
+    // count is `batch*seq` — the product of the leading dims of any activation
+    // handoff `[batch, seq, hidden]`.
+    if let Some(tokens) = segment
+        .output_handoff
+        .iter()
+        .chain(segment.input_handoff.iter())
+        .filter(|h| h.shape.len() == 3)
+        .map(|h| h.shape[..h.shape.len() - 1].iter().product::<usize>())
+        .find(|t| *t > 0)
+    {
+        segment.graph.set_dim('s', tokens);
+    }
+
     let input_zeros = segment_input_zero_bytes(&segment);
     let runtime =
         R::build_and_search_cached(&mut segment.graph, search_budget, &input_zeros, cache_dir)?;
@@ -659,6 +679,54 @@ fn load_weights_into_segments(
 
     for segment in segments {
         for (name, shape) in &segment.weight_names {
+            // Stacked-expert weight (on-device sparse MoE): the resident tensor
+            // `[E, d1, d2]` is the concatenation of the E per-expert checkpoint
+            // tensors, so `gather` can index k-of-E without N separate copies.
+            if let Some(idx) = name.find(".experts.stacked_") {
+                let prefix = &name[..idx]; // model.layers.{b}.block_sparse_moe
+                let kind = &name[idx + ".experts.stacked_".len()..]; // gate_up | down
+                // Fused gate+up is per-expert [w1 (gate); w3 (up)] concatenated;
+                // down is [w2]. Matches the GLUMoE weight layout.
+                let wtypes: &[&str] = match kind {
+                    "gate_up" => &["w1", "w3"],
+                    "down" => &["w2"],
+                    _ => {
+                        return Err(CompileError::MissingWeight {
+                            path: path.to_path_buf(),
+                            tensor: name.clone(),
+                        });
+                    }
+                };
+                let n_exp = shape[0];
+                let mut buf: Vec<u8> = Vec::new();
+                let mut dt: Option<WeightDtype> = None;
+                for e in 0..n_exp {
+                    for w in wtypes {
+                        let en = format!("{prefix}.experts.{e}.{w}.weight");
+                        let t = tensors.tensor(&en).map_err(|_| CompileError::MissingWeight {
+                            path: path.to_path_buf(),
+                            tensor: en.clone(),
+                        })?;
+                        dt = Some(weight_dtype(&en, t.dtype())?);
+                        buf.extend_from_slice(t.data());
+                    }
+                }
+                let dtype = dt.ok_or_else(|| CompileError::MissingWeight {
+                    path: path.to_path_buf(),
+                    tensor: name.clone(),
+                })?;
+                let expected = shape.iter().product::<usize>();
+                let got = buf.len() / dtype.byte_width();
+                if got != expected {
+                    return Err(CompileError::TensorSizeMismatch {
+                        tensor: name.clone(),
+                        expected,
+                        got,
+                    });
+                }
+                segment.runtime.set_tensor_bytes_by_name(name, &buf, dtype)?;
+                continue;
+            }
             let tensor = tensors
                 .tensor(name)
                 .map_err(|_| CompileError::MissingWeight {

@@ -875,7 +875,15 @@ impl CudaRuntime {
             bucket
                 .intermediate_buffer_dims
                 .extend(spec.bytes.dyn_vars());
-            let bytes = spec.bytes.exec(dyn_dims).unwrap();
+            let bytes = spec.bytes.exec(dyn_dims).unwrap_or_else(|| {
+                panic!(
+                    "buffer byte-size {:?} for node {:?} has unresolved dims {:?}; bound dims={:?}",
+                    spec.bytes,
+                    node,
+                    spec.bytes.dyn_vars(),
+                    dyn_dims
+                )
+            });
             if bytes > 0 {
                 logical_bytes.insert(*node, bytes);
             }

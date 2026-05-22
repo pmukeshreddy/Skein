@@ -71,7 +71,14 @@ pub struct GLUMoE {
     /// Total elements in a single down expert weight matrix
     dn_within_range: Expression,
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
-    module: OnceLock<(Arc<CudaModule>, CudaFunction, CudaFunction)>,
+    #[allow(clippy::type_complexity)]
+    module: OnceLock<(
+        Arc<CudaModule>,
+        CudaFunction,
+        CudaFunction,
+        CudaFunction,
+        CudaFunction,
+    )>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,10 +167,17 @@ impl GLUMoE {
         Ok(created)
     }
 
+    #[allow(clippy::type_complexity)]
     fn get_kernels(
         &self,
         stream: &Arc<CudaStream>,
-    ) -> &(Arc<CudaModule>, CudaFunction, CudaFunction) {
+    ) -> &(
+        Arc<CudaModule>,
+        CudaFunction,
+        CudaFunction,
+        CudaFunction,
+        CudaFunction,
+    ) {
         self.module.get_or_init(|| {
             let src = r#"
 #include <cuda_bf16.h>
@@ -197,12 +211,110 @@ extern "C" __global__ void glu_activation_bf16(
         out[i] = __float2bfloat16(activated * up);
     }
 }
+
+// Fully on-device fused MoE: expert selection (topk_idx) and weighting
+// (topk_vals) are read straight from device memory, so the op never copies
+// indices to the host or issues per-expert GEMMs from a host loop. For decode
+// (seq small) these are GEMVs — memory-bandwidth bound — so a coalesced custom
+// kernel matches cuBLAS while removing the per-layer device->host sync.
+
+// gate_up GEMV + gated activation, fused. One block per (intermediate index o,
+// (token,slot)); the block reduces the gate row and up row dot-products over
+// `hidden`, then writes silu(gate)*up (act_mode 0) / gelu(gate)*up (act_mode 1).
+extern "C" __global__ void moe_gate_up_act(
+    unsigned long long x_bf16_ptr,    // [seq, hidden] bf16
+    unsigned long long topk_idx_ptr,  // [seq, idx_stride] i32
+    unsigned long long gate_up_ptr,   // [E, gate_up_dim, hidden] bf16
+    unsigned long long hid_ptr,       // [seq*top_k, intermediate] bf16
+    int hidden, int intermediate, int gate_up_dim, int top_k, int idx_stride, int seq, int act_mode
+) {
+    int o = blockIdx.x;          // [0, intermediate)
+    int tj = blockIdx.y;         // t*top_k + slot
+    int t = tj / top_k;
+    int slot = tj % top_k;
+    if (t >= seq || o >= intermediate) return;
+    int expert = ((const int*)topk_idx_ptr)[(long long)t * idx_stride + slot];
+    const __nv_bfloat16* x = (const __nv_bfloat16*)x_bf16_ptr + (long long)t * hidden;
+    const __nv_bfloat16* W = (const __nv_bfloat16*)gate_up_ptr + (long long)expert * gate_up_dim * hidden;
+    const __nv_bfloat16* gate_row = W + (long long)o * hidden;
+    const __nv_bfloat16* up_row   = W + (long long)(o + intermediate) * hidden;
+    float gacc = 0.f, uacc = 0.f;
+    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
+        float xv = __bfloat162float(x[h]);
+        gacc += __bfloat162float(gate_row[h]) * xv;
+        uacc += __bfloat162float(up_row[h]) * xv;
+    }
+    __shared__ float sg[256];
+    __shared__ float su[256];
+    sg[threadIdx.x] = gacc; su[threadIdx.x] = uacc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) { sg[threadIdx.x] += sg[threadIdx.x + s]; su[threadIdx.x] += su[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float gate = sg[0], up = su[0];
+        float act;
+        if (act_mode == 0) { act = gate / (1.0f + expf(-gate)); }
+        else { float sc = 1.5957691216f * gate * (1.0f + 0.044715f * gate * gate); act = gate / (1.0f + expf(-sc)); }
+        ((__nv_bfloat16*)hid_ptr)[(long long)tj * intermediate + o] = __float2bfloat16(act * up);
+    }
+}
+
+// down GEMV + weighted combine, fused. One block per (hidden index h, token t);
+// the block reduces each selected expert's down row over `intermediate`, weights
+// it by the (optionally renormalized, optionally per-expert-scaled) topk value,
+// and writes the F32 sum. Mode flags: normalize (mode 2 / gemma), use_scale (gemma).
+extern "C" __global__ void moe_down_combine(
+    unsigned long long hid_ptr,       // [seq*top_k, intermediate] bf16
+    unsigned long long topk_idx_ptr,  // [seq, idx_stride] i32
+    unsigned long long topk_vals_ptr, // [seq, vals_stride] f32
+    unsigned long long scale_ptr,     // [E] f32 (gemma) or unused
+    unsigned long long down_ptr,      // [E, hidden, intermediate] bf16
+    unsigned long long out_ptr,       // [seq, hidden] f32
+    int hidden, int intermediate, int top_k, int idx_stride, int vals_stride, int seq,
+    int normalize, int use_scale
+) {
+    int h = blockIdx.x;          // [0, hidden)
+    int t = blockIdx.y;          // token
+    if (t >= seq || h >= hidden) return;
+    const int* idx = (const int*)topk_idx_ptr;
+    const float* vals = (const float*)topk_vals_ptr;
+    float inv_norm = 1.0f;
+    if (normalize) {
+        float s = 0.f;
+        for (int j = 0; j < top_k; j++) s += vals[(long long)t * vals_stride + j];
+        inv_norm = (s != 0.f) ? (1.0f / s) : 0.f;
+    }
+    __shared__ float sd[256];
+    float out_acc = 0.f;
+    for (int j = 0; j < top_k; j++) {
+        int expert = idx[(long long)t * idx_stride + j];
+        float w = vals[(long long)t * vals_stride + j] * inv_norm;
+        if (use_scale) w *= ((const float*)scale_ptr)[expert];
+        const __nv_bfloat16* D = (const __nv_bfloat16*)down_ptr + (long long)expert * hidden * intermediate + (long long)h * intermediate;
+        const __nv_bfloat16* hd = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k + j) * intermediate;
+        float dot = 0.f;
+        for (int m = threadIdx.x; m < intermediate; m += blockDim.x) dot += __bfloat162float(D[m]) * __bfloat162float(hd[m]);
+        sd[threadIdx.x] = dot;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) sd[threadIdx.x] += sd[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) out_acc += w * sd[0];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
+}
 "#;
             let ptx = compile_module_image_for_current_device(stream.context(), src).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let f32_to_bf16 = module.load_function("f32_to_bf16").unwrap();
             let activation = module.load_function("glu_activation_bf16").unwrap();
-            (module, f32_to_bf16, activation)
+            let gate_up_act = module.load_function("moe_gate_up_act").unwrap();
+            let down_combine = module.load_function("moe_down_combine").unwrap();
+            (module, f32_to_bf16, activation, gate_up_act, down_combine)
         })
     }
 }
@@ -437,135 +549,44 @@ impl HostOp for GLUMoE {
         let down_ptr = buf_ptr(down_buf, stream);
         let output_ptr = buf_ptr(output_buf, stream);
 
-        let cublaslt = self.get_cublaslt(stream)?;
-        let (_, f32_to_bf16_fn, activation_fn) = self.get_kernels(stream);
+        // Fully on-device dispatch: topk_idx / topk_vals stay on the GPU; the
+        // two fused kernels read them directly, so there is NO per-layer
+        // device->host copy and NO host-side per-expert GEMM loop.
+        let kernels = self.get_kernels(stream);
+        let f32_to_bf16_fn = &kernels.1;
+        let gate_up_act_fn = &kernels.3;
+        let down_combine_fn = &kernels.4;
 
-        // Read top-k routing values from GPU
-        let topk_idx_host: Vec<u8> = topk_idx_buf.clone_dtoh(stream)?;
-        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host);
-        let topk_vals_host: Vec<u8> = topk_vals_buf.clone_dtoh(stream)?;
-        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
+        let topk_idx_ptr = buf_ptr(topk_idx_buf, stream);
+        let topk_vals_ptr = buf_ptr(topk_vals_buf, stream);
 
-        if !topk_idx_i32.len().is_multiple_of(seq) {
+        // Row strides come from buffer sizes (no copy of the data itself).
+        let topk_idx_elems = topk_idx_buf.len() / 4;
+        let topk_vals_elems = topk_vals_buf.len() / 4;
+        if seq == 0 || !topk_idx_elems.is_multiple_of(seq) || !topk_vals_elems.is_multiple_of(seq)
+        {
             anyhow::bail!(
-                "GLUMoE topk index element count {} is not divisible by seq {seq}",
-                topk_idx_i32.len()
+                "GLUMoE topk buffers (idx {topk_idx_elems}, vals {topk_vals_elems}) not divisible by seq {seq}"
             );
         }
-        if !topk_vals_f32.len().is_multiple_of(seq) {
+        let idx_stride = topk_idx_elems / seq;
+        let vals_stride = topk_vals_elems / seq;
+        if idx_stride < top_k || vals_stride < top_k {
             anyhow::bail!(
-                "GLUMoE topk value element count {} is not divisible by seq {seq}",
-                topk_vals_f32.len()
+                "GLUMoE topk row stride (idx {idx_stride}, vals {vals_stride}) smaller than top_k {top_k}"
             );
         }
-        let topk_idx_row_stride = topk_idx_i32.len() / seq;
-        let topk_vals_row_stride = topk_vals_f32.len() / seq;
-        if topk_idx_row_stride < top_k {
-            anyhow::bail!(
-                "GLUMoE topk index row stride {topk_idx_row_stride} is smaller than top_k {top_k}"
-            );
-        }
-        if topk_vals_row_stride < top_k {
-            anyhow::bail!(
-                "GLUMoE topk value row stride {topk_vals_row_stride} is smaller than top_k {top_k}"
-            );
-        }
+        let _ = num_experts;
 
-        let topk_idx_at = |token: usize, expert: usize| -> i32 {
-            topk_idx_i32[token * topk_idx_row_stride + expert]
-        };
-        let topk_val_at = |token: usize, expert: usize| -> f32 {
-            topk_vals_f32[token * topk_vals_row_stride + expert]
-        };
-
-        for t in 0..seq {
-            for i in 0..top_k {
-                let expert_idx = topk_idx_at(t, i);
-                if expert_idx < 0 || expert_idx as usize >= num_experts {
-                    anyhow::bail!(
-                        "GLUMoE expert index {expert_idx} at token {t} top-k position {i} out of bounds for {num_experts} experts"
-                    );
-                }
-            }
-        }
-
-        // Mode-dependent expert weights used for the final reduction:
-        // - SwiGLU: direct topk values
-        // - SwiGLUNormalized: normalize topk values row-wise
-        // - GemmaGELU: normalize topk values and scale by per-expert factors
-        let mut expert_weights_storage: Vec<f32> = Vec::new();
-        let expert_weights_f32: &[f32] = match self.mode {
-            GLUMoEMode::SwiGLU => {
-                if topk_vals_row_stride == top_k {
-                    topk_vals_f32
-                } else {
-                    expert_weights_storage.resize(seq * top_k, 0.0);
-                    for t in 0..seq {
-                        for i in 0..top_k {
-                            expert_weights_storage[t * top_k + i] = topk_val_at(t, i);
-                        }
-                    }
-                    &expert_weights_storage
-                }
-            }
-            GLUMoEMode::SwiGLUNormalized => {
-                expert_weights_storage.resize(seq * top_k, 0.0);
-                for t in 0..seq {
-                    let norm = (0..top_k).map(|i| topk_val_at(t, i)).sum::<f32>();
-                    let inv_norm = if norm != 0.0 { norm.recip() } else { 0.0 };
-                    for i in 0..top_k {
-                        expert_weights_storage[t * top_k + i] = topk_val_at(t, i) * inv_norm;
-                    }
-                }
-                &expert_weights_storage
-            }
-            GLUMoEMode::GemmaGELU => {
-                let per_expert_scale_host: Vec<u8> = mode_aux_buf.clone_dtoh(stream)?;
-                let per_expert_scale_bytes = num_experts * 4;
-                if per_expert_scale_host.len() < per_expert_scale_bytes {
-                    anyhow::bail!(
-                        "GLUMoE per-expert scale buffer too small: have {} bytes, need {per_expert_scale_bytes}",
-                        per_expert_scale_host.len()
-                    );
-                }
-                let per_expert_scale_f32: &[f32] =
-                    bytemuck::cast_slice(&per_expert_scale_host[..per_expert_scale_bytes]);
-                expert_weights_storage.resize(seq * top_k, 0.0);
-                for t in 0..seq {
-                    let norm = (0..top_k).map(|i| topk_val_at(t, i)).sum::<f32>();
-                    let inv_norm = if norm != 0.0 { norm.recip() } else { 0.0 };
-                    for i in 0..top_k {
-                        let expert_idx = topk_idx_at(t, i) as usize;
-                        if expert_idx >= per_expert_scale_f32.len() {
-                            anyhow::bail!(
-                                "GLUMoE Gemma mode expert index {} out of bounds {}",
-                                expert_idx,
-                                per_expert_scale_f32.len()
-                            );
-                        }
-                        let scale = per_expert_scale_f32[expert_idx];
-                        expert_weights_storage[t * top_k + i] =
-                            topk_val_at(t, i) * inv_norm * scale;
-                    }
-                }
-                &expert_weights_storage
-            }
-        };
-
-        // Allocate temp buffers
-        let x_bf16_buf = unsafe { stream.alloc::<u8>(seq * hidden * 2)? }; // BF16
-        let gate_up_out_buf = unsafe { stream.alloc::<u8>(gate_up_dim * 2)? }; // BF16 per-token
-        let hidden_tmp = unsafe { stream.alloc::<u8>(intermediate * 2)? }; // BF16
-        let workspace = unsafe { stream.alloc::<u8>(WORKSPACE_SIZE)? };
-
+        // Scratch: x as bf16 [seq, hidden]; gated hidden [seq*top_k, intermediate] bf16.
+        let x_bf16_buf = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
+        let hid_buf = unsafe { stream.alloc::<u8>(seq * top_k * intermediate * 2)? };
         let xbf16_ptr = slice_ptr(&x_bf16_buf, stream);
-        let gu_out_ptr = slice_ptr(&gate_up_out_buf, stream);
-        let hid_ptr = slice_ptr(&hidden_tmp, stream);
-        let ws_ptr = slice_ptr(&workspace, stream);
+        let hid_ptr = slice_ptr(&hid_buf, stream);
 
-        // Cast x F32 → BF16
+        // x F32 -> BF16.
         let n_cast = (seq * hidden) as i32;
-        let blocks = (n_cast as u32).div_ceil(256);
+        let cast_blocks = (n_cast as u32).div_ceil(256);
         unsafe {
             stream
                 .launch_builder(f32_to_bf16_fn)
@@ -573,91 +594,79 @@ impl HostOp for GLUMoE {
                 .arg(&xbf16_ptr)
                 .arg(&n_cast)
                 .launch(LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
+                    grid_dim: (cast_blocks, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
         }
 
-        // Per-token expert computation
-        let gu_stride = gu_stride_bytes as u64; // bytes per expert gate_up (BF16)
-        let down_stride = down_stride_bytes as u64; // bytes per expert down (BF16)
+        let act_mode: i32 = self.mode.activation_kernel_mode();
+        let normalize: i32 = match self.mode {
+            GLUMoEMode::SwiGLU => 0,
+            GLUMoEMode::SwiGLUNormalized | GLUMoEMode::GemmaGELU => 1,
+        };
+        let use_scale: i32 = matches!(self.mode, GLUMoEMode::GemmaGELU) as i32;
+        let scale_ptr: u64 = if use_scale == 1 {
+            buf_ptr(mode_aux_buf, stream)
+        } else {
+            0
+        };
 
-        for t in 0..seq {
-            let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64; // BF16
-            let weights = &expert_weights_f32[t * top_k..(t + 1) * top_k];
+        let hidden_i = hidden as i32;
+        let intermediate_i = intermediate as i32;
+        let gate_up_dim_i = gate_up_dim as i32;
+        let top_k_i = top_k as i32;
+        let idx_stride_i = idx_stride as i32;
+        let vals_stride_i = vals_stride as i32;
+        let seq_i = seq as i32;
 
-            for (i, &weight) in weights.iter().enumerate() {
-                let expert_idx = topk_idx_at(t, i) as usize;
-
-                // a. Gate+Up matmul (BF16 in, BF16 out)
-                let expert_gu_ptr = gate_up_ptr + expert_idx as u64 * gu_stride;
-                cublas_matmul(
-                    stream,
-                    &cublaslt,
-                    ws_ptr,
-                    gate_up_dim as u64,
-                    1,
-                    hidden as u64,
-                    expert_gu_ptr,
-                    cublasOperation_t::CUBLAS_OP_T,
-                    hidden as i64,
-                    x_t_ptr,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    hidden as i64,
-                    gu_out_ptr,
-                    gate_up_dim as i64,
-                    cudaDataType::CUDA_R_16BF,
-                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    1.0f32,
-                    0.0f32,
-                )?;
-
-                // b. Mode-specific gated activation (BF16 → BF16)
-                let moe_int = intermediate as i32;
-                let activation_mode = self.mode.activation_kernel_mode();
-                let activation_blocks = (moe_int as u32).div_ceil(256);
-                unsafe {
-                    stream
-                        .launch_builder(activation_fn)
-                        .arg(&gu_out_ptr)
-                        .arg(&hid_ptr)
-                        .arg(&moe_int)
-                        .arg(&activation_mode)
-                        .launch(LaunchConfig {
-                            grid_dim: (activation_blocks, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        })?;
-                }
-
-                // c. Down matmul (BF16 in → F32 out) with fused accumulate
-                let expert_down_ptr = down_ptr + expert_idx as u64 * down_stride;
-                let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
-
-                let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
-                cublas_matmul_mixed(
-                    stream,
-                    &cublaslt,
-                    ws_ptr,
-                    hidden as u64,
-                    1,
-                    intermediate as u64,
-                    expert_down_ptr,
-                    cublasOperation_t::CUBLAS_OP_T,
-                    intermediate as i64,
-                    hid_ptr,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    intermediate as i64,
-                    out_t_ptr,
-                    hidden as i64,
-                    weight,
-                    beta,
-                )?;
-            }
+        // gate_up GEMV + gated activation. Grid: (intermediate, seq*top_k).
+        unsafe {
+            stream
+                .launch_builder(gate_up_act_fn)
+                .arg(&xbf16_ptr)
+                .arg(&topk_idx_ptr)
+                .arg(&gate_up_ptr)
+                .arg(&hid_ptr)
+                .arg(&hidden_i)
+                .arg(&intermediate_i)
+                .arg(&gate_up_dim_i)
+                .arg(&top_k_i)
+                .arg(&idx_stride_i)
+                .arg(&seq_i)
+                .arg(&act_mode)
+                .launch(LaunchConfig {
+                    grid_dim: (intermediate as u32, (seq * top_k) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
 
-        stream.synchronize()?;
+        // down GEMV + weighted combine. Grid: (hidden, seq).
+        unsafe {
+            stream
+                .launch_builder(down_combine_fn)
+                .arg(&hid_ptr)
+                .arg(&topk_idx_ptr)
+                .arg(&topk_vals_ptr)
+                .arg(&scale_ptr)
+                .arg(&down_ptr)
+                .arg(&output_ptr)
+                .arg(&hidden_i)
+                .arg(&intermediate_i)
+                .arg(&top_k_i)
+                .arg(&idx_stride_i)
+                .arg(&vals_stride_i)
+                .arg(&seq_i)
+                .arg(&normalize)
+                .arg(&use_scale)
+                .launch(LaunchConfig {
+                    grid_dim: (hidden as u32, seq as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+
         Ok(())
     }
 
