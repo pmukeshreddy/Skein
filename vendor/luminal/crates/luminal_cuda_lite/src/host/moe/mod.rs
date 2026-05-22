@@ -221,6 +221,8 @@ extern "C" __global__ void glu_activation_bf16(
 // gate_up GEMV + gated activation, fused. One block per (intermediate index o,
 // (token,slot)); the block reduces the gate row and up row dot-products over
 // `hidden`, then writes silu(gate)*up (act_mode 0) / gelu(gate)*up (act_mode 1).
+// gate_up GEMV + gated activation, fused. float4 (8 bf16) vectorized loads +
+// warp-shuffle reduction. One block per (intermediate o, (token,slot)).
 extern "C" __global__ void moe_gate_up_act(
     unsigned long long x_bf16_ptr,    // [seq, hidden] bf16
     unsigned long long topk_idx_ptr,  // [seq, idx_stride] i32
@@ -228,8 +230,8 @@ extern "C" __global__ void moe_gate_up_act(
     unsigned long long hid_ptr,       // [seq*top_k, intermediate] bf16
     int hidden, int intermediate, int gate_up_dim, int top_k, int idx_stride, int seq, int act_mode
 ) {
-    int o = blockIdx.x;          // [0, intermediate)
-    int tj = blockIdx.y;         // t*top_k + slot
+    int o = blockIdx.x;
+    int tj = blockIdx.y;
     int t = tj / top_k;
     int slot = tj % top_k;
     if (t >= seq || o >= intermediate) return;
@@ -238,33 +240,44 @@ extern "C" __global__ void moe_gate_up_act(
     const __nv_bfloat16* W = (const __nv_bfloat16*)gate_up_ptr + (long long)expert * gate_up_dim * hidden;
     const __nv_bfloat16* gate_row = W + (long long)o * hidden;
     const __nv_bfloat16* up_row   = W + (long long)(o + intermediate) * hidden;
+
     float gacc = 0.f, uacc = 0.f;
-    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-        float xv = __bfloat162float(x[h]);
-        gacc += __bfloat162float(gate_row[h]) * xv;
-        uacc += __bfloat162float(up_row[h]) * xv;
+    int n4 = hidden >> 3;
+    const float4* xp = (const float4*)x;
+    const float4* gp = (const float4*)gate_row;
+    const float4* upp = (const float4*)up_row;
+    for (int j = threadIdx.x; j < n4; j += blockDim.x) {
+        float4 xb = xp[j], gb = gp[j], ub = upp[j];
+        const __nv_bfloat16* xh = (const __nv_bfloat16*)&xb;
+        const __nv_bfloat16* gh = (const __nv_bfloat16*)&gb;
+        const __nv_bfloat16* uh = (const __nv_bfloat16*)&ub;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) { float xf = __bfloat162float(xh[e]); gacc += __bfloat162float(gh[e]) * xf; uacc += __bfloat162float(uh[e]) * xf; }
     }
-    __shared__ float sg[256];
-    __shared__ float su[256];
-    sg[threadIdx.x] = gacc; su[threadIdx.x] = uacc;
+    for (int j = n4 * 8 + (int)threadIdx.x; j < hidden; j += blockDim.x) {
+        float xf = __bfloat162float(x[j]); gacc += __bfloat162float(gate_row[j]) * xf; uacc += __bfloat162float(up_row[j]) * xf;
+    }
+    for (int s = 16; s > 0; s >>= 1) { gacc += __shfl_down_sync(0xffffffffu, gacc, s); uacc += __shfl_down_sync(0xffffffffu, uacc, s); }
+    __shared__ float sg[32];
+    __shared__ float su[32];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    if (lane == 0) { sg[warp] = gacc; su[warp] = uacc; }
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { sg[threadIdx.x] += sg[threadIdx.x + s]; su[threadIdx.x] += su[threadIdx.x + s]; }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        float gate = sg[0], up = su[0];
-        float act;
-        if (act_mode == 0) { act = gate / (1.0f + expf(-gate)); }
-        else { float sc = 1.5957691216f * gate * (1.0f + 0.044715f * gate * gate); act = gate / (1.0f + expf(-sc)); }
-        ((__nv_bfloat16*)hid_ptr)[(long long)tj * intermediate + o] = __float2bfloat16(act * up);
+    if (warp == 0) {
+        gacc = (lane < nwarp) ? sg[lane] : 0.f;
+        uacc = (lane < nwarp) ? su[lane] : 0.f;
+        for (int s = 16; s > 0; s >>= 1) { gacc += __shfl_down_sync(0xffffffffu, gacc, s); uacc += __shfl_down_sync(0xffffffffu, uacc, s); }
+        if (lane == 0) {
+            float gate = gacc, up = uacc, act;
+            if (act_mode == 0) { act = gate / (1.0f + expf(-gate)); }
+            else { float sc = 1.5957691216f * gate * (1.0f + 0.044715f * gate * gate); act = gate / (1.0f + expf(-sc)); }
+            ((__nv_bfloat16*)hid_ptr)[(long long)tj * intermediate + o] = __float2bfloat16(act * up);
+        }
     }
 }
 
-// down GEMV + weighted combine, fused. One block per (hidden index h, token t);
-// the block reduces each selected expert's down row over `intermediate`, weights
-// it by the (optionally renormalized, optionally per-expert-scaled) topk value,
-// and writes the F32 sum. Mode flags: normalize (mode 2 / gemma), use_scale (gemma).
+// down GEMV + weighted combine, fused. float4 vectorized loads + warp-shuffle.
+// One block per (hidden h, token t); loops the selected experts.
 extern "C" __global__ void moe_down_combine(
     unsigned long long hid_ptr,       // [seq*top_k, intermediate] bf16
     unsigned long long topk_idx_ptr,  // [seq, idx_stride] i32
@@ -275,34 +288,46 @@ extern "C" __global__ void moe_down_combine(
     int hidden, int intermediate, int top_k, int idx_stride, int vals_stride, int seq,
     int normalize, int use_scale
 ) {
-    int h = blockIdx.x;          // [0, hidden)
-    int t = blockIdx.y;          // token
+    int h = blockIdx.x;
+    int t = blockIdx.y;
     if (t >= seq || h >= hidden) return;
     const int* idx = (const int*)topk_idx_ptr;
     const float* vals = (const float*)topk_vals_ptr;
     float inv_norm = 1.0f;
     if (normalize) {
-        float s = 0.f;
-        for (int j = 0; j < top_k; j++) s += vals[(long long)t * vals_stride + j];
-        inv_norm = (s != 0.f) ? (1.0f / s) : 0.f;
+        float ssum = 0.f;
+        for (int j = 0; j < top_k; j++) ssum += vals[(long long)t * vals_stride + j];
+        inv_norm = (ssum != 0.f) ? (1.0f / ssum) : 0.f;
     }
-    __shared__ float sd[256];
+    int n4 = intermediate >> 3;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    __shared__ float sd[32];
     float out_acc = 0.f;
-    for (int j = 0; j < top_k; j++) {
-        int expert = idx[(long long)t * idx_stride + j];
-        float w = vals[(long long)t * vals_stride + j] * inv_norm;
+    for (int jx = 0; jx < top_k; jx++) {
+        int expert = idx[(long long)t * idx_stride + jx];
+        float w = vals[(long long)t * vals_stride + jx] * inv_norm;
         if (use_scale) w *= ((const float*)scale_ptr)[expert];
         const __nv_bfloat16* D = (const __nv_bfloat16*)down_ptr + (long long)expert * hidden * intermediate + (long long)h * intermediate;
-        const __nv_bfloat16* hd = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k + j) * intermediate;
+        const __nv_bfloat16* hd = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k + jx) * intermediate;
+        const float4* dp = (const float4*)D;
+        const float4* hp = (const float4*)hd;
         float dot = 0.f;
-        for (int m = threadIdx.x; m < intermediate; m += blockDim.x) dot += __bfloat162float(D[m]) * __bfloat162float(hd[m]);
-        sd[threadIdx.x] = dot;
-        __syncthreads();
-        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-            if (threadIdx.x < s) sd[threadIdx.x] += sd[threadIdx.x + s];
-            __syncthreads();
+        for (int j = threadIdx.x; j < n4; j += blockDim.x) {
+            float4 db = dp[j], hb = hp[j];
+            const __nv_bfloat16* dh = (const __nv_bfloat16*)&db;
+            const __nv_bfloat16* hh = (const __nv_bfloat16*)&hb;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) dot += __bfloat162float(dh[e]) * __bfloat162float(hh[e]);
         }
-        if (threadIdx.x == 0) out_acc += w * sd[0];
+        for (int j = n4 * 8 + (int)threadIdx.x; j < intermediate; j += blockDim.x) dot += __bfloat162float(D[j]) * __bfloat162float(hd[j]);
+        for (int s = 16; s > 0; s >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, s);
+        if (lane == 0) sd[warp] = dot;
+        __syncthreads();
+        if (warp == 0) {
+            float r = (lane < nwarp) ? sd[lane] : 0.f;
+            for (int s = 16; s > 0; s >>= 1) r += __shfl_down_sync(0xffffffffu, r, s);
+            if (lane == 0) out_acc += w * r;
+        }
         __syncthreads();
     }
     if (threadIdx.x == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
