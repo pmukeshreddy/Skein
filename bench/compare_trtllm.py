@@ -108,8 +108,11 @@ def run_skein(artifact: str, prompt: str, max_new_tokens: int, tp: int,
         once()  # populate cubin cache / capture CUDA graphs
     log = once()
     m = None
+    # serve's tracing layer emits ANSI color codes (e.g. \x1b[3mttft_ms\x1b[0m=...)
+    # which sit between the field name and value; strip them before matching.
+    ansi = re.compile(r"\x1b\[[0-9;]*m")
     for line in log.splitlines():
-        mm = SKEIN_PERF_RE.search(line)
+        mm = SKEIN_PERF_RE.search(ansi.sub("", line))
         if mm:
             m = mm
     if not m:
