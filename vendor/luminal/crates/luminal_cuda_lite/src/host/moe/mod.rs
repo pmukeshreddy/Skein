@@ -78,7 +78,23 @@ pub struct GLUMoE {
         CudaFunction,
         CudaFunction,
         CudaFunction,
+        CudaFunction, // quantize_fp8_rows
+        CudaFunction, // moe_gate_up_act_fp8
+        CudaFunction, // moe_down_combine_fp8
     )>,
+    /// fp8 (E4M3) weight cache (SKEIN_MOE_FP8): raw device pointers to the
+    /// quantized resident expert weights + per-row scales. Computed once on the
+    /// first execute and leaked (resident for the process, like the bf16 weights).
+    fp8: OnceLock<Fp8Weights>,
+}
+
+/// Raw device pointers to the fp8-quantized expert weights and per-row scales.
+#[derive(Clone, Copy)]
+struct Fp8Weights {
+    gate_up_ptr: u64,
+    gate_up_scale_ptr: u64,
+    down_ptr: u64,
+    down_scale_ptr: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +137,7 @@ impl Default for GLUMoE {
             dn_within_range: Expression::default(),
             cublaslt: OnceLock::new(),
             module: OnceLock::new(),
+            fp8: OnceLock::new(),
         }
     }
 }
@@ -151,6 +168,7 @@ impl Clone for GLUMoE {
             dn_within_range: self.dn_within_range,
             cublaslt: OnceLock::new(),
             module: OnceLock::new(),
+            fp8: OnceLock::new(),
         }
     }
 }
@@ -177,10 +195,14 @@ impl GLUMoE {
         CudaFunction,
         CudaFunction,
         CudaFunction,
+        CudaFunction,
+        CudaFunction,
+        CudaFunction,
     ) {
         self.module.get_or_init(|| {
             let src = r#"
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 extern "C" __global__ void f32_to_bf16(unsigned long long in_ptr, unsigned long long out_ptr, int n) {
     const float* in_ = (const float*)in_ptr;
@@ -332,6 +354,145 @@ extern "C" __global__ void moe_down_combine(
     }
     if (threadIdx.x == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
 }
+
+// ---- fp8 (E4M3) weight-only path (SKEIN_MOE_FP8) ----
+// Quantize a [n_rows, row_len] bf16 matrix to fp8 E4M3 with one scale per row
+// (scale = rowmax/448). One block per row.
+extern "C" __global__ void quantize_fp8_rows(
+    unsigned long long bf16_ptr, unsigned long long fp8_ptr, unsigned long long scale_ptr,
+    int n_rows, int row_len
+) {
+    int row = blockIdx.x;
+    if (row >= n_rows) return;
+    const __nv_bfloat16* w = (const __nv_bfloat16*)bf16_ptr + (long long)row * row_len;
+    float m = 0.f;
+    for (int j = threadIdx.x; j < row_len; j += blockDim.x) m = fmaxf(m, fabsf(__bfloat162float(w[j])));
+    for (int s = 16; s > 0; s >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, s));
+    __shared__ float sm[32];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    if (lane == 0) sm[warp] = m;
+    __syncthreads();
+    if (warp == 0) {
+        m = (lane < nwarp) ? sm[lane] : 0.f;
+        for (int s = 16; s > 0; s >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, s));
+        if (lane == 0) { float sc = (m > 0.f) ? (m / 448.0f) : 1.0f; sm[0] = sc; ((float*)scale_ptr)[row] = sc; }
+    }
+    __syncthreads();
+    float inv = 1.0f / sm[0];
+    unsigned char* out = (unsigned char*)fp8_ptr + (long long)row * row_len;
+    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
+        out[j] = __nv_fp8_e4m3(__bfloat162float(w[j]) * inv).__x;
+    }
+}
+
+extern "C" __global__ void moe_gate_up_act_fp8(
+    unsigned long long x_bf16_ptr, unsigned long long topk_idx_ptr,
+    unsigned long long gate_up_ptr, unsigned long long gate_up_scale_ptr, unsigned long long hid_ptr,
+    int hidden, int intermediate, int gate_up_dim, int top_k, int idx_stride, int seq, int act_mode
+) {
+    int o = blockIdx.x;
+    int tj = blockIdx.y;
+    int t = tj / top_k, slot = tj % top_k;
+    if (t >= seq || o >= intermediate) return;
+    int expert = ((const int*)topk_idx_ptr)[(long long)t * idx_stride + slot];
+    const __nv_bfloat16* x = (const __nv_bfloat16*)x_bf16_ptr + (long long)t * hidden;
+    const unsigned char* W = (const unsigned char*)gate_up_ptr + (long long)expert * gate_up_dim * hidden;
+    const unsigned char* gate_row = W + (long long)o * hidden;
+    const unsigned char* up_row   = W + (long long)(o + intermediate) * hidden;
+    const float* sc = (const float*)gate_up_scale_ptr + (long long)expert * gate_up_dim;
+    float gscale = sc[o], uscale = sc[o + intermediate];
+    float gacc = 0.f, uacc = 0.f;
+    int n16 = hidden >> 4;
+    const uint4* gp4 = (const uint4*)gate_row;
+    const uint4* up4 = (const uint4*)up_row;
+    for (int j = threadIdx.x; j < n16; j += blockDim.x) {
+        uint4 gw = gp4[j], uw = up4[j];
+        const __nv_fp8_e4m3* gh = (const __nv_fp8_e4m3*)&gw;
+        const __nv_fp8_e4m3* uh = (const __nv_fp8_e4m3*)&uw;
+        int b = j << 4;
+        #pragma unroll
+        for (int e = 0; e < 16; e++) { float xf = __bfloat162float(x[b + e]); gacc += (float)gh[e] * xf; uacc += (float)uh[e] * xf; }
+    }
+    for (int j = (n16 << 4) + (int)threadIdx.x; j < hidden; j += blockDim.x) {
+        float xf = __bfloat162float(x[j]);
+        __nv_fp8_e4m3 gq; gq.__x = gate_row[j];
+        __nv_fp8_e4m3 uq; uq.__x = up_row[j];
+        gacc += (float)gq * xf;
+        uacc += (float)uq * xf;
+    }
+    for (int s = 16; s > 0; s >>= 1) { gacc += __shfl_down_sync(0xffffffffu, gacc, s); uacc += __shfl_down_sync(0xffffffffu, uacc, s); }
+    __shared__ float sg[32];
+    __shared__ float su[32];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    if (lane == 0) { sg[warp] = gacc; su[warp] = uacc; }
+    __syncthreads();
+    if (warp == 0) {
+        gacc = (lane < nwarp) ? sg[lane] : 0.f;
+        uacc = (lane < nwarp) ? su[lane] : 0.f;
+        for (int s = 16; s > 0; s >>= 1) { gacc += __shfl_down_sync(0xffffffffu, gacc, s); uacc += __shfl_down_sync(0xffffffffu, uacc, s); }
+        if (lane == 0) {
+            float gate = gacc * gscale, up = uacc * uscale, act;
+            if (act_mode == 0) { act = gate / (1.0f + expf(-gate)); }
+            else { float scx = 1.5957691216f * gate * (1.0f + 0.044715f * gate * gate); act = gate / (1.0f + expf(-scx)); }
+            ((__nv_bfloat16*)hid_ptr)[(long long)tj * intermediate + o] = __float2bfloat16(act * up);
+        }
+    }
+}
+
+extern "C" __global__ void moe_down_combine_fp8(
+    unsigned long long hid_ptr, unsigned long long topk_idx_ptr, unsigned long long topk_vals_ptr,
+    unsigned long long scale_ptr, unsigned long long down_ptr, unsigned long long down_scale_ptr,
+    unsigned long long out_ptr,
+    int hidden, int intermediate, int top_k, int idx_stride, int vals_stride, int seq,
+    int normalize, int use_scale
+) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    if (t >= seq || h >= hidden) return;
+    const int* idx = (const int*)topk_idx_ptr;
+    const float* vals = (const float*)topk_vals_ptr;
+    float inv_norm = 1.0f;
+    if (normalize) {
+        float ssum = 0.f;
+        for (int j = 0; j < top_k; j++) ssum += vals[(long long)t * vals_stride + j];
+        inv_norm = (ssum != 0.f) ? (1.0f / ssum) : 0.f;
+    }
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    __shared__ float sd[32];
+    float out_acc = 0.f;
+    for (int jx = 0; jx < top_k; jx++) {
+        int expert = idx[(long long)t * idx_stride + jx];
+        float w = vals[(long long)t * vals_stride + jx] * inv_norm;
+        if (use_scale) w *= ((const float*)scale_ptr)[expert];
+        const unsigned char* D = (const unsigned char*)down_ptr + (long long)expert * hidden * intermediate + (long long)h * intermediate;
+        const __nv_bfloat16* hd = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k + jx) * intermediate;
+        float dscale = ((const float*)down_scale_ptr)[(long long)expert * hidden + h];
+        float dot = 0.f;
+        int n16 = intermediate >> 4;
+        const uint4* dp4 = (const uint4*)D;
+        for (int j = threadIdx.x; j < n16; j += blockDim.x) {
+            uint4 dw = dp4[j];
+            const __nv_fp8_e4m3* dh = (const __nv_fp8_e4m3*)&dw;
+            int b = j << 4;
+            #pragma unroll
+            for (int e = 0; e < 16; e++) dot += (float)dh[e] * __bfloat162float(hd[b + e]);
+        }
+        for (int j = (n16 << 4) + (int)threadIdx.x; j < intermediate; j += blockDim.x) {
+            __nv_fp8_e4m3 dq; dq.__x = D[j];
+            dot += (float)dq * __bfloat162float(hd[j]);
+        }
+        for (int s = 16; s > 0; s >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, s);
+        if (lane == 0) sd[warp] = dot;
+        __syncthreads();
+        if (warp == 0) {
+            float r = (lane < nwarp) ? sd[lane] : 0.f;
+            for (int s = 16; s > 0; s >>= 1) r += __shfl_down_sync(0xffffffffu, r, s);
+            if (lane == 0) out_acc += w * dscale * r;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
+}
 "#;
             let ptx = compile_module_image_for_current_device(stream.context(), src).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
@@ -339,7 +500,19 @@ extern "C" __global__ void moe_down_combine(
             let activation = module.load_function("glu_activation_bf16").unwrap();
             let gate_up_act = module.load_function("moe_gate_up_act").unwrap();
             let down_combine = module.load_function("moe_down_combine").unwrap();
-            (module, f32_to_bf16, activation, gate_up_act, down_combine)
+            let quant_fp8 = module.load_function("quantize_fp8_rows").unwrap();
+            let gate_up_act_fp8 = module.load_function("moe_gate_up_act_fp8").unwrap();
+            let down_combine_fp8 = module.load_function("moe_down_combine_fp8").unwrap();
+            (
+                module,
+                f32_to_bf16,
+                activation,
+                gate_up_act,
+                down_combine,
+                quant_fp8,
+                gate_up_act_fp8,
+                down_combine_fp8,
+            )
         })
     }
 }
@@ -415,6 +588,7 @@ impl EgglogOp for GLUMoE {
             dn_within_range,
             cublaslt: OnceLock::new(),
             module: OnceLock::new(),
+            fp8: OnceLock::new(),
         };
 
         let op = LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>);
@@ -601,7 +775,56 @@ impl HostOp for GLUMoE {
                 "GLUMoE topk row stride (idx {idx_stride}, vals {vals_stride}) smaller than top_k {top_k}"
             );
         }
-        let _ = num_experts;
+        // fp8 (SKEIN_MOE_FP8): quantize the resident bf16 expert weights to E4M3
+        // with per-output-row scales ONCE (cached + leaked), halving the weight
+        // bytes the decode GEMVs read.
+        let use_fp8 = std::env::var_os("SKEIN_MOE_FP8").is_some();
+        let fp8w: Option<Fp8Weights> = if use_fp8 {
+            let quant_fn = kernels.5.clone();
+            Some(*self.fp8.get_or_init(|| {
+                let gu_rows = num_experts * gate_up_dim;
+                let dn_rows = num_experts * hidden;
+                let gu_fp8 = unsafe { stream.alloc::<u8>(num_experts * gate_up_dim * hidden).unwrap() };
+                let gu_scale = unsafe { stream.alloc::<u8>(gu_rows * 4).unwrap() };
+                let dn_fp8 = unsafe { stream.alloc::<u8>(num_experts * hidden * intermediate).unwrap() };
+                let dn_scale = unsafe { stream.alloc::<u8>(dn_rows * 4).unwrap() };
+                let gu_fp8_ptr = slice_ptr(&gu_fp8, stream);
+                let gu_scale_ptr = slice_ptr(&gu_scale, stream);
+                let dn_fp8_ptr = slice_ptr(&dn_fp8, stream);
+                let dn_scale_ptr = slice_ptr(&dn_scale, stream);
+                let gu_rows_i = gu_rows as i32;
+                let hidden_i = hidden as i32;
+                let dn_rows_i = dn_rows as i32;
+                let inter_i = intermediate as i32;
+                unsafe {
+                    stream
+                        .launch_builder(&quant_fn)
+                        .arg(&gate_up_ptr).arg(&gu_fp8_ptr).arg(&gu_scale_ptr)
+                        .arg(&gu_rows_i).arg(&hidden_i)
+                        .launch(LaunchConfig { grid_dim: (gu_rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                        .unwrap();
+                    stream
+                        .launch_builder(&quant_fn)
+                        .arg(&down_ptr).arg(&dn_fp8_ptr).arg(&dn_scale_ptr)
+                        .arg(&dn_rows_i).arg(&inter_i)
+                        .launch(LaunchConfig { grid_dim: (dn_rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                        .unwrap();
+                }
+                stream.synchronize().unwrap();
+                std::mem::forget(gu_fp8);
+                std::mem::forget(gu_scale);
+                std::mem::forget(dn_fp8);
+                std::mem::forget(dn_scale);
+                Fp8Weights {
+                    gate_up_ptr: gu_fp8_ptr,
+                    gate_up_scale_ptr: gu_scale_ptr,
+                    down_ptr: dn_fp8_ptr,
+                    down_scale_ptr: dn_scale_ptr,
+                }
+            }))
+        } else {
+            None
+        };
 
         // Scratch: x as bf16 [seq, hidden]; gated hidden [seq*top_k, intermediate] bf16.
         let x_bf16_buf = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
@@ -646,50 +869,57 @@ impl HostOp for GLUMoE {
         let seq_i = seq as i32;
 
         // gate_up GEMV + gated activation. Grid: (intermediate, seq*top_k).
+        let grid_gu = LaunchConfig {
+            grid_dim: (intermediate as u32, (seq * top_k) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
-            stream
-                .launch_builder(gate_up_act_fn)
-                .arg(&xbf16_ptr)
-                .arg(&topk_idx_ptr)
-                .arg(&gate_up_ptr)
-                .arg(&hid_ptr)
-                .arg(&hidden_i)
-                .arg(&intermediate_i)
-                .arg(&gate_up_dim_i)
-                .arg(&top_k_i)
-                .arg(&idx_stride_i)
-                .arg(&seq_i)
-                .arg(&act_mode)
-                .launch(LaunchConfig {
-                    grid_dim: (intermediate as u32, (seq * top_k) as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+            if let Some(f8) = fp8w {
+                let gu_w = f8.gate_up_ptr;
+                let gu_s = f8.gate_up_scale_ptr;
+                stream
+                    .launch_builder(&kernels.6)
+                    .arg(&xbf16_ptr).arg(&topk_idx_ptr).arg(&gu_w).arg(&gu_s).arg(&hid_ptr)
+                    .arg(&hidden_i).arg(&intermediate_i).arg(&gate_up_dim_i).arg(&top_k_i)
+                    .arg(&idx_stride_i).arg(&seq_i).arg(&act_mode)
+                    .launch(grid_gu)?;
+            } else {
+                stream
+                    .launch_builder(gate_up_act_fn)
+                    .arg(&xbf16_ptr).arg(&topk_idx_ptr).arg(&gate_up_ptr).arg(&hid_ptr)
+                    .arg(&hidden_i).arg(&intermediate_i).arg(&gate_up_dim_i).arg(&top_k_i)
+                    .arg(&idx_stride_i).arg(&seq_i).arg(&act_mode)
+                    .launch(grid_gu)?;
+            }
         }
 
         // down GEMV + weighted combine. Grid: (hidden, seq).
+        let grid_dn = LaunchConfig {
+            grid_dim: (hidden as u32, seq as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
-            stream
-                .launch_builder(down_combine_fn)
-                .arg(&hid_ptr)
-                .arg(&topk_idx_ptr)
-                .arg(&topk_vals_ptr)
-                .arg(&scale_ptr)
-                .arg(&down_ptr)
-                .arg(&output_ptr)
-                .arg(&hidden_i)
-                .arg(&intermediate_i)
-                .arg(&top_k_i)
-                .arg(&idx_stride_i)
-                .arg(&vals_stride_i)
-                .arg(&seq_i)
-                .arg(&normalize)
-                .arg(&use_scale)
-                .launch(LaunchConfig {
-                    grid_dim: (hidden as u32, seq as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+            if let Some(f8) = fp8w {
+                let dn_w = f8.down_ptr;
+                let dn_s = f8.down_scale_ptr;
+                stream
+                    .launch_builder(&kernels.7)
+                    .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr)
+                    .arg(&dn_w).arg(&dn_s).arg(&output_ptr)
+                    .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
+                    .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
+                    .launch(grid_dn)?;
+            } else {
+                stream
+                    .launch_builder(down_combine_fn)
+                    .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr)
+                    .arg(&down_ptr).arg(&output_ptr)
+                    .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
+                    .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
+                    .launch(grid_dn)?;
+            }
         }
 
         Ok(())
