@@ -234,6 +234,16 @@ impl ComputeRuntime for NativeComputeRuntime {
 #[cfg(feature = "cuda")]
 pub use cuda_impl::CudaComputeRuntime;
 
+/// Real per-segment CUDA-graph activity from the Luminal `CudaGraphOp` execution
+/// path: `(graph_instantiations, graph_launches)` since process start. These come
+/// from the actual `cuGraphInstantiate` / `cuGraphLaunch` call sites in
+/// `luminal_cuda_lite`, so the runtime can report — and prove — that the model's
+/// kernel CUDA graphs really build once and replay on every later forward.
+#[cfg(feature = "cuda")]
+pub fn cuda_graph_exec_stats() -> (u64, u64) {
+    luminal_cuda_lite::kernel::graph_exec_stats()
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;

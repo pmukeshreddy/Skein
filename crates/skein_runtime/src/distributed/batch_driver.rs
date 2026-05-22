@@ -1,5 +1,7 @@
 //! `ContinuousBatchDriver` — single-process continuous-batching execution over
-//! paged KV, with optional CUDA-graph decode replay.
+//! paged KV. The per-segment kernel CUDA graphs are Luminal's `CudaGraphOp`
+//! (built once, replayed via `cuGraphLaunch` every forward); the driver reports
+//! the real instantiate/launch counts from Luminal's counters.
 //!
 //! This is the execution driver the [`ContinuousBatcher`] drives. It owns all
 //! devices' paged [`SegmentRunner`]s (via [`LocalTopology`]) and runs the tp=2
@@ -17,9 +19,9 @@
 //!     compiled graph is seq=1) using its own pages; new tokens are recorded
 //!     back into the batcher, KV is grown, and finished requests are retired
 //!     (freeing their pages for prefix reuse);
-//!   * when every decoding request shares the same `(batch, kv_class)`
-//!     (`uniform_decode_size`), the decode step is captured/replayed through the
-//!     [`CudaGraphCache`] to cut per-launch overhead.
+//!   * each forward's kernels replay Luminal's per-segment CUDA graphs;
+//!     `metrics.graph_captures/replays` are the real `cuGraphInstantiate` /
+//!     `cuGraphLaunch` deltas measured around each step.
 //!
 //! The compiled graph processes one sequence per forward, so a batch step runs
 //! its requests sequentially; this is iteration-level (continuous) batching at
@@ -32,7 +34,7 @@ use std::time::Instant;
 use skein_compile::{ComputeRuntime, SkeinArtifact, load_runtime_segments};
 
 use crate::batcher::ContinuousBatcher;
-use crate::cuda::cuda_graphs::{CudaGraphCache, GraphOutcome};
+use skein_compile::cuda_graph_exec_stats;
 use crate::distributed::rank_executor::LocalSegments;
 use crate::distributed::{LocalTopology, SegmentRunner};
 use crate::error::RuntimeError;
@@ -90,7 +92,9 @@ pub struct ContinuousBatchDriver {
     /// Keep token streamers alive (the batcher holds senders); we drain tokens
     /// here so the channels don't fill, but the demo reads `BatchOutput`.
     _streamers: Vec<TokenStreamer>,
-    graph_cache: Option<CudaGraphCache>,
+    /// When set, accumulate real Luminal CUDA-graph instantiate/launch counts
+    /// (deltas around each forward) into `metrics.graph_captures/replays`.
+    track_graphs: bool,
     next_order: usize,
     metrics: DriverMetrics,
     outputs: Vec<BatchOutput>,
@@ -113,18 +117,13 @@ impl ContinuousBatchDriver {
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
         let runners: Vec<SegmentRunner> = per_device.into_iter().map(SegmentRunner::new).collect();
         let topo = LocalTopology::new(runners, sequencing);
-        let graph_cache = if enable_cuda_graphs {
-            Some(CudaGraphCache::new()?)
-        } else {
-            None
-        };
         Ok(Self {
             topo,
             batcher,
             vocab,
             state: HashMap::new(),
             _streamers: Vec::new(),
-            graph_cache,
+            track_graphs: enable_cuda_graphs,
             next_order: 0,
             metrics: DriverMetrics::default(),
             outputs: Vec::new(),
@@ -200,13 +199,8 @@ impl ContinuousBatchDriver {
                 self.metrics.mixed_batch_steps += 1;
             }
 
-            // CUDA-graph eligibility: a pure-decode step where every request is
-            // a single-token decode. `uniform_decode_size` is the batcher's
-            // signal; the cache replays a captured graph for that key.
-            let uniform = step.uniform_decode_size.filter(|_| step.prefill_requests.is_empty());
-
             for id in ids {
-                self.run_one_request_step(id, uniform)?;
+                self.run_one_request_step(id)?;
             }
         }
         // Stable order for the caller.
@@ -218,11 +212,7 @@ impl ContinuousBatchDriver {
     /// its current input token at its position, walk the schedule (or replay a
     /// captured CUDA graph for a uniform decode step), then update its state and
     /// the batcher.
-    fn run_one_request_step(
-        &mut self,
-        id: RequestId,
-        uniform: Option<u32>,
-    ) -> Result<(), RuntimeError> {
+    fn run_one_request_step(&mut self, id: RequestId) -> Result<(), RuntimeError> {
         let (position, next_input, prompt_len, in_prefill) = {
             let st = self.state.get(&id).ok_or(RuntimeError::UnknownRequest(id.0))?;
             (
@@ -245,24 +235,18 @@ impl ContinuousBatchDriver {
             runner.set_position(position);
         }
 
-        // Execute the schedule. For a uniform pure-decode step, route through the
-        // CUDA-graph cache (capture on first sight of the key, replay after) so
-        // decode steps replay a captured graph instead of re-recording kernels.
-        // The cache itself decides replay vs capture vs eager and runs the
-        // schedule closure when it cannot replay.
+        // Execute the schedule. The per-segment kernel CUDA graphs live inside
+        // Luminal's `CudaGraphOp` (built once, replayed via `cuGraphLaunch` on
+        // every later forward). We measure the *real* instantiate/launch deltas
+        // around the step from Luminal's counters — no separate serving-level
+        // graph, no fabricated counts.
         let started = Instant::now();
-        let graph_key = if is_decode { uniform.map(|k| (k, 0u32)) } else { None };
-        match (graph_key, self.graph_cache.as_mut()) {
-            (Some(key), Some(cache)) => {
-                let topo = &mut self.topo;
-                let outcome = cache.run_decode_step(key, &mut || topo.run_step().map_err(rt))?;
-                match outcome {
-                    GraphOutcome::Replayed => self.metrics.graph_replays += 1,
-                    GraphOutcome::Captured => self.metrics.graph_captures += 1,
-                    GraphOutcome::Eager => {}
-                }
-            }
-            _ => self.topo.run_step().map_err(rt)?,
+        let g0 = if self.track_graphs { cuda_graph_exec_stats() } else { (0, 0) };
+        self.topo.run_step().map_err(rt)?;
+        if self.track_graphs {
+            let g1 = cuda_graph_exec_stats();
+            self.metrics.graph_captures += g1.0.saturating_sub(g0.0);
+            self.metrics.graph_replays += g1.1.saturating_sub(g0.1);
         }
         self.metrics.total_compute_us += started.elapsed().as_secs_f64() * 1e6;
         self.metrics.forward_steps += 1;

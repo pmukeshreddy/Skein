@@ -23,8 +23,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use skein_compile::{
-    CudaComputeRuntime, DEFAULT_SEARCH_BUDGET, SkeinArtifact, load_device_prefill_segments,
-    load_device_runtime_segments,
+    CudaComputeRuntime, DEFAULT_SEARCH_BUDGET, SkeinArtifact, cuda_graph_exec_stats,
+    load_device_prefill_segments, load_device_runtime_segments,
 };
 use skein_emit::segment::SequenceStep;
 
@@ -284,6 +284,10 @@ impl RankServer {
             return Ok(GenResult::default());
         }
 
+        // Snapshot real Luminal CUDA-graph counters so we can report how many
+        // graph instantiations vs. replays this whole generation actually did.
+        let graph_start = cuda_graph_exec_stats();
+
         // Admit through the paged allocator: prefix match + page allocation.
         let request_id = crate::types::RequestId::next();
         let matched = self
@@ -342,6 +346,15 @@ impl RankServer {
         // sharing this prompt's prefix can reuse them.
         self.executor.runner_mut().end_request();
 
+        // Real CUDA-graph activity for this generation (delta of the Luminal
+        // counters): instantiations are first-build / shape-change rebuilds,
+        // launches are graph replays. A healthy decode shows launches growing
+        // by ~(segments x decode_steps) while instantiations stay near the
+        // one-time build count.
+        let graph_end = cuda_graph_exec_stats();
+        let graph_instantiates = graph_end.0.saturating_sub(graph_start.0);
+        let graph_launches = graph_end.1.saturating_sub(graph_start.1);
+
         let mut ms: Vec<f64> = step_times.iter().map(|d| d.as_secs_f64() * 1e3).collect();
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let pct = |p: f64| -> f64 {
@@ -368,6 +381,8 @@ impl RankServer {
             tpot_p95_ms: pct(0.95),
             decode_tokens_per_s: tput,
             kv_pages_in_use: pages_in_use,
+            graph_instantiates,
+            graph_launches,
         };
         if self.layout.is_leader() {
             tracing::info!(
@@ -380,6 +395,8 @@ impl RankServer {
                 tpot_p50_ms = result.tpot_p50_ms,
                 tpot_p95_ms = result.tpot_p95_ms,
                 decode_tokens_per_s = result.decode_tokens_per_s,
+                cuda_graph_instantiations = result.graph_instantiates,
+                cuda_graph_replays = result.graph_launches,
                 "SKEIN_PERF: paged-KV cached-decode timing (single in-flight request, greedy)"
             );
         }
@@ -401,6 +418,10 @@ pub struct GenResult {
     pub tpot_p95_ms: f64,
     pub decode_tokens_per_s: f64,
     pub kv_pages_in_use: u32,
+    /// Real Luminal `cuGraphInstantiate` count during this generation.
+    pub graph_instantiates: u64,
+    /// Real Luminal `cuGraphLaunch` (graph replay) count during this generation.
+    pub graph_launches: u64,
 }
 
 /// End-to-end distributed greedy generation for one prompt across the rank

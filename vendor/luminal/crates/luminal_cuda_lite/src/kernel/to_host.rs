@@ -33,6 +33,26 @@ use crate::{
     runtime::partition_marked_convex,
 };
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Real CUDA-graph activity counters for `CudaGraphOp`. These are incremented at
+/// the actual `cuGraphInstantiate` / `cuGraphLaunch` call sites (not a proxy or
+/// stub), so callers can verify that the per-segment kernel CUDA graphs really
+/// build once and replay on subsequent forwards. Process-global and monotonic.
+static GRAPH_INSTANTIATES: AtomicU64 = AtomicU64::new(0);
+static GRAPH_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+/// `(graph_instantiations, graph_launches)` since process start. An instantiation
+/// is a real `cuGraphInstantiate` (first build or shape-change rebuild); a launch
+/// is a real `cuGraphLaunch` (graph replay). On a steady decode loop, launches
+/// grow by one-per-segment-per-step while instantiations stay flat.
+pub fn graph_exec_stats() -> (u64, u64) {
+    (
+        GRAPH_INSTANTIATES.load(Ordering::Relaxed),
+        GRAPH_LAUNCHES.load(Ordering::Relaxed),
+    )
+}
+
 /// A compiled kernel within a CudaGraphOp.
 #[derive(Debug)]
 struct CompiledKernel {
@@ -589,8 +609,9 @@ impl CudaGraphOp {
             state.last_buffer_ptrs = current_buffer_ptrs;
         }
 
-        // Launch the graph
+        // Launch the graph (real cuGraphLaunch replay).
         state.cuda_graph_exec.as_ref().unwrap().launch(stream)?;
+        GRAPH_LAUNCHES.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -770,6 +791,7 @@ impl CudaGraphOp {
         }
 
         let exec = graph.instantiate()?;
+        GRAPH_INSTANTIATES.fetch_add(1, Ordering::Relaxed);
 
         state.cuda_graph = Some(graph);
         state.cuda_graph_exec = Some(exec);

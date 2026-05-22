@@ -111,6 +111,29 @@ Generated text differed (both greedy, same weights): Skein → "Paris."; TRT-LLM
 BOS/prompt-tokenization differences between the two harnesses, not a model
 disagreement.
 
-The gap is expected: TRT-LLM is a mature engine (fused flashinfer kernels, CUDA
-graphs, optimized MoE); Skein's runtime currently executes per-segment NVRTC
-kernels and re-uploads weights per launch.
+The gap is expected: TRT-LLM is a mature engine (fused flashinfer kernels,
+batched prefill, optimized MoE). Skein already runs **real per-segment CUDA
+graphs** (see below) but executes the segments sequentially and re-uploads
+weights per process launch.
+
+## CUDA graphs: what's real (verified)
+
+Two layers existed; one was genuine, one was a stub:
+
+- **Real — Luminal per-segment kernel graphs.** Each segment's kernels are built
+  into a `cudaGraph` once (`cuGraphInstantiate`) and replayed every forward via
+  `cuGraphLaunch` with surgical param updates. Instrumented at the actual call
+  sites (`luminal_cuda_lite`); the `--gpus` decode now logs the real counts. One
+  measured 32-token run (5 prefill + 31 decode = 36 forwards):
+
+  ```
+  cuda_graph_instantiations=394   cuda_graph_replays=14184     (394 graphs x 36 forwards)
+  ```
+
+  i.e. 394 segment graphs built once, replayed 14,184 times — proof the kernel
+  CUDA graphs really fire in the production decode.
+
+- **Removed — fake serving-level `CudaGraphCache`.** It captured a no-op
+  scratch-zeroing graph, replayed *that*, ran the real forward eagerly anyway,
+  and reported phantom `graph_captures/replays`. Deleted; `batch_driver` now
+  reports the real Luminal instantiate/launch deltas instead.
