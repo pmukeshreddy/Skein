@@ -277,21 +277,39 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
         .ok()
         .flatten();
 
+    // SKEIN_PIPELINE_STREAMS=N (N>=2): drive N concurrent streams with 1F1B
+    // pipeline overlap so both PP stages (GPUs) compute at once. Unset/1 = the
+    // single-stream path.
+    let pipeline_streams = std::env::var("SKEIN_PIPELINE_STREAMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 2);
+
     tracing::info!(
         rank = layout.rank,
         world_size = layout.world_size,
+        pipeline_streams = pipeline_streams.unwrap_or(1),
         "rank serving: bootstrapping NCCL + loading device segments"
     );
     // NCCL + the compute runtime are blocking/sync — run off the async runtime.
-    let out = tokio::task::spawn_blocking(move || {
-        gpu_rank::run_generation(
+    let out = tokio::task::spawn_blocking(move || match pipeline_streams {
+        Some(n) => gpu_rank::run_generation_pipelined(
+            &artifact_dir,
+            layout,
+            &rendezvous,
+            &prompt,
+            max_new,
+            n,
+            tokenizer.as_ref(),
+        ),
+        None => gpu_rank::run_generation(
             &artifact_dir,
             layout,
             &rendezvous,
             &prompt,
             max_new,
             tokenizer.as_ref(),
-        )
+        ),
     })
     .await
     .map_err(|e| CliError::BadArgument(format!("rank task panicked: {e}")))??;

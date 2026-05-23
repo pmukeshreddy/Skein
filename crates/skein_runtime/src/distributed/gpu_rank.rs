@@ -613,6 +613,245 @@ impl RankServer {
         }
         Ok(result)
     }
+
+    /// 1F1B pipeline-parallel decode across the two PP stages: drive
+    /// `prompts.len()` concurrent requests (microbatches) so BOTH stages — and
+    /// thus both GPUs — compute simultaneously on different microbatches, instead
+    /// of the single-stream path where the stages run in turns and only one GPU
+    /// is busy per token. Targets pp==2 (stage 0 = sender rank, stage 1 = last
+    /// stage). Needs >= 2 microbatches: the pipeline must have slack for a
+    /// microbatch's sampled token to travel back from stage 1 to stage 0 before
+    /// that microbatch's next forward — so stage 0 issues another microbatch's
+    /// stage in the meantime. Falls back to sequential single-stream otherwise.
+    ///
+    /// The token feedback (stage 1 -> stage 0) and the activation handoff (stage
+    /// 0 -> stage 1) are exchanged in ONE NCCL group per step
+    /// ([`RankCollective::send_recv_f32`]); two separate blocking calls would
+    /// deadlock. Both ranks build the identical round-robin job order so the
+    /// send/recv streams stay matched.
+    ///
+    /// Returns one [`GenResult`] per prompt (tokens populated on stage 0 — which
+    /// receives every sampled token — and the last stage). The leader logs the
+    /// aggregate decode throughput = (microbatches * decode-tokens-each) / decode
+    /// wall time.
+    pub fn generate_pipelined(
+        &mut self,
+        prompts: &[Vec<u32>],
+        max_new_tokens: usize,
+    ) -> Result<Vec<GenResult>, RuntimeError> {
+        let n = prompts.len();
+
+        // This rank's compute-only steps (schedule minus the boundary SendRecv)
+        // and the carry handoff (id, element count, sender rank, receiver rank).
+        let compute: Vec<ResolvedSequenceStep> = self
+            .schedule_resolved
+            .iter()
+            .filter(|s| {
+                !matches!(
+                    s,
+                    ResolvedSequenceStep::Collective {
+                        collective: CollectiveKind::SendRecv,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect();
+        let carry = self.schedule_resolved.iter().find_map(|s| match s {
+            ResolvedSequenceStep::Collective {
+                collective: CollectiveKind::SendRecv,
+                participants,
+                tensor,
+                elems,
+            } => Some((
+                *tensor,
+                *elems,
+                participants[0] as usize,
+                participants[1] as usize,
+            )),
+            _ => None,
+        });
+        // Not a 2-stage PP plan, or too few microbatches to fill the pipeline →
+        // run each prompt single-stream (still correct, just no stage overlap).
+        let needs_fallback = self.pp != 2 || n < 2 || carry.is_none();
+        if needs_fallback {
+            let mut out = Vec::with_capacity(n);
+            for p in prompts {
+                out.push(self.generate(p, max_new_tokens)?);
+            }
+            return Ok(out);
+        }
+        let (carry_id, carry_elems, sender, receiver) = carry.unwrap();
+        let is_first = self.layout.rank == sender;
+        let is_last = self.layout.rank == receiver;
+
+        struct Mb {
+            id: crate::types::RequestId,
+            base_position: usize,
+            first_token: u32,
+            generated: Vec<u32>,
+        }
+        let mut mbs: Vec<Mb> = Vec::with_capacity(n);
+
+        // --- PREFILL: lockstep through both stages (full schedule incl. SendRecv),
+        // one microbatch at a time. Establishes each request's KV + first token. ---
+        self.executor.runner_mut().reset_kv_cache();
+        for p in prompts.iter() {
+            let id = crate::types::RequestId::next();
+            // admit (keeps prior microbatches in-flight) + activate, NOT
+            // begin_request — begin_request releases the previous active request,
+            // which would evict every earlier microbatch before decode.
+            let matched = self.executor.runner_mut().admit_request(id, p)?;
+            self.executor.runner_mut().activate_request(id, matched)?;
+            let start = matched.min(p.len().saturating_sub(1));
+            let mut pos = start;
+            let mut logits = Vec::new();
+            for &tok in &p[start..] {
+                logits = self.forward_step(tok, pos)?;
+                pos += 1;
+            }
+            let first = self.sample_and_sync(&logits)?;
+            mbs.push(Mb {
+                id,
+                base_position: pos,
+                first_token: first,
+                generated: vec![first],
+            });
+        }
+
+        // --- DECODE: 1F1B pipeline. jobs[i] = microbatch index, round-robin so a
+        // microbatch's token has `n-1` other-microbatch jobs to return in. ---
+        let per_mb = max_new_tokens.saturating_sub(1);
+        let mut jobs: Vec<usize> = Vec::with_capacity(n * per_mb);
+        for _ in 0..per_mb {
+            for m in 0..n {
+                jobs.push(m);
+            }
+        }
+        let njobs = jobs.len();
+        let decode_start = Instant::now();
+
+        if njobs == 0 {
+            // no decode steps beyond the prefill token
+        } else if is_first {
+            // Stage 0: run stage-0 compute, then send the activation forward and
+            // receive the previous job's sampled token back (one NCCL group).
+            let mut results: Vec<u32> = vec![0u32; njobs];
+            for i in 0..njobs {
+                let m = jobs[i];
+                let k = i / n;
+                let id = mbs[m].id;
+                let input = if k == 0 { mbs[m].first_token } else { results[i - n] };
+                let pos = mbs[m].base_position + k;
+                {
+                    let r = self.executor.runner_mut();
+                    r.activate_request(id, pos)?;
+                    r.advance_kv()?;
+                    r.set_input_tokens(INPUT_TOKENS, vec![input as i32]);
+                    r.set_position(pos);
+                }
+                self.executor
+                    .run(&compute, &self.collective)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                let buf = self
+                    .executor
+                    .runner()
+                    .read_by_id(carry_id)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                if i == 0 {
+                    self.collective.send_f32(&buf, receiver).map_err(to_rt)?;
+                } else {
+                    let tok = self
+                        .collective
+                        .send_recv_f32(&buf, receiver, receiver, 1)
+                        .map_err(to_rt)?;
+                    results[i - 1] = tok[0] as u32;
+                }
+            }
+            // Drain the last job's token (stage 1 sends it after its final job).
+            let tok = self.collective.recv_f32(receiver, 1).map_err(to_rt)?;
+            results[njobs - 1] = tok[0] as u32;
+            for (m, mb) in mbs.iter_mut().enumerate() {
+                for k in 0..per_mb {
+                    mb.generated.push(results[k * n + m]);
+                }
+            }
+        } else if is_last {
+            // Stage 1: receive the activation (and send the previous job's token
+            // back, same group), run stage-1 compute, sample.
+            let mut last_token: u32 = 0;
+            for i in 0..njobs {
+                let m = jobs[i];
+                let k = i / n;
+                let id = mbs[m].id;
+                let pos = mbs[m].base_position + k;
+                let buf = if i == 0 {
+                    self.collective
+                        .recv_f32(sender, carry_elems)
+                        .map_err(to_rt)?
+                } else {
+                    self.collective
+                        .send_recv_f32(&[last_token as f32], sender, sender, carry_elems)
+                        .map_err(to_rt)?
+                };
+                {
+                    let r = self.executor.runner_mut();
+                    r.write_by_id(carry_id, buf)
+                        .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                    r.activate_request(id, pos)?;
+                    r.advance_kv()?;
+                    r.set_position(pos);
+                }
+                self.executor
+                    .run(&compute, &self.collective)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                let logits = self
+                    .executor
+                    .runner()
+                    .read(LOGITS)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                let next = argmax(&logits);
+                mbs[m].generated.push(next);
+                last_token = next;
+            }
+            // Drain: send the final token back to stage 0.
+            self.collective
+                .send_f32(&[last_token as f32], sender)
+                .map_err(to_rt)?;
+        }
+
+        let decode_elapsed = decode_start.elapsed();
+        let decode_tokens = (n * per_mb) as f64;
+        let agg_tps = if decode_elapsed.as_secs_f64() > 0.0 {
+            decode_tokens / decode_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        for mb in &mbs {
+            let _ = self.executor.runner_mut().release_request(mb.id);
+        }
+
+        if self.layout.is_leader() {
+            tracing::info!(
+                microbatches = n,
+                max_new_tokens,
+                decode_tokens_total = decode_tokens as u64,
+                decode_wall_s = decode_elapsed.as_secs_f64(),
+                aggregate_decode_tokens_per_s = agg_tps,
+                "SKEIN_PERF_PIPE: 1F1B pipelined decode (both stages run concurrently)"
+            );
+        }
+
+        let mut out = Vec::with_capacity(n);
+        for mb in mbs {
+            out.push(GenResult {
+                tokens: mb.generated,
+                decode_tokens_per_s: agg_tps,
+                ..Default::default()
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// One generation's tokens plus paged-KV / timing telemetry.
@@ -706,6 +945,57 @@ pub fn run_generation(
         let text = match tokenizer {
             Some(tok) => tok.decode(&cold.tokens)?,
             None => format!("{:?}", cold.tokens),
+        };
+        Ok(Some(text))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Pipelined multi-stream generation: drive `n_streams` concurrent copies of the
+/// prompt through the PP stages with 1F1B overlap so both GPUs compute at once.
+/// Reports aggregate decode throughput. Rank 0 returns the (first stream's)
+/// decoded text; other ranks return `None`. Falls back to single-stream inside
+/// [`RankServer::generate_pipelined`] when the plan isn't 2-stage PP or
+/// `n_streams < 2`.
+pub fn run_generation_pipelined(
+    artifact_dir: &Path,
+    layout: WorldLayout,
+    rendezvous_path: &Path,
+    prompt: &str,
+    max_new_tokens: usize,
+    n_streams: usize,
+    tokenizer: Option<&SkeinTokenizer>,
+) -> Result<Option<String>, RuntimeError> {
+    let mut server = RankServer::bootstrap(artifact_dir, layout, rendezvous_path)?;
+
+    let prompt_tokens: Vec<u32> = if layout.is_leader() {
+        match tokenizer {
+            Some(tok) => tok.encode(prompt)?,
+            None => {
+                let vocab = server.vocab().max(1);
+                prompt.bytes().map(|b| (b as u32) % vocab).collect()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let prompt_tokens = server.broadcast_prompt(if layout.is_leader() {
+        Some(&prompt_tokens)
+    } else {
+        None
+    })?;
+
+    // Same prompt on every stream: each is an independent request (its own KV
+    // pages + decode trajectory) so the aggregate reflects real concurrent work.
+    let prompts: Vec<Vec<u32>> = vec![prompt_tokens; n_streams.max(1)];
+    let results = server.generate_pipelined(&prompts, max_new_tokens)?;
+
+    if layout.is_leader() {
+        let tokens = results.first().map(|r| r.tokens.as_slice()).unwrap_or(&[]);
+        let text = match tokenizer {
+            Some(tok) => tok.decode(tokens)?,
+            None => format!("{tokens:?}"),
         };
         Ok(Some(text))
     } else {

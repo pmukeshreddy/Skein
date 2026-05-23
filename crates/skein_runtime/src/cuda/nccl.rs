@@ -254,6 +254,31 @@ impl RankCollective for NcclCollective {
         self.stream.synchronize().map_err(cuda_err)?;
         self.stream.memcpy_dtov(&dev).map_err(cuda_err)
     }
+
+    fn send_recv_f32(
+        &self,
+        send_buf: &[f32],
+        send_peer: usize,
+        recv_peer: usize,
+        recv_len: usize,
+    ) -> Result<Vec<f32>, CollectiveError> {
+        use cudarc::nccl::result::{group_end, group_start};
+        let send_dev = self.stream.memcpy_stod(send_buf).map_err(cuda_err)?;
+        let mut recv_dev = self.stream.alloc_zeros::<f32>(recv_len).map_err(cuda_err)?;
+        // One NCCL group: the send (this stage -> next) and the recv (prev job's
+        // result <- next stage) are enqueued together and resolved by group_end,
+        // so neither blocks waiting for the other (no deadlock).
+        group_start().map_err(|e| CollectiveError::Nccl(format!("ncclGroupStart: {e:?}")))?;
+        self.comm
+            .send(&send_dev, send_peer as i32)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclSend(grp): {e:?}")))?;
+        self.comm
+            .recv(&mut recv_dev, recv_peer as i32)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclRecv(grp): {e:?}")))?;
+        group_end().map_err(|e| CollectiveError::Nccl(format!("ncclGroupEnd: {e:?}")))?;
+        self.stream.synchronize().map_err(cuda_err)?;
+        self.stream.memcpy_dtov(&recv_dev).map_err(cuda_err)
+    }
 }
 
 impl NcclCollective {

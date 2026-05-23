@@ -193,4 +193,24 @@ pub trait RankCollective {
     fn recv_f32(&self, _peer: usize, _len: usize) -> Result<Vec<f32>, CollectiveError> {
         Err(CollectiveError::Nccl("recv not supported on this backend".to_string()))
     }
+
+    /// Deadlock-free bidirectional point-to-point exchange: in ONE NCCL group,
+    /// send `send_buf` to `send_peer` AND receive `recv_len` f32 from `recv_peer`.
+    /// Returns the received buffer. Used by the 1F1B pipeline-parallel decode,
+    /// where each stage hands its activation forward and receives the previous
+    /// job's result backward in the same step — issuing those as two separate
+    /// blocking send/recv calls deadlocks (both ranks block in `send` waiting for
+    /// the peer's `recv`). Grouping them (`ncclGroupStart/End`) lets NCCL resolve
+    /// the pair together. Default: unsupported.
+    fn send_recv_f32(
+        &self,
+        _send_buf: &[f32],
+        _send_peer: usize,
+        _recv_peer: usize,
+        _recv_len: usize,
+    ) -> Result<Vec<f32>, CollectiveError> {
+        Err(CollectiveError::Nccl(
+            "send_recv not supported on this backend".to_string(),
+        ))
+    }
 }
