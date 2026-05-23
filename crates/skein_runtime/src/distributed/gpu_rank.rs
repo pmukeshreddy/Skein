@@ -86,6 +86,10 @@ pub struct RankServer {
     pp: u32,
     is_last_stage: bool,
     last_stage_root: usize,
+    /// Compiled decode batch width (`plan.batching.max_batch()`): the number of
+    /// rows the decode graph processes per forward. `generate_batched` packs this
+    /// many sequences into each captured step.
+    batch_width: usize,
 }
 
 impl RankServer {
@@ -354,7 +358,12 @@ impl RankServer {
             pp,
             is_last_stage,
             last_stage_root,
+            batch_width: artifact.plan.batching.max_batch() as usize,
         })
+    }
+
+    pub fn batch_width(&self) -> usize {
+        self.batch_width
     }
 
     pub fn layout(&self) -> WorldLayout {
@@ -398,9 +407,19 @@ impl RankServer {
     /// `position` tokens) and append this token's K/V. Returns this rank's logits
     /// — full vocab on TP ranks after the logits all-gather.
     pub fn forward_step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, RuntimeError> {
+        self.forward_step_tokens(&[token], position)
+    }
+
+    /// Batched cached-decode step: feed `tokens` (one per batch row, length =
+    /// the compiled graph's batch width) at the shared absolute `position`,
+    /// driving this rank's segments + collectives over the schedule with the
+    /// SAME full-step CUDA-graph capture/replay as the single-token path. Returns
+    /// this rank's logits (full vocab after the all-gather, `[batch, vocab]`
+    /// rank-major across TP ranks → de-interleave per row at the call site).
+    pub fn forward_step_tokens(&mut self, tokens: &[u32], position: usize) -> Result<Vec<f32>, RuntimeError> {
         {
             let runner = self.executor.runner_mut();
-            runner.set_input_tokens(INPUT_TOKENS, vec![token as i32]);
+            runner.set_input_tokens(INPUT_TOKENS, tokens.iter().map(|&t| t as i32).collect());
             runner.set_position(position);
         }
         // SKEIN_CAPTURE full-step graph: capture the device-only compute window
@@ -444,9 +463,10 @@ impl RankServer {
             // position) into their persistent device buffers, OUTSIDE the captured
             // region, so the captured kernels read fresh values on every replay.
             if std::env::var_os("SKEIN_NO_FLUSH").is_none() {
+                let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
                 self.executor
                     .runner_mut()
-                    .flush_step_device_inputs(token as i32, position);
+                    .flush_step_device_inputs(&toks_i32, position);
             }
             // Host pre-region (e.g. last stage's boundary recv of the carry).
             if lo > 0 {
@@ -762,6 +782,92 @@ impl RankServer {
             );
         }
         Ok(result)
+    }
+
+    /// Batched cached-decode of `prompts.len()` sequences in lockstep through the
+    /// batch=N decode graph, WITH the full-step CUDA-graph capture (one
+    /// `cuGraphLaunch`/token) + shm device all-reduce — the product path. Every
+    /// row shares the decode position (the graph's `position` is a scalar), so the
+    /// prompts are truncated to their common min length L for a clean synchronous
+    /// prefill, then `max_new` tokens are decoded with all rows advancing together.
+    /// Returns (per-row generated tokens, decode seconds over the `max_new`
+    /// captured forwards). TP only (pp==1); each rank holds vocab-parallel logits
+    /// gathered rank-major `[ranks, N, vocab_local]`, de-interleaved per row here.
+    pub fn generate_batched(
+        &mut self,
+        prompts: &[Vec<u32>],
+        max_new_tokens: usize,
+    ) -> Result<(Vec<Vec<u32>>, f64), RuntimeError> {
+        let n = prompts.len();
+        if n == 0 {
+            return Ok((Vec::new(), 0.0));
+        }
+        let vocab = self.vocab as usize;
+        let ranks = (self.layout.world_size as usize).max(1);
+        let vl = (vocab / ranks).max(1); // vocab_local per rank
+
+        // FULL-CONTEXT mixed-length batching (the default): every row feeds ONE
+        // token per step — its own prompt token while prefilling, then its own
+        // generated token once decoding — so after `step` steps every row holds
+        // exactly `step` tokens and the graph's shared `position` scalar is
+        // correct for ALL rows (no per-row positions, no recompile, NO truncation
+        // to a common length). A short-prompt row simply starts generating while
+        // longer-prompt rows are still consuming their prompt.
+        let plen: Vec<usize> = prompts.iter().map(|p| p.len().max(1)).collect();
+        let lmax = *plen.iter().max().unwrap();
+
+        self.executor.runner_mut().reset_kv_cache();
+        self.executor.runner_mut().set_paged_device_kv(false);
+        self.executor.runner_mut().set_decode_batch(n);
+
+        let mut cur: Vec<u32> = prompts.iter().map(|p| p[0]).collect();
+        let mut genr: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // Decode wall = the final `max_new_tokens` steps, during which the
+        // longest-prompt row is decoding (all rows have finished prefill by then),
+        // so it is a clean steady-state batched-decode measurement at full context.
+        let mut decode_start = Instant::now();
+        let total_steps = (lmax - 1) + max_new_tokens;
+        for pos in 0..total_steps {
+            if pos == lmax - 1 {
+                decode_start = Instant::now();
+            }
+            let logits = self.forward_step_tokens(&cur, pos)?;
+            // De-interleave the rank-major all-gathered logits per row and argmax
+            // over the full vocab. (Every TP rank holds the same gathered logits,
+            // so all ranks pick identical next tokens → stays in lockstep.)
+            let mut next = vec![0u32; n];
+            for (r, slot) in next.iter_mut().enumerate() {
+                let mut best_v = f32::NEG_INFINITY;
+                let mut best_i = 0usize;
+                for rk in 0..ranks {
+                    let base = (rk * n + r) * vl;
+                    for j in 0..vl {
+                        let idx = base + j;
+                        if idx < logits.len() && logits[idx] > best_v {
+                            best_v = logits[idx];
+                            best_i = rk * vl + j;
+                        }
+                    }
+                }
+                *slot = best_i as u32;
+            }
+            // Per-row update: still in this row's prompt → feed its next prompt
+            // token (no emit); otherwise this output is one of its generated
+            // tokens → record (until it has max_new) and feed it back.
+            for r in 0..n {
+                if pos + 1 < plen[r] {
+                    cur[r] = prompts[r][pos + 1];
+                } else {
+                    if genr[r].len() < max_new_tokens {
+                        genr[r].push(next[r]);
+                    }
+                    cur[r] = next[r];
+                }
+            }
+        }
+        let decode_s = decode_start.elapsed().as_secs_f64();
+        self.executor.runner_mut().set_decode_batch(1);
+        Ok((genr, decode_s))
     }
 
     /// 1F1B pipeline-parallel decode across the two PP stages: drive
@@ -1125,6 +1231,96 @@ pub fn run_generation(
             None => format!("{:?}", cold.tokens),
         };
         Ok(Some(text))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Batched decode of many prompts in one captured forward per token — the
+/// product path (batch>1 graph + full-step CUDA-graph capture + shm device
+/// all-reduce). Every rank process calls this; all read the same prompts and run
+/// identical lockstep batched decode. The prompts are padded/truncated by
+/// repetition to the compiled batch width. Rank 0 returns a report (aggregate +
+/// per-row decode throughput + decoded rows); other ranks return `None`.
+pub fn run_generation_batched(
+    artifact_dir: &Path,
+    layout: WorldLayout,
+    rendezvous_path: &Path,
+    prompts: &[Vec<u32>],
+    max_new_tokens: usize,
+    tokenizer: Option<&SkeinTokenizer>,
+) -> Result<Option<String>, RuntimeError> {
+    let mut server = RankServer::bootstrap(artifact_dir, layout, rendezvous_path)?;
+    let gb = server.batch_width().max(1);
+
+    // Keep original indices so the report maps back to the user's prompt order.
+    let mut indexed: Vec<(usize, Vec<u32>)> = prompts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.is_empty())
+        .map(|(i, p)| (i, p.clone()))
+        .collect();
+    if indexed.is_empty() {
+        return Err(RuntimeError::ServerInit("no prompts for batched generation".into()));
+    }
+    let total_unique = indexed.len();
+    // Length-bucket: sort by prompt length so each fixed-width chunk has
+    // similar-length prompts. Mixed-length batching wastes work when a short
+    // prompt shares a chunk with a very long one (it finishes early but still
+    // rides every forward); bucketing minimises that.
+    indexed.sort_by_key(|(_, p)| p.len());
+
+    let mut all_rows: Vec<(usize, Vec<u32>)> = Vec::new(); // (original idx, tokens)
+    let mut total_decode_s = 0.0f64;
+    let mut total_unique_tokens = 0usize;
+    let mut chunk_lines = String::new();
+    let mut chunk_idx = 0;
+    for chunk in indexed.chunks(gb) {
+        let unique_here = chunk.len();
+        let mut bp: Vec<Vec<u32>> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        let src_len = bp.len();
+        while bp.len() < gb {
+            let i = bp.len() % src_len;
+            bp.push(bp[i].clone());
+        }
+        let (genr, decode_s) = server.generate_batched(&bp, max_new_tokens)?;
+        total_decode_s += decode_s;
+        total_unique_tokens += unique_here * max_new_tokens;
+        if layout.is_leader() {
+            let agg = (gb * max_new_tokens) as f64 / decode_s.max(1e-9);
+            let maxlen = chunk.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+            chunk_lines.push_str(&format!(
+                "  chunk{chunk_idx}: batch={gb} unique={unique_here} maxlen={maxlen} decode_s={decode_s:.3} chunk_aggregate_decode_tok/s={agg:.1}\n"
+            ));
+            for (r, g) in genr.iter().enumerate().take(unique_here) {
+                all_rows.push((chunk[r].0, g.clone()));
+            }
+        }
+        chunk_idx += 1;
+    }
+    all_rows.sort_by_key(|(idx, _)| *idx);
+
+    if layout.is_leader() {
+        // Sustained throughput across all prompts = unique tokens / total decode
+        // wall (chunks run sequentially → this is the real system throughput for
+        // the 20 prompts on this 2-GPU box).
+        let sustained = total_unique_tokens as f64 / total_decode_s.max(1e-9);
+        let per_row = max_new_tokens as f64 / (total_decode_s / chunk_idx.max(1) as f64).max(1e-9);
+        let mut s = format!(
+            "=== Batched decode + full-step CUDA-graph capture (TP, shm all-reduce) ===\n  \
+             unique_prompts={total_unique} batch_width={gb} chunks={chunk_idx} max_new={max_new_tokens} \
+             total_decode_s={total_decode_s:.3}\n  \
+             SUSTAINED aggregate_tokens_per_s={sustained:.1} (per_row≈{per_row:.1})\n{chunk_lines}"
+        );
+        for (idx, g) in all_rows.iter().take(total_unique) {
+            let txt = match tokenizer {
+                Some(t) => t.decode(g).unwrap_or_default(),
+                None => format!("{:?}", &g[..g.len().min(8)]),
+            };
+            let head: String = txt.chars().take(64).collect();
+            s.push_str(&format!("  prompt{idx}: {head:?}\n"));
+        }
+        Ok(Some(s))
     } else {
         Ok(None)
     }

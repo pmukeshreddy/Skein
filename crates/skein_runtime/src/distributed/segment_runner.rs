@@ -61,6 +61,17 @@ const DEFAULT_PAGE_SIZE: u32 = 16;
 const DEFAULT_TOTAL_PAGES: u32 = 256;
 const DEFAULT_RADIX_DEPTH: u32 = 4096;
 
+/// Bytes per element of the device-resident decode KV cache. The cached-decode
+/// attention (`attention_fixed_cache`) runs RoPE/scores/softmax/Attn·V in **f32**
+/// and writes the new token's K/V back **f32** (only the final attention output
+/// is cast to the activation dtype), so the `kvcache_*` buffer the runtime sizes,
+/// strides, and DtoD-appends into is f32 — 4 bytes/element, NOT the activation
+/// dtype (bf16). Sizing it as bf16 (×2) under-allocates the buffer to half and,
+/// in the batched write, halves the per-row slot stride `cap` — corrupting every
+/// row but row 0. (Single-request decode only stayed correct because short
+/// prompts never read past the first half of the under-sized buffer.)
+const KV_DEVICE_ELEM_BYTES: usize = 4;
+
 /// Parse a `u32` from the environment, falling back to `default`.
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
@@ -593,7 +604,7 @@ impl SegmentRunner {
     /// recorded into it. Must be called every decode step before replay/capture,
     /// on the shared capture stream (it is — these go through each segment's
     /// runtime, which shares that stream under SKEIN_CAPTURE).
-    pub fn flush_step_device_inputs(&mut self, token: i32, position: usize) {
+    pub fn flush_step_device_inputs(&mut self, tokens: &[i32], position: usize) {
         self.position = position;
         let _ = self.kv.set_position(position);
         let tok_id = self.input_tokens_id;
@@ -621,7 +632,7 @@ impl SegmentRunner {
                 if self.segment_inputs[segment_idx].iter().any(|id| *id == tok_id) {
                     match self.segments[segment_idx]
                         .runtime
-                        .set_input_i32_immediate_by_id(tok_id, vec![token])
+                        .set_input_i32_immediate_by_id(tok_id, tokens.to_vec())
                     {
                         Ok(()) => n_tok += 1,
                         Err(_) => n_err += 1,
@@ -645,8 +656,8 @@ impl SegmentRunner {
         }
         if log {
             eprintln!(
-                "SKEIN_FLUSH pos={position} tok={token} fed: kv={n_kv} tok={n_tok} pos={n_pos} err={n_err} (segs={})",
-                self.segments.len()
+                "SKEIN_FLUSH pos={position} ntok={} tok0={:?} fed: kv={n_kv} tok={n_tok} pos={n_pos} err={n_err} (segs={})",
+                tokens.len(), tokens.first(), self.segments.len()
             );
         }
     }
@@ -997,24 +1008,25 @@ impl LocalSegments for SegmentRunner {
                     // below would let concurrent requests clobber each other's KV.
                     let base = if self.paged_device_kv {
                         let req = self.active_request;
-                        let ptr =
-                            req.and_then(|r| self.req_kv_buffer(segment_idx, r, slot, full * 2));
+                        let ptr = req.and_then(|r| {
+                            self.req_kv_buffer(segment_idx, r, slot, full * KV_DEVICE_ELEM_BYTES)
+                        });
                         if let Some(p) = ptr {
                             // Rebind the input to this request's buffer for this step.
                             unsafe {
                                 self.segments[segment_idx]
                                     .runtime
-                                    .bind_input_device_by_id(id, p, full * 2)
+                                    .bind_input_device_by_id(id, p, full * KV_DEVICE_ELEM_BYTES)
                             };
                         }
                         ptr
                     } else {
                         // Single-request path: bind a persistent on-GPU buffer (full
-                        // capacity, bf16) once and reuse it every step — NO assemble,
+                        // capacity, f32) once and reuse it every step — NO assemble,
                         // NO H2D. The new token's K/V is written into it via DtoD.
                         self.segments[segment_idx]
                             .runtime
-                            .ensure_kv_input_device_by_id(id, full * 2)
+                            .ensure_kv_input_device_by_id(id, full * KV_DEVICE_ELEM_BYTES)
                     };
                     if let Some(b) = base {
                         self.kv_device_base[slot] = Some(b);
@@ -1104,6 +1116,47 @@ impl LocalSegments for SegmentRunner {
             .map_err(&err)?;
         t.mark_out();
 
+        // DEBUG (SKEIN_BATCH_DIVERGE): for identical prompts, every per-row
+        // activation must match across rows. Read each output, split into
+        // `decode_batch` rows, and log the first segment whose row0 != row1 —
+        // that op is where batch>1 striding breaks. Gated, first few forwards.
+        if self.decode_batch > 1 && std::env::var_os("SKEIN_BATCH_DIVERGE").is_some() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static BUDGET: AtomicUsize = AtomicUsize::new(400);
+            // Only the first two positions: pos=0 is pure (no KV history) — a
+            // divergence there is a batch COMPUTE bug; a divergence appearing only
+            // at pos>=1 is a KV-history (write/read) bug.
+            let pos = self.position;
+            let batch = self.decode_batch;
+            if pos == 1 {
+                for &id in &self.segment_outputs[segment_idx] {
+                    if BUDGET.load(Ordering::Relaxed) == 0 { break; }
+                    if let Ok(v) = self.segments[segment_idx].runtime.get_tensor_by_id(id) {
+                        if v.len() % batch == 0 && v.len() >= batch * 2 {
+                            let per = v.len() / batch;
+                            // Compare EVERY row r against row 0 (catch row-pairing).
+                            let mut maxd = 0f32;
+                            let mut worst_row = 0usize;
+                            let mut first = usize::MAX;
+                            for r in 1..batch {
+                                for j in 0..per {
+                                    let d = (v[j] - v[r * per + j]).abs();
+                                    if d > maxd { maxd = d; worst_row = r;
+                                        if first == usize::MAX { first = j; } }
+                                }
+                            }
+                            if maxd > 1e-5 && BUDGET.fetch_sub(1, Ordering::Relaxed) > 0 {
+                                eprintln!(
+                                    "DIVERGE pos=1 seg={} out='{}' per_row={} max|r0-r{}|={:.6} first_idx={}",
+                                    segment_idx, self.id_name(id), per, worst_row, maxd, first
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Capture outputs by pre-resolved id. A `kvcache_*` output is the new
         // token's K/V written into slot `position`; collective/router tensors stay
         // host; every other activation is kept DEVICE-RESIDENT (record the
@@ -1125,16 +1178,24 @@ impl LocalSegments for SegmentRunner {
                                 // Synchronous batched decode: write all `decode_batch`
                                 // rows' new K/V into the [batch, cap, kv_dim] cache at
                                 // the shared `position` (strided per row). `base` is the
-                                // single batched KV buffer (full*2 bytes); the per-row
-                                // output is `out_bytes/batch`, and `cap` is the slot
-                                // count = (full*2)/out_bytes.
+                                // single batched KV buffer (full*4 bytes, f32); the
+                                // per-row output is `out_bytes/batch`, and `cap` is the
+                                // slot count = (full*4)/out_bytes.
                                 if self.decode_batch > 1 {
                                     let rt = &self.segments[segment_idx].runtime;
-                                    rt.set_decode_position(self.position);
+                                    // Under SKEIN_CAPTURE the position memcpy is done
+                                    // outside the graph by flush_step_device_inputs
+                                    // (recording it would bake a freed host pointer);
+                                    // the captured batched kv_slot_write reads the
+                                    // device position buffer. Mirrors the single path.
+                                    if !self.capturing || std::env::var_os("SKEIN_NO_SKIP").is_some() {
+                                        rt.set_decode_position(self.position);
+                                    }
                                     let batch = self.decode_batch;
                                     let row_bytes = out_bytes / batch;
-                                    let full2 = self.kv_full_elems[slot].unwrap_or(0) * 2;
-                                    let cap = if out_bytes > 0 { full2 / out_bytes } else { 0 };
+                                    let full_bytes =
+                                        self.kv_full_elems[slot].unwrap_or(0) * KV_DEVICE_ELEM_BYTES;
+                                    let cap = if out_bytes > 0 { full_bytes / out_bytes } else { 0 };
                                     if std::env::var_os("SKEIN_BKV_LOG").is_some() {
                                         use std::sync::atomic::{AtomicBool, Ordering};
                                         static D: AtomicBool = AtomicBool::new(false);

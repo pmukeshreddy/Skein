@@ -339,6 +339,26 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 2);
 
+    // SKEIN_BATCHED_GEN + SKEIN_PROMPTS_FILE: batched decode of many prompts in
+    // one captured forward per token (batch>1 graph + full-step CUDA-graph
+    // capture). Every rank reads the same file → identical lockstep batches.
+    let batched_gen = std::env::var_os("SKEIN_BATCHED_GEN").is_some();
+    let batched_prompts: Vec<String> = if batched_gen {
+        match std::env::var_os("SKEIN_PROMPTS_FILE") {
+            Some(path) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| CliError::BadArgument(format!("read SKEIN_PROMPTS_FILE: {e}")))?;
+                let v: Vec<String> = serde_json::from_slice(&bytes).map_err(|e| {
+                    CliError::BadArgument(format!("parse SKEIN_PROMPTS_FILE: {e}"))
+                })?;
+                v.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+            }
+            None => vec![prompt.clone()],
+        }
+    } else {
+        Vec::new()
+    };
+
     tracing::info!(
         rank = layout.rank,
         world_size = layout.world_size,
@@ -346,24 +366,46 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
         "rank serving: bootstrapping NCCL + loading device segments"
     );
     // NCCL + the compute runtime are blocking/sync — run off the async runtime.
-    let out = tokio::task::spawn_blocking(move || match pipeline_streams {
-        Some(n) => gpu_rank::run_generation_pipelined(
-            &artifact_dir,
-            layout,
-            &rendezvous,
-            &prompt,
-            max_new,
-            n,
-            tokenizer.as_ref(),
-        ),
-        None => gpu_rank::run_generation(
-            &artifact_dir,
-            layout,
-            &rendezvous,
-            &prompt,
-            max_new,
-            tokenizer.as_ref(),
-        ),
+    let out = tokio::task::spawn_blocking(move || {
+        if batched_gen {
+            // Tokenize on each rank identically (same file + tokenizer) so the
+            // ranks run the same lockstep batches.
+            let prompts: Vec<Vec<u32>> = batched_prompts
+                .iter()
+                .map(|p| match tokenizer.as_ref() {
+                    Some(t) => t.encode(p).unwrap_or_default(),
+                    None => Vec::new(),
+                })
+                .filter(|t| !t.is_empty())
+                .collect();
+            return gpu_rank::run_generation_batched(
+                &artifact_dir,
+                layout,
+                &rendezvous,
+                &prompts,
+                max_new,
+                tokenizer.as_ref(),
+            );
+        }
+        match pipeline_streams {
+            Some(n) => gpu_rank::run_generation_pipelined(
+                &artifact_dir,
+                layout,
+                &rendezvous,
+                &prompt,
+                max_new,
+                n,
+                tokenizer.as_ref(),
+            ),
+            None => gpu_rank::run_generation(
+                &artifact_dir,
+                layout,
+                &rendezvous,
+                &prompt,
+                max_new,
+                tokenizer.as_ref(),
+            ),
+        }
     })
     .await
     .map_err(|e| CliError::BadArgument(format!("rank task panicked: {e}")))??;

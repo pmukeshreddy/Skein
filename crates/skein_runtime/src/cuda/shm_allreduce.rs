@@ -22,9 +22,13 @@ use cudarc::driver::{
 };
 use memmap2::MmapMut;
 
-/// Custom path handles all-reduces with `elems <= MAX_ELEMS` (decode hidden is
-/// 4096); larger ones (prefill) fall back to NCCL.
-pub const MAX_ELEMS: usize = 8192;
+/// Custom path handles all-reduces with `elems <= MAX_ELEMS`. The per-step
+/// decode all-reduce is `batch * hidden` (hidden=4096); batched decode (batch up
+/// to 32) makes that 131072, so size the shm slot for it — otherwise the batched
+/// all-reduce exceeds the slot and falls back to NCCL, which cannot be recorded
+/// into the full-step CUDA-graph capture (breaking batched+capture). Larger
+/// (prefill) still falls back to NCCL. Slot = MAX_ELEMS*2 bytes (bf16) per rank.
+pub const MAX_ELEMS: usize = 131072;
 const FLAGS_BYTES: usize = 64; // 2 u64 seq flags + pad to a cache line
 const SLOT_BYTES: usize = MAX_ELEMS * 2; // bf16
 const SHM_BYTES: usize = FLAGS_BYTES + 2 * SLOT_BYTES;
