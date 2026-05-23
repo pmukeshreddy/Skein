@@ -70,6 +70,14 @@ pub struct RankServer {
     /// captured into a full-step graph and replayed; the post-split (all-gather +
     /// logits read) runs on the host every step.
     decode_step: usize,
+    /// Full-step CUDA-graph capture window `[capture_lo, capture_hi)` into
+    /// `schedule_resolved`: the contiguous device-only region replayed per token.
+    /// Under PP the boundary `SendRecv` (host-staged) bounds it — the sender's
+    /// send follows its compute (`[0, sr)`), the receiver's recv precedes it
+    /// (`[sr+1, len)`). Under TP it ends after the last RingAllReduce (which is
+    /// routed onto the capture stream via shm). The pre-region `[0, lo)` and the
+    /// post-region `[hi, len)` run on the host each step, outside capture.
+    capture_lo: usize,
     capture_split: usize,
     /// Pipeline-parallel coordination: under PP only the last stage computes
     /// logits, so it samples the next token and broadcasts it to the earlier
@@ -265,6 +273,36 @@ impl RankServer {
         let is_last_stage = stage as u32 == pp.saturating_sub(1);
         let last_stage_root = (pp.saturating_sub(1) * tp * ep) as usize;
 
+        // PP capture window: the compute region between this rank's boundary
+        // SendRecv handoffs. The recv (this rank as receiver) precedes the
+        // compute → capture starts after it; the send (this rank as sender)
+        // follows the compute → capture ends before it. Stage 0: `[0, send)`.
+        // Last stage: `[recv+1, len)`. TP (pp==1): `[0, capture_split)`.
+        let (capture_lo, capture_hi) = if pp > 1 {
+            let mut lo = 0usize;
+            let mut hi = schedule_resolved.len();
+            for (i, s) in schedule_resolved.iter().enumerate() {
+                if let ResolvedSequenceStep::Collective {
+                    collective: CollectiveKind::SendRecv,
+                    participants,
+                    ..
+                } = s
+                {
+                    let sender = participants.first().copied().unwrap_or(0) as usize;
+                    let receiver = participants.get(1).copied().unwrap_or(0) as usize;
+                    if receiver == layout.rank {
+                        lo = i + 1;
+                    }
+                    if sender == layout.rank && i < hi {
+                        hi = i;
+                    }
+                }
+            }
+            (lo, hi)
+        } else {
+            (0, capture_split)
+        };
+
         Ok(Self {
             layout,
             executor,
@@ -276,7 +314,8 @@ impl RankServer {
             prefill_seq,
             num_layers: artifact.plan.model_meta.num_layers,
             decode_step: 0,
-            capture_split,
+            capture_lo,
+            capture_split: capture_hi,
             pp,
             is_last_stage,
             last_stage_root,
@@ -329,32 +368,49 @@ impl RankServer {
             runner.set_input_tokens(INPUT_TOKENS, vec![token as i32]);
             runner.set_position(position);
         }
-        // SKEIN_CAPTURE full-step graph: capture the pre-all-gather region once
-        // (after a few warmup steps so the arena/handoff buffers are stable), then
-        // replay it per token with one cuGraphLaunch; the logits all-gather + read
-        // run on the host every step.
+        // SKEIN_CAPTURE full-step graph: capture the device-only compute window
+        // `[capture_lo, capture_hi)` once (after a few warmup steps so the arena /
+        // handoff buffers are stable), then replay it per token with one
+        // cuGraphLaunch. The host pre-region (the receiver's boundary recv) and
+        // post-region (the sender's boundary send, or TP's logits all-gather +
+        // read) run on the host every step, outside the capture.
         const CAPTURE_AT: usize = 2;
-        let capture =
-            std::env::var_os("SKEIN_CAPTURE").is_some() && self.capture_split < self.schedule_resolved.len();
+        let lo = self.capture_lo;
+        let hi = self.capture_split;
+        let len = self.schedule_resolved.len();
+        // Capture only when there is a proper device-only window. Under PP the
+        // window is always device-only; under TP require it to stop before the
+        // host logits tail (`hi < len`).
+        let window_ok = hi > lo && (self.pp > 1 || hi < len);
+        let capture = std::env::var_os("SKEIN_CAPTURE").is_some() && window_ok;
         if capture {
             self.decode_step += 1;
-            let split = self.capture_split;
+            // Host pre-region (e.g. last stage's boundary recv of the carry).
+            if lo > 0 {
+                self.executor
+                    .run(&self.schedule_resolved[..lo], &self.collective)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+            }
+            // Captured/replayed compute region.
             if self.executor.runner().has_captured() {
                 self.executor.runner().replay_captured();
             } else if self.decode_step == CAPTURE_AT {
                 self.executor.runner().begin_capture();
                 self.executor
-                    .run(&self.schedule_resolved[..split], &self.collective)
+                    .run(&self.schedule_resolved[lo..hi], &self.collective)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                 self.executor.runner().end_capture();
             } else {
                 self.executor
-                    .run(&self.schedule_resolved[..split], &self.collective)
+                    .run(&self.schedule_resolved[lo..hi], &self.collective)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
             }
-            self.executor
-                .run(&self.schedule_resolved[split..], &self.collective)
-                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+            // Host post-region (e.g. stage 0's boundary send; TP's logits tail).
+            if hi < len {
+                self.executor
+                    .run(&self.schedule_resolved[hi..], &self.collective)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+            }
         } else {
             self.executor
                 .run(&self.schedule_resolved, &self.collective)
@@ -530,6 +586,11 @@ impl RankServer {
         // Snapshot host<->device traffic counters across the decode loop so we
         // can report H2D/D2H bytes + host materializations PER GENERATED TOKEN.
         let perf_before = crate::perf_counters::snapshot();
+        // True end-to-end decode wall: includes sample_and_sync (the broadcast
+        // that, under PP, waits for the last stage to compute the token). The
+        // per-step `step_times` below time only forward_step, which under PP is
+        // just THIS rank's stage — so the leader's tpot understates the true rate.
+        let decode_wall = Instant::now();
         for i in 0..max_new_tokens {
             let next = self.sample_and_sync(&logits)?;
             generated.push(next);
@@ -541,6 +602,14 @@ impl RankServer {
                 step_times.push(t.elapsed());
                 position += 1;
             }
+        }
+        if self.layout.is_leader() && std::env::var_os("SKEIN_PERF").is_some() {
+            let w = decode_wall.elapsed().as_secs_f64();
+            let toks = generated.len().saturating_sub(1) as f64;
+            eprintln!(
+                "SKEIN_PERF_TRUE: single-stream end-to-end decode (incl. sample_and_sync) tokens={toks} wall_s={w:.4} true_tokens_per_s={:.2}",
+                if w > 0.0 { toks / w } else { 0.0 }
+            );
         }
 
         // Per-token host<->device traffic over the decode loop (the round-trips
@@ -731,6 +800,8 @@ impl RankServer {
         let njobs = jobs.len();
         let decode_start = Instant::now();
 
+        let pipe_timing = std::env::var_os("SKEIN_PIPE_TIMING").is_some();
+        let (mut t_setup, mut t_compute, mut t_read, mut t_comm) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         if njobs == 0 {
             // no decode steps beyond the prefill token
         } else if is_first {
@@ -743,6 +814,7 @@ impl RankServer {
                 let id = mbs[m].id;
                 let input = if k == 0 { mbs[m].first_token } else { results[i - n] };
                 let pos = mbs[m].base_position + k;
+                let ts = Instant::now();
                 {
                     let r = self.executor.runner_mut();
                     r.activate_request(id, pos)?;
@@ -750,14 +822,20 @@ impl RankServer {
                     r.set_input_tokens(INPUT_TOKENS, vec![input as i32]);
                     r.set_position(pos);
                 }
+                if pipe_timing { t_setup += ts.elapsed().as_secs_f64() * 1e3; }
+                let tc = Instant::now();
                 self.executor
                     .run(&compute, &self.collective)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                if pipe_timing { t_compute += tc.elapsed().as_secs_f64() * 1e3; }
+                let tr = Instant::now();
                 let buf = self
                     .executor
                     .runner()
                     .read_by_id(carry_id)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                if pipe_timing { t_read += tr.elapsed().as_secs_f64() * 1e3; }
+                let tm = Instant::now();
                 if i == 0 {
                     self.collective.send_f32(&buf, receiver).map_err(to_rt)?;
                 } else {
@@ -767,10 +845,16 @@ impl RankServer {
                         .map_err(to_rt)?;
                     results[i - 1] = tok[0] as u32;
                 }
+                if pipe_timing { t_comm += tm.elapsed().as_secs_f64() * 1e3; }
             }
             // Drain the last job's token (stage 1 sends it after its final job).
             let tok = self.collective.recv_f32(receiver, 1).map_err(to_rt)?;
             results[njobs - 1] = tok[0] as u32;
+            if pipe_timing {
+                eprintln!(
+                    "SKEIN_PIPE_TIMING stage0: setup={t_setup:.1} compute={t_compute:.1} read_carry={t_read:.1} comm={t_comm:.1} (ms total over {njobs} jobs)"
+                );
+            }
             for (m, mb) in mbs.iter_mut().enumerate() {
                 for k in 0..per_mb {
                     mb.generated.push(results[k * n + m]);
@@ -785,6 +869,7 @@ impl RankServer {
                 let k = i / n;
                 let id = mbs[m].id;
                 let pos = mbs[m].base_position + k;
+                let tm = Instant::now();
                 let buf = if i == 0 {
                     self.collective
                         .recv_f32(sender, carry_elems)
@@ -794,6 +879,8 @@ impl RankServer {
                         .send_recv_f32(&[last_token as f32], sender, sender, carry_elems)
                         .map_err(to_rt)?
                 };
+                if pipe_timing { t_comm += tm.elapsed().as_secs_f64() * 1e3; }
+                let ts = Instant::now();
                 {
                     let r = self.executor.runner_mut();
                     r.write_by_id(carry_id, buf)
@@ -802,14 +889,19 @@ impl RankServer {
                     r.advance_kv()?;
                     r.set_position(pos);
                 }
+                if pipe_timing { t_setup += ts.elapsed().as_secs_f64() * 1e3; }
+                let tc = Instant::now();
                 self.executor
                     .run(&compute, &self.collective)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                if pipe_timing { t_compute += tc.elapsed().as_secs_f64() * 1e3; }
+                let tr = Instant::now();
                 let logits = self
                     .executor
                     .runner()
                     .read(LOGITS)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                if pipe_timing { t_read += tr.elapsed().as_secs_f64() * 1e3; }
                 let next = argmax(&logits);
                 mbs[m].generated.push(next);
                 last_token = next;
@@ -818,6 +910,11 @@ impl RankServer {
             self.collective
                 .send_f32(&[last_token as f32], sender)
                 .map_err(to_rt)?;
+            if pipe_timing {
+                eprintln!(
+                    "SKEIN_PIPE_TIMING stage1: comm={t_comm:.1} setup={t_setup:.1} compute={t_compute:.1} read_logits={t_read:.1} (ms total over {njobs} jobs)"
+                );
+            }
         }
 
         let decode_elapsed = decode_start.elapsed();
