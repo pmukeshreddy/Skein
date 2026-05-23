@@ -306,6 +306,31 @@ impl RankServer {
             (0, capture_split)
         };
 
+        // Clamp the window to a device-only run: stop before the first segment
+        // whose output is host-materialized (the boundary carry on stage 0, the
+        // LM-head logits on the last stage). Its device→host copy is illegal
+        // during stream capture; excluded, it runs in the un-captured post-region
+        // (where the SendRecv send / logits read already live). This makes the
+        // ~15/16-block compute region capturable without touching the carry/
+        // logits/SendRecv host paths.
+        let capture_hi = {
+            let runner = executor.runner();
+            let mut hi = capture_hi;
+            for i in capture_lo..capture_hi {
+                if let ResolvedSequenceStep::ExecuteSegment {
+                    device_idx,
+                    segment_idx,
+                } = &schedule_resolved[i]
+                    && *device_idx as usize == layout.rank
+                    && runner.segment_has_host_output(*segment_idx)
+                {
+                    hi = i;
+                    break;
+                }
+            }
+            hi
+        };
+
         Ok(Self {
             layout,
             executor,

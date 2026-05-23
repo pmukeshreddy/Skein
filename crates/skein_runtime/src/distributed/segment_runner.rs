@@ -518,6 +518,21 @@ impl SegmentRunner {
         self.segments.len()
     }
 
+    /// Does this segment produce any host-materialized output (a `HostCollective`
+    /// handoff: the boundary carry, the logits, a router tensor)? Such an output
+    /// triggers a device→host copy in `run_segment`, which is illegal during CUDA
+    /// stream capture — the full-step-graph capture window must stop before it
+    /// (the segment then runs in the un-captured host pre/post region).
+    pub fn segment_has_host_output(&self, segment_idx: usize) -> bool {
+        self.segment_outputs
+            .get(segment_idx)
+            .map(|ids| {
+                ids.iter()
+                    .any(|id| matches!(self.kind[id.idx()], HandoffKind::HostCollective))
+            })
+            .unwrap_or(false)
+    }
+
     /// Resolve the artifact's String-keyed [`SequenceStep`] schedule into the
     /// id-keyed [`ResolvedSequenceStep`] the [`RankExecutor`](super::RankExecutor)
     /// walks on the hot path. Done once at bootstrap (after `name_to_id` is
