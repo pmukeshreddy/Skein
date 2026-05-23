@@ -51,6 +51,14 @@ pub struct ContinuousBatcher {
     inflight: InflightSet,
     workload: Workload,
     kv: Arc<Mutex<PagedKVAllocator>>,
+    /// Benchmark concurrency override (env `SKEIN_CB_MAX_BATCH`). The compiled
+    /// plan pins `max_batch = 1` for single-stream latency, which caps the
+    /// scheduler to one in-flight request. This override raises the *scheduler's*
+    /// concurrency so the continuous batcher actually interleaves N requests
+    /// (mixed prefill/decode, shared paged KV). It is independent of the
+    /// per-forward graph batch width (still 1): requests are run sequentially per
+    /// step but join/leave continuously. `None` = use the plan's `max_batch`.
+    max_batch_override: Option<u32>,
 }
 
 impl ContinuousBatcher {
@@ -67,12 +75,26 @@ impl ContinuousBatcher {
             inflight: InflightSet::new(),
             workload: workload.clone(),
             kv,
+            max_batch_override: std::env::var("SKEIN_CB_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&m| m >= 1),
         }
     }
 
     /// Decide what to do with an incoming request without admitting it.
     /// `admit` is the mutating counterpart.
     pub fn decide(&self, request: &IncomingRequest, now_ms: u64) -> AdmissionDecision {
+        // Benchmark override: admit up to `m` concurrent immediately (no SLO
+        // delay); requeue with `until_ms: 0` so the next `promote_ready` retries
+        // as soon as a slot frees — no wall-clock advance required.
+        if let Some(m) = self.max_batch_override {
+            return if (self.inflight.len() as u32) < m {
+                AdmissionDecision::Admit
+            } else {
+                AdmissionDecision::Delay { until_ms: 0 }
+            };
+        }
         admission::decide(
             request,
             now_ms,
@@ -178,14 +200,9 @@ impl ContinuousBatcher {
             let Some(entry) = self.queue.pop_ready(now_ms) else {
                 break;
             };
-            let decision = admission::decide(
-                &entry.request,
-                now_ms,
-                self.policy.max_batch(),
-                self.inflight.len() as u32,
-                &self.workload.slo,
-                &self.estimator,
-            );
+            // Honor the benchmark override (and the SLO/load policy otherwise) by
+            // re-deciding through the same path as `admit`.
+            let decision = self.decide(&entry.request, now_ms);
             match decision {
                 AdmissionDecision::Admit => {
                     self.inflight

@@ -239,6 +239,33 @@ pub trait ComputeRuntime: Sized {
 
     /// Read the output buffer for the given tensor as an owned `Vec<f32>`.
     fn get_data_f32(&self, id: NodeIndex) -> Vec<f32>;
+
+    /// Read `elems` bf16 values at an external device pointer into host f32.
+    /// Used by the single-process `LocalTopology` to host-stage a cross-GPU
+    /// all-reduce over device-resident activation handoffs. CUDA only; the CPU
+    /// backend never holds device pointers, so the default returns empty.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `elems * 2` bytes on this
+    /// runtime's device.
+    unsafe fn read_device_bf16(&self, _ptr: u64, _elems: usize) -> Vec<f32> {
+        Vec::new()
+    }
+
+    /// Write host f32 (narrowed to bf16) back to an external device pointer.
+    /// Counterpart of [`read_device_bf16`](Self::read_device_bf16). CUDA only;
+    /// no-op default.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `data.len() * 2` bytes.
+    unsafe fn write_device_bf16(&self, _ptr: u64, _data: &[f32]) {}
+
+    /// Allocate a zeroed device buffer of `n_bytes`, returning its raw pointer
+    /// (leaked — caller owns the lifetime). Used for per-request KV buffers in
+    /// the continuous-batch driver. CUDA only; default returns 0.
+    fn alloc_device_zeros(&self, _n_bytes: usize) -> u64 {
+        0
+    }
 }
 
 /// Top-level entry. `R` selects the backend at the call site. Takes a
@@ -531,6 +558,18 @@ mod cuda_impl {
         }
         fn has_captured_graph(&self) -> bool {
             self.inner.has_captured_graph()
+        }
+
+        unsafe fn read_device_bf16(&self, ptr: u64, elems: usize) -> Vec<f32> {
+            unsafe { self.inner.read_device_bf16_to_f32(ptr, elems) }
+        }
+
+        unsafe fn write_device_bf16(&self, ptr: u64, data: &[f32]) {
+            unsafe { self.inner.write_f32_to_device_bf16(ptr, data) }
+        }
+
+        fn alloc_device_zeros(&self, n_bytes: usize) -> u64 {
+            self.inner.alloc_device_zeros(n_bytes)
         }
 
         fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>) {

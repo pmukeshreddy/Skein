@@ -873,6 +873,59 @@ extern "C" __global__ void shm_allreduce2(
         }
     }
 
+    /// Allocate a zeroed device buffer of `n_bytes` and return its raw pointer.
+    /// The buffer is intentionally leaked (the `CudaSlice` wrapper is forgotten)
+    /// so the caller owns the lifetime — used for per-request KV buffers in the
+    /// single-process continuous-batch driver, which need a distinct, stable,
+    /// zero-initialized contiguous KV buffer per in-flight request.
+    pub fn alloc_device_zeros(&self, n_bytes: usize) -> u64 {
+        let buf = self
+            .cuda_stream
+            .alloc_zeros::<u8>(n_bytes.max(1))
+            .expect("alloc_device_zeros");
+        let ptr = buf.device_ptr(&self.cuda_stream).0;
+        std::mem::forget(buf);
+        ptr
+    }
+
+    /// Read `elems` bf16 values at external device pointer `ptr` into a host
+    /// `Vec<f32>` (widening bf16 -> f32). Used by the single-process
+    /// `LocalTopology` to host-stage a cross-GPU all-reduce over device-resident
+    /// activation handoffs (no NVLink P2P required). Synchronizes the stream so
+    /// the producing kernel's write is complete before the copy is read.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of at least `elems * 2` bytes on
+    /// this runtime's device.
+    pub unsafe fn read_device_bf16_to_f32(&self, ptr: u64, elems: usize) -> Vec<f32> {
+        let nbytes = elems * 2;
+        let slice = unsafe { self.cuda_stream.upgrade_device_ptr::<u8>(ptr, nbytes) };
+        let host: Vec<u8> = self.cuda_stream.clone_dtoh(&slice).unwrap();
+        // The slice is a non-owning view of an externally-owned pointer; forget
+        // it so dropping the wrapper does not cuMemFree the caller's buffer.
+        std::mem::forget(slice);
+        host.chunks_exact(2)
+            .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect()
+    }
+
+    /// Write host `data` (f32, narrowed to bf16) to `data.len()` bf16 slots at
+    /// external device pointer `ptr`. Counterpart of [`read_device_bf16_to_f32`]
+    /// for writing the reduced all-reduce result back into each rank's buffer.
+    /// Synchronizes so the host source stays valid through the copy and the
+    /// device holds the result before a consumer reads it.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of at least `data.len() * 2` bytes.
+    pub unsafe fn write_f32_to_device_bf16(&self, ptr: u64, data: &[f32]) {
+        let bf: Vec<u16> = data.iter().map(|&x| bf16::from_f32(x).to_bits()).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&bf);
+        let mut slice = unsafe { self.cuda_stream.upgrade_device_ptr::<u8>(ptr, bytes.len()) };
+        self.cuda_stream.memcpy_htod(bytes, &mut slice).unwrap();
+        let _ = self.cuda_stream.synchronize();
+        std::mem::forget(slice);
+    }
+
     // ---- Full-step CUDA graph capture/replay on the shared stream (SKEIN_CAPTURE).
     // Any segment runtime can drive these: they all share the one capture stream,
     // so a capture begun here records every kernel any runtime launches on it.

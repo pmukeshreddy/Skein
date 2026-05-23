@@ -1278,7 +1278,7 @@ fn to_rt(e: CollectiveError) -> RuntimeError {
 
 /// The MoE `top_k` from a resolved schedule (all MoeRoute steps share it), or
 /// `None` on the dense path (no MoeRoute steps → no gate buffer needed).
-fn schedule_top_k(schedule: &[ResolvedSequenceStep]) -> Option<usize> {
+pub(crate) fn schedule_top_k(schedule: &[ResolvedSequenceStep]) -> Option<usize> {
     schedule.iter().find_map(|s| match s {
         ResolvedSequenceStep::MoeRoute { top_k, .. } => Some(*top_k),
         _ => None,
@@ -1287,15 +1287,33 @@ fn schedule_top_k(schedule: &[ResolvedSequenceStep]) -> Option<usize> {
 
 /// Allocate this runner's resident bf16 gate buffer (`num_layers * top_k` slots)
 /// on a fresh default-stream and bind its FFN gate inputs to fixed offsets once.
-fn install_gate_buffer(
+pub(crate) fn install_gate_buffer(
     runner: &mut SegmentRunner,
     schedule: &[ResolvedSequenceStep],
     rank: u32,
     num_layers: usize,
     top_k: usize,
 ) -> Result<(), RuntimeError> {
+    // Multi-process ranks see their GPU as device 0 (CUDA_VISIBLE_DEVICES), so
+    // the gate buffer goes on device 0. The single-process LocalTopology, which
+    // places runner `d` on physical device `d`, must instead call
+    // [`install_gate_buffer_on`] with the explicit device index.
+    install_gate_buffer_on(runner, schedule, rank, num_layers, top_k, 0)
+}
+
+/// Device-explicit variant of [`install_gate_buffer`]: allocate the gate buffer
+/// on `device` (the runner's physical GPU). The multi-process path passes the
+/// CUDA-visible device 0; the single-process LocalTopology passes the device idx.
+pub(crate) fn install_gate_buffer_on(
+    runner: &mut SegmentRunner,
+    schedule: &[ResolvedSequenceStep],
+    rank: u32,
+    num_layers: usize,
+    top_k: usize,
+    device: usize,
+) -> Result<(), RuntimeError> {
     let total = num_layers * top_k;
-    let ctx = cudarc::driver::CudaContext::new(0)
+    let ctx = cudarc::driver::CudaContext::new(device)
         .map_err(|e| RuntimeError::ServerInit(format!("gate buffer ctx: {e}")))?;
     let stream = ctx.default_stream();
     let buf = stream

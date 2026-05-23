@@ -14,16 +14,23 @@
 //! (attention + MoE output sums) and `AllGather` (final logits). `Broadcast` /
 //! `SendRecv` are handled for completeness.
 
+use skein_compile::HandoffId;
 use skein_cost::collectives::CollectiveKind;
 use skein_emit::segment::SequenceStep;
 
-use super::rank_executor::{LocalSegments, RankExecError};
+use super::rank_executor::{LocalSegments, RankExecError, ResolvedSequenceStep};
 use super::segment_runner::SegmentRunner;
 
 /// Drives all devices' paged segment runners through one global schedule pass.
 pub struct LocalTopology {
     runners: Vec<SegmentRunner>,
     sequencing: Vec<SequenceStep>,
+    /// Per-runner resolved schedule (id-keyed, with sparse-MoE routing + expert
+    /// weights pre-resolved per device). Empty = legacy host-only string-keyed
+    /// walk (the CPU mock tests / dense host-materialized path). When present,
+    /// `run_step` uses the resolved walk that handles `MoeRoute` and
+    /// device-resident collectives — required for the on-device sparse Mixtral.
+    resolved: Vec<Vec<ResolvedSequenceStep>>,
 }
 
 impl LocalTopology {
@@ -31,7 +38,15 @@ impl LocalTopology {
         Self {
             runners,
             sequencing,
+            resolved: Vec::new(),
         }
+    }
+
+    /// Install the per-runner resolved schedules (one per device, same step order;
+    /// MoeRoute expert weights resolved against each runner's resident weights).
+    /// Switches `run_step` to the device-resident-aware walk.
+    pub fn set_resolved(&mut self, resolved: Vec<Vec<ResolvedSequenceStep>>) {
+        self.resolved = resolved;
     }
 
     pub fn num_devices(&self) -> usize {
@@ -50,9 +65,168 @@ impl LocalTopology {
         &mut self.runners
     }
 
-    /// Walk the schedule once: execute each device's segments in order and
-    /// resolve each collective across its participants' runners.
+    /// Walk the schedule once. Uses the resolved, device-resident-aware walk when
+    /// per-runner resolved schedules are installed ([`set_resolved`]), else the
+    /// legacy host-only string-keyed walk (CPU tests / dense host path).
     pub fn run_step(&mut self) -> Result<(), RankExecError> {
+        if self.resolved.is_empty() {
+            self.run_step_host()
+        } else {
+            self.run_step_resolved()
+        }
+    }
+
+    /// Resolved walk: executes each device's segments + MoE routing, and resolves
+    /// every collective. A device-resident activation handoff (e.g. `embed_out`,
+    /// per-layer RingAllReduce) is all-reduced by host-staging each device's GPU
+    /// buffer (D2H bf16 -> sum -> H2D) — correct without NVLink P2P; tensors that
+    /// stay host (logits AllGather) take the f32-slot path.
+    fn run_step_resolved(&mut self) -> Result<(), RankExecError> {
+        // Structure (step kinds/order) is identical across runners; walk by index
+        // and dispatch each step using that device's own resolved entry. Extract a
+        // light descriptor first so the `resolved` borrow is released before the
+        // (mutable) runner operations.
+        enum StepKind {
+            Exec(usize, usize),
+            Moe(usize),
+            Coll(CollectiveKind, Vec<u32>),
+        }
+        let n = self.resolved[0].len();
+        for i in 0..n {
+            let kind = match &self.resolved[0][i] {
+                ResolvedSequenceStep::ExecuteSegment {
+                    device_idx,
+                    segment_idx,
+                } => StepKind::Exec(*device_idx as usize, *segment_idx),
+                ResolvedSequenceStep::MoeRoute { device_idx, .. } => {
+                    StepKind::Moe(*device_idx as usize)
+                }
+                ResolvedSequenceStep::Collective {
+                    collective,
+                    participants,
+                    ..
+                } => StepKind::Coll(*collective, participants.clone()),
+            };
+            match kind {
+                StepKind::Exec(d, seg) => self.runners[d].run_segment(seg)?,
+                StepKind::Moe(d) => {
+                    // Use device `d`'s own resolved MoeRoute (its experts/weights).
+                    if let ResolvedSequenceStep::MoeRoute {
+                        ffn_segment_idx,
+                        router_id,
+                        top_k,
+                        block,
+                        expert_weights,
+                        slot_ids,
+                        ..
+                    } = self.resolved[d][i].clone()
+                    {
+                        self.runners[d].route_moe_resolved(
+                            ffn_segment_idx,
+                            router_id,
+                            top_k,
+                            block,
+                            &expert_weights,
+                            &slot_ids,
+                        )?;
+                    }
+                }
+                StepKind::Coll(c, parts) => self.run_collective_resolved(c, &parts, i)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve one collective at resolved-step index `i`. Each participant's
+    /// tensor id is that runner's own interned id (`resolved[p][i]`).
+    fn run_collective_resolved(
+        &mut self,
+        kind: CollectiveKind,
+        participants: &[u32],
+        i: usize,
+    ) -> Result<(), RankExecError> {
+        if participants.is_empty() {
+            return Ok(());
+        }
+        // Per-participant interned tensor id (collect first → no aliasing of
+        // `resolved` while we touch `runners`).
+        let mut pt: Vec<(usize, HandoffId)> = Vec::with_capacity(participants.len());
+        for &p in participants {
+            let pi = p as usize;
+            if let ResolvedSequenceStep::Collective { tensor, .. } = &self.resolved[pi][i] {
+                pt.push((pi, *tensor));
+            }
+        }
+
+        // Try the device-resident all-reduce path: D2H each rank's GPU buffer.
+        if matches!(kind, CollectiveKind::RingAllReduce) {
+            let mut device_bufs: Vec<Vec<f32>> = Vec::with_capacity(pt.len());
+            let mut all_device = true;
+            for &(pi, tid) in &pt {
+                match self.runners[pi].read_device_handoff(tid) {
+                    Some(b) => device_bufs.push(b),
+                    None => {
+                        all_device = false;
+                        break;
+                    }
+                }
+            }
+            if all_device {
+                let sum = elementwise_sum(&device_bufs);
+                for &(pi, tid) in &pt {
+                    self.runners[pi].write_device_handoff(tid, &sum);
+                }
+                return Ok(());
+            }
+        }
+
+        // Host path (logits AllGather / Broadcast / a non-device-resident tensor).
+        let mut bufs: Vec<Vec<f32>> = Vec::with_capacity(pt.len());
+        for &(pi, tid) in &pt {
+            bufs.push(self.runners[pi].read_by_id(tid)?);
+        }
+        match kind {
+            CollectiveKind::RingAllReduce => {
+                let sum = elementwise_sum(&bufs);
+                for &(pi, tid) in &pt {
+                    self.runners[pi].write_by_id(tid, sum.clone())?;
+                }
+            }
+            CollectiveKind::AllGather => {
+                let gathered: Vec<f32> = bufs.iter().flatten().copied().collect();
+                for &(pi, tid) in &pt {
+                    self.runners[pi].write_by_id(tid, gathered.clone())?;
+                }
+            }
+            CollectiveKind::Broadcast => {
+                let src = bufs[0].clone();
+                for &(pi, tid) in &pt {
+                    self.runners[pi].write_by_id(tid, src.clone())?;
+                }
+            }
+            CollectiveKind::ReduceScatter => {
+                let sum = elementwise_sum(&bufs);
+                let chunk = sum.len() / pt.len().max(1);
+                for (rank, &(pi, tid)) in pt.iter().enumerate() {
+                    let start = rank * chunk;
+                    let end = (start + chunk).min(sum.len());
+                    self.runners[pi].write_by_id(tid, sum[start..end].to_vec())?;
+                }
+            }
+            CollectiveKind::SendRecv => {
+                if pt.len() >= 2 {
+                    let src = self.runners[pt[0].0].read_by_id(pt[0].1)?;
+                    self.runners[pt[1].0].write_by_id(pt[1].1, src)?;
+                }
+            }
+            kind => return Err(RankExecError::UnsupportedCollective { kind }),
+        }
+        Ok(())
+    }
+
+    /// Legacy host-only walk: execute each device's segments in order and
+    /// resolve each collective across its participants' runners (string-keyed).
+    fn run_step_host(&mut self) -> Result<(), RankExecError> {
         // Clone the (small) schedule so we can mutably borrow `runners` in the
         // loop without aliasing `self.sequencing`.
         let schedule = self.sequencing.clone();

@@ -177,6 +177,21 @@ pub struct SegmentRunner {
     /// [`SegmentRunner::set_gate_buffer`]). `None` until set / on the CPU build.
     #[cfg(feature = "cuda")]
     gate_buffer: Option<MoeGateBuffer>,
+    /// Continuous-batching per-request device KV. The default on-device KV path
+    /// binds ONE persistent KV buffer per layer (correct for a single in-flight
+    /// request), which concurrent requests would clobber. When `paged_device_kv`
+    /// is on, each in-flight request gets its OWN contiguous device KV buffer per
+    /// `kvcache_*` slot — bound on activation so reads/writes stay isolated. The
+    /// active request is tracked so the KV input feed selects the right buffer.
+    paged_device_kv: bool,
+    /// The request whose pages/buffers are currently active (set by
+    /// [`activate_request`](Self::activate_request)); selects which per-request
+    /// KV buffer the next `run_segment` binds under `paged_device_kv`.
+    active_request: Option<RequestId>,
+    /// Per-request KV device buffers: `request -> (slot -> base ptr)`. Allocated
+    /// lazily (zeroed) on a request's first activation and reused across its
+    /// decode steps. (Benchmark scope: freed in bulk at driver teardown.)
+    kv_req_bufs: HashMap<RequestId, Vec<Option<u64>>>,
 }
 
 /// Classify a handoff by its logical name. Mirrors the dispatch the previous
@@ -330,7 +345,44 @@ impl SegmentRunner {
             position_id: None,
             #[cfg(feature = "cuda")]
             gate_buffer: None,
+            paged_device_kv: false,
+            active_request: None,
+            kv_req_bufs: HashMap::new(),
         }
+    }
+
+    /// Enable per-request device KV buffers (continuous-batch driver). Off by
+    /// default so the single-request path keeps its single shared KV buffer.
+    pub fn set_paged_device_kv(&mut self, on: bool) {
+        self.paged_device_kv = on;
+    }
+
+    /// Get (or lazily allocate, zeroed) request `req`'s own contiguous device KV
+    /// buffer for KV-slot `slot` (`n_bytes` capacity). Allocated on the consuming
+    /// segment's runtime (this runner's GPU) and reused across the request's
+    /// decode steps. `None` if the backend has no device pointers (CPU).
+    fn req_kv_buffer(
+        &mut self,
+        segment_idx: usize,
+        req: RequestId,
+        slot: usize,
+        n_bytes: usize,
+    ) -> Option<u64> {
+        if let Some(bufs) = self.kv_req_bufs.get(&req)
+            && let Some(Some(p)) = bufs.get(slot)
+        {
+            return Some(*p);
+        }
+        let ptr = self.segments[segment_idx].runtime.alloc_device_zeros(n_bytes);
+        if ptr == 0 {
+            return None;
+        }
+        let n = self.kind.len();
+        let bufs = self.kv_req_bufs.entry(req).or_insert_with(|| vec![None; n]);
+        if slot < bufs.len() {
+            bufs[slot] = Some(ptr);
+        }
+        Some(ptr)
     }
 
     /// Resolve a logical name to its interned id, interning it on demand. Used by
@@ -457,6 +509,7 @@ impl SegmentRunner {
     pub fn activate_request(&mut self, id: RequestId, position: usize) -> Result<(), RuntimeError> {
         self.kv.set_active(id, position)?;
         self.position = position;
+        self.active_request = Some(id);
         Ok(())
     }
 
@@ -610,6 +663,39 @@ impl SegmentRunner {
             .first()
             .map(|seg| seg.runtime.has_captured_graph())
             .unwrap_or(false)
+    }
+
+    /// Host-stage one side of a cross-GPU all-reduce: D2H-read the device-resident
+    /// handoff `id` (bf16 -> f32) from this runner's GPU. `None` if the handoff is
+    /// not device-resident (then the caller falls back to the host `f32_slots`
+    /// path). Used by [`LocalTopology`](super::LocalTopology) so the single-process
+    /// continuous-batch driver can all-reduce on-device activations without NVLink
+    /// P2P. Any segment's runtime works — they share this runner's device context.
+    pub fn read_device_handoff(&self, id: HandoffId) -> Option<Vec<f32>> {
+        let (ptr, elems) = self.output_device_ptr_by_id(id)?;
+        let rt = &self.segments.first()?.runtime;
+        Some(unsafe { rt.read_device_bf16(ptr, elems) })
+    }
+
+    /// Write the reduced result back into the device-resident handoff `id`
+    /// (f32 -> bf16, H2D) so the consuming segment (which binds this buffer)
+    /// reads the all-reduced value. Returns false if `id` is not device-resident.
+    pub fn write_device_handoff(&self, id: HandoffId, data: &[f32]) -> bool {
+        let Some((ptr, _elems)) = self.output_device_ptr_by_id(id) else {
+            return false;
+        };
+        let Some(seg) = self.segments.first() else {
+            return false;
+        };
+        unsafe { seg.runtime.write_device_bf16(ptr, data) };
+        true
+    }
+
+    /// This runner's interned [`HandoffId`] for a logical tensor name, if known.
+    /// Each runner has its own `name -> id` map, so a collective tensor must be
+    /// resolved per runner. `None` if the name was never interned here.
+    pub fn handoff_id(&self, name: &str) -> Option<HandoffId> {
+        self.name_to_id.get(name).copied()
     }
 
     pub fn segment_count(&self) -> usize {
@@ -894,12 +980,30 @@ impl LocalSegments for SegmentRunner {
             match self.kind[slot] {
                 HandoffKind::KvCache { kind, layer } => {
                     let full = self.kv_full_elems[slot].unwrap_or(0);
-                    // Device-resident KV: bind a persistent on-GPU buffer (full
-                    // capacity, bf16) once and reuse it every step — NO assemble,
-                    // NO H2D. The new token's K/V is written into it via DtoD.
-                    let base = self.segments[segment_idx]
-                        .runtime
-                        .ensure_kv_input_device_by_id(id, full * 2);
+                    // Continuous batching: bind THIS request's own contiguous KV
+                    // buffer (per-request isolation). The shared single-buffer path
+                    // below would let concurrent requests clobber each other's KV.
+                    let base = if self.paged_device_kv {
+                        let req = self.active_request;
+                        let ptr =
+                            req.and_then(|r| self.req_kv_buffer(segment_idx, r, slot, full * 2));
+                        if let Some(p) = ptr {
+                            // Rebind the input to this request's buffer for this step.
+                            unsafe {
+                                self.segments[segment_idx]
+                                    .runtime
+                                    .bind_input_device_by_id(id, p, full * 2)
+                            };
+                        }
+                        ptr
+                    } else {
+                        // Single-request path: bind a persistent on-GPU buffer (full
+                        // capacity, bf16) once and reuse it every step — NO assemble,
+                        // NO H2D. The new token's K/V is written into it via DtoD.
+                        self.segments[segment_idx]
+                            .runtime
+                            .ensure_kv_input_device_by_id(id, full * 2)
+                    };
                     if let Some(b) = base {
                         self.kv_device_base[slot] = Some(b);
                     } else {

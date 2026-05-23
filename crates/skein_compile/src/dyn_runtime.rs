@@ -291,6 +291,30 @@ pub trait DynRuntime {
     ) {
     }
 
+    /// Read `elems` bf16 at external device `ptr` into host f32. Used by
+    /// `LocalTopology` to host-stage a cross-GPU all-reduce of a device-resident
+    /// activation handoff. CUDA only; default empty.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `elems * 2` bytes.
+    unsafe fn read_device_bf16(&self, _ptr: u64, _elems: usize) -> Vec<f32> {
+        Vec::new()
+    }
+
+    /// Write host f32 (narrowed to bf16) back to external device `ptr`. CUDA
+    /// only; no-op default.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `data.len() * 2` bytes.
+    unsafe fn write_device_bf16(&self, _ptr: u64, _data: &[f32]) {}
+
+    /// Allocate a zeroed device buffer of `n_bytes`, returning its raw pointer
+    /// (leaked). Used for per-request KV buffers in continuous batching. CUDA
+    /// only; default returns 0.
+    fn alloc_device_zeros(&self, _n_bytes: usize) -> u64 {
+        0
+    }
+
     /// Full-step CUDA graph capture/replay on the shared SKEIN_CAPTURE stream.
     /// CUDA only; defaults no-op / `false`.
     fn begin_stream_capture(&self) {}
@@ -835,6 +859,18 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             self.inner
                 .device_shm_all_reduce(data_ptr, shm_ptr, rank, elems, slot_bytes)
         };
+    }
+
+    unsafe fn read_device_bf16(&self, ptr: u64, elems: usize) -> Vec<f32> {
+        unsafe { self.inner.read_device_bf16(ptr, elems) }
+    }
+
+    unsafe fn write_device_bf16(&self, ptr: u64, data: &[f32]) {
+        unsafe { self.inner.write_device_bf16(ptr, data) }
+    }
+
+    fn alloc_device_zeros(&self, n_bytes: usize) -> u64 {
+        self.inner.alloc_device_zeros(n_bytes)
     }
 
     fn begin_stream_capture(&self) {

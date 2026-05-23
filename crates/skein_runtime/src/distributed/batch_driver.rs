@@ -28,14 +28,17 @@
 //! the scheduler, which is what lets requests join/leave every step and share
 //! the paged KV pool — independent of the per-forward batch width.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use skein_compile::{ComputeRuntime, SkeinArtifact, load_runtime_segments};
+use skein_cost::collectives::CollectiveKind;
+use skein_emit::segment::SequenceStep;
 
 use crate::batcher::ContinuousBatcher;
 use skein_compile::cuda_graph_exec_stats;
-use crate::distributed::rank_executor::LocalSegments;
+use crate::distributed::gpu_rank::{install_gate_buffer_on, schedule_top_k};
+use crate::distributed::rank_executor::{LocalSegments, ResolvedSequenceStep};
 use crate::distributed::{LocalTopology, SegmentRunner};
 use crate::error::RuntimeError;
 use crate::token_stream::TokenStreamer;
@@ -112,11 +115,70 @@ impl ContinuousBatchDriver {
         let artifact = SkeinArtifact::load(artifact_dir)
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
         let vocab = artifact.plan.model_meta.vocab as u32;
-        let sequencing = artifact.sequencing.clone();
+        let num_layers = artifact.plan.model_meta.num_layers;
+
+        // Sparse MoE re-lowers each device into gate/FFN-split segments with
+        // MoeRoute steps the stored (dense) schedule lacks, so re-derive the
+        // schedule to match the rebuilt segments (no recompile; same weights).
+        let sparse = std::env::var_os("SKEIN_SPARSE_MOE").is_some();
+        let ondevice = std::env::var_os("SKEIN_ONDEVICE_MOE").is_some();
+        let spread = std::env::var_os("SKEIN_SPREAD_DEVICES").is_some();
+        let schedule: Vec<SequenceStep> = if sparse {
+            artifact
+                .rebuild_sequencing()
+                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?
+        } else {
+            artifact.sequencing.clone()
+        };
+
+        // Only size-changing / final collectives (logits AllGather, Broadcast)
+        // stay host-materialized; RingAllReduce tensors and internal activations
+        // are device-resident (all-reduced in place across GPUs by the resolved
+        // walk). The driver reads `logits` host-side, so mark it host too.
+        let mut host_tensors: HashSet<String> = schedule
+            .iter()
+            .filter_map(|s| match s {
+                SequenceStep::Collective {
+                    collective, tensor, ..
+                } if !matches!(collective, CollectiveKind::RingAllReduce) => Some(tensor.clone()),
+                _ => None,
+            })
+            .collect();
+        host_tensors.insert(LOGITS.to_string());
+
         let per_device = load_runtime_segments::<R>(&artifact, search_budget)
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-        let runners: Vec<SegmentRunner> = per_device.into_iter().map(SegmentRunner::new).collect();
-        let topo = LocalTopology::new(runners, sequencing);
+        let mut runners: Vec<SegmentRunner> =
+            per_device.into_iter().map(SegmentRunner::new).collect();
+
+        // Per-device sparse bootstrap (mirrors the multi-process RankServer):
+        // mark host tensors, free search arenas + materialize the resident expert
+        // weights, resolve the schedule per runner, and install the resident
+        // gate-scalar buffer on the runner's own GPU.
+        let mut resolved_per: Vec<Vec<ResolvedSequenceStep>> = Vec::with_capacity(runners.len());
+        for (d, runner) in runners.iter_mut().enumerate() {
+            runner.set_host_tensors(host_tensors.clone());
+            // Per-request device KV: each in-flight request gets its own KV
+            // buffer so concurrent decode/prefill don't clobber each other.
+            runner.set_paged_device_kv(true);
+            if sparse || ondevice {
+                runner.clear_intermediates();
+                runner.materialize_weights();
+            }
+            let r = runner
+                .resolve_schedule(&schedule)
+                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+            if let Some(top_k) = schedule_top_k(&r) {
+                // Runner `d` lives on physical GPU `d` only when SKEIN_SPREAD_DEVICES
+                // is set (else all on device 0). Place the gate buffer accordingly.
+                let device = if spread { d } else { 0 };
+                install_gate_buffer_on(runner, &r, d as u32, num_layers, top_k, device)?;
+            }
+            resolved_per.push(r);
+        }
+
+        let mut topo = LocalTopology::new(runners, schedule);
+        topo.set_resolved(resolved_per);
         Ok(Self {
             topo,
             batcher,

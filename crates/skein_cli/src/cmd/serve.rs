@@ -61,12 +61,23 @@ async fn run_batch_demo(args: ServeArgs) -> Result<(), CliError> {
     // Tokenize the demo prompts with the model's real tokenizer when bundled.
     let tokenizer = SkeinTokenizer::from_artifact_dir(&artifact_dir).ok().flatten();
     let vocab = plan.model_meta.vocab as u32;
-    let prompts: Vec<String> = match args.demo_prompts {
-        Some(s) => s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect(),
-        None => vec![
-            "The capital of France is".to_string(),
-            "The capital of France is Paris".to_string(),
-        ],
+    // SKEIN_PROMPTS_FILE: a JSON array of prompt strings (handles commas/newlines
+    // that the comma-separated `--demo-prompts` cannot) — used to drive the
+    // continuous batcher with real ShareGPT conversations.
+    let prompts: Vec<String> = if let Some(path) = std::env::var_os("SKEIN_PROMPTS_FILE") {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| CliError::BadArgument(format!("read SKEIN_PROMPTS_FILE: {e}")))?;
+        let v: Vec<String> = serde_json::from_slice(&bytes)
+            .map_err(|e| CliError::BadArgument(format!("parse SKEIN_PROMPTS_FILE (expect JSON array of strings): {e}")))?;
+        v.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+    } else {
+        match args.demo_prompts {
+            Some(s) => s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect(),
+            None => vec![
+                "The capital of France is".to_string(),
+                "The capital of France is Paris".to_string(),
+            ],
+        }
     };
     let encode = |p: &str| -> Vec<u32> {
         match &tokenizer {
@@ -113,14 +124,28 @@ async fn run_batch_demo(args: ServeArgs) -> Result<(), CliError> {
                 .submit(toks.clone(), max_new, now)
                 .map_err(|e| e.to_string())?;
         }
+        let wall = std::time::Instant::now();
         let results = driver.run_to_completion(now).map_err(|e| e.to_string())?;
+        let wall_s = wall.elapsed().as_secs_f64();
         out.push_str("=== Phase A: concurrent continuous batching ===\n");
+        let mut total_decode_tokens = 0usize;
         for r in &results {
+            // Decode tokens = generated tokens beyond the prompt (one per decode step).
+            total_decode_tokens += r.tokens.len();
             out.push_str(&format!(
                 "  req#{} prompt_len={} prefix_hit={} prefill_steps={} tokens={:?}\n",
                 r.order, r.prompt_len, r.prefix_hit_tokens, r.prefill_steps, r.tokens
             ));
         }
+        let agg = if wall_s > 0.0 { total_decode_tokens as f64 / wall_s } else { 0.0 };
+        out.push_str(&format!(
+            "=== Aggregate (Phase A) ===\n  requests={} total_generated_tokens={} wall_s={:.3} \
+             aggregate_tokens_per_s={:.2}\n",
+            results.len(),
+            total_decode_tokens,
+            wall_s,
+            agg,
+        ));
 
         // Phase B: re-submit the first prompt — its KV pages are still cached,
         // so the shared prefix is reused (prefix_hit > 0) with fewer prefill
