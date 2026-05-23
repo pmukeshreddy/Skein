@@ -946,11 +946,36 @@ impl HostOp for GLUMoE {
         };
 
         // Scratch: x as bf16 [seq, hidden]; gated hidden [seq*top_k, intermediate] bf16.
-        let x_bf16_buf = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
-        let hid_buf = unsafe { stream.alloc::<u8>(seq * top_k * intermediate * 2)? };
-        let xbf16_ptr = slice_ptr(&x_bf16_buf, stream);
-        let hid_ptr = slice_ptr(&hid_buf, stream);
+        // SKEIN_CAPTURE: these are read/written by the captured gate_up / down
+        // kernels, so a per-call alloc (freed at scope end) would make the replayed
+        // graph touch freed/reused addresses — garbage. Use persistent scratch
+        // (distinct keys: x and hid coexist within the op; one buffer each is safe
+        // because the MoE layers run serialized on the shared capture stream).
+        let _x_owned;
+        let _hid_owned;
+        let (xbf16_ptr, hid_ptr) = if super::is_capture() {
+            (
+                super::capture_scratch(stream, 2, seq * hidden * 2),
+                super::capture_scratch(stream, 3, seq * top_k * intermediate * 2),
+            )
+        } else {
+            let x_bf16_buf = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
+            let hid_buf = unsafe { stream.alloc::<u8>(seq * top_k * intermediate * 2)? };
+            let xp = slice_ptr(&x_bf16_buf, stream);
+            let hp = slice_ptr(&hid_buf, stream);
+            _x_owned = x_bf16_buf;
+            _hid_owned = hid_buf;
+            (xp, hp)
+        };
 
+        if std::env::var_os("SKEIN_FI_LOG").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 100 && n % 16 == 0 {
+                eprintln!("SKEIN_MOE call#{n} seq={seq} hidden={hidden} top_k={top_k} inter={intermediate} fp8={}", fp8w.is_some());
+            }
+        }
         // x F32 -> BF16.
         let n_cast = (seq * hidden) as i32;
         let cast_blocks = (n_cast as u32).div_ceil(256);

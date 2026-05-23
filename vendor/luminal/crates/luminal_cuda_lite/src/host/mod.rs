@@ -1,11 +1,61 @@
 use std::{fmt::Debug, sync::Arc};
 
-use crate::cudarc::driver::{CudaStream, DriverError, result};
+use crate::cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DriverError, result};
 use luminal::{op::EgglogOp, prelude::*};
 mod cublas;
 mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
+
+/// True iff SKEIN_CAPTURE is set (full-step CUDA-graph capture). Cached.
+pub fn is_capture() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var_os("SKEIN_CAPTURE").is_some())
+}
+
+/// Persistent per-`key` scratch device buffer for the SKEIN_CAPTURE full-step
+/// graph. A normal per-call `stream.alloc` is freed at scope end, so a captured
+/// kernel that scratched into it would, on every graph replay, read/write a
+/// freed (and since-reused) address — producing garbage. This keeps one buffer
+/// per `key` alive (grown monotonically) and returns its stable device pointer,
+/// reused every step. Safe because all captured kernels run serialized on the
+/// single shared capture stream, so one buffer per key is never touched by two
+/// concurrent kernels. Distinct `key`s are required for buffers that must coexist
+/// within one op (e.g. a GEMV's input vs its output).
+pub fn capture_scratch(stream: &Arc<CudaStream>, key: u32, bytes: usize) -> u64 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashMap<u32, CudaSlice<u8>>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = pool.lock().unwrap();
+    let need = match g.get(&key) {
+        Some(b) => b.len() < bytes,
+        None => true,
+    };
+    if need {
+        let buf = unsafe { stream.alloc::<u8>(bytes.max(1)).unwrap() };
+        g.insert(key, buf);
+    }
+    let buf = g.get(&key).unwrap();
+    let (ptr, _guard) = buf.device_ptr(stream);
+    ptr
+}
+
+/// Persistent device buffer holding a single `1.0f32` (the unit tensorwide scale),
+/// for SKEIN_CAPTURE: a per-call `clone_htod(&[1.0])` is freed at scope end, so a
+/// captured fp8 matmul would read a stale scale pointer on replay. Allocated once.
+pub fn capture_unit_scale(stream: &Arc<CudaStream>) -> u64 {
+    use std::sync::{Mutex, OnceLock};
+    static S: OnceLock<Mutex<Option<CudaSlice<u8>>>> = OnceLock::new();
+    let m = S.get_or_init(|| Mutex::new(None));
+    let mut g = m.lock().unwrap();
+    if g.is_none() {
+        let bytes = unsafe { std::slice::from_raw_parts([1.0f32].as_ptr() as *const u8, 4) };
+        *g = Some(stream.clone_htod(bytes).unwrap());
+    }
+    let (ptr, _guard) = g.as_ref().unwrap().device_ptr(stream);
+    ptr
+}
 
 pub type Ops = (
     // cublas::CuBlasSgemmV2,

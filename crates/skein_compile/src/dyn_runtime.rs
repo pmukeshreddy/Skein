@@ -175,6 +175,36 @@ pub trait DynRuntime {
     ) -> Result<(), DynRuntimeError> {
         Err(DynRuntimeError::UnknownTensor(format!("id {}", id.0)))
     }
+
+    /// Write an f32 input by id **immediately** to its device buffer, in place,
+    /// bypassing the per-step `staged_*` map drained at `execute_segment`.
+    ///
+    /// SKEIN_CAPTURE needs this: a captured full-step graph replays kernels
+    /// without ever calling `execute_segment`, so the staged → upload path never
+    /// runs on replay and the input would freeze at its capture-time value. Worse,
+    /// when the staged upload *does* run (during the capture step) its host→device
+    /// copy is recorded into the graph from a transient host buffer that is freed
+    /// right after — so replays read freed memory. This setter performs the upload
+    /// now (outside the captured region, stream-ordered before the replay) and
+    /// clears any staged value for the node so no copy is recorded into the graph.
+    /// CUDA only; default errors like the other id setters.
+    fn set_input_f32_immediate_by_id(
+        &mut self,
+        id: HandoffId,
+        _data: Vec<f32>,
+    ) -> Result<(), DynRuntimeError> {
+        Err(DynRuntimeError::UnknownTensor(format!("id {}", id.0)))
+    }
+
+    /// Write an i32 input by id **immediately** to its device buffer, in place.
+    /// See [`DynRuntime::set_input_f32_immediate_by_id`].
+    fn set_input_i32_immediate_by_id(
+        &mut self,
+        id: HandoffId,
+        _data: Vec<i32>,
+    ) -> Result<(), DynRuntimeError> {
+        Err(DynRuntimeError::UnknownTensor(format!("id {}", id.0)))
+    }
     /// Read an output by id. See [`DynRuntime::set_tensor_by_id`].
     fn get_tensor_by_id(&self, id: HandoffId) -> Result<Vec<f32>, DynRuntimeError> {
         Err(DynRuntimeError::UnknownTensor(format!("id {}", id.0)))
@@ -687,6 +717,42 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             self.external_f32
                 .insert(node, data.into_iter().map(|v| v as f32).collect());
         }
+        Ok(())
+    }
+
+    fn set_input_f32_immediate_by_id(
+        &mut self,
+        id: HandoffId,
+        data: Vec<f32>,
+    ) -> Result<(), DynRuntimeError> {
+        let node = self
+            .node_for_input_id(id)
+            .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
+        // Drop any staged value so `execute_segment` does not also record a
+        // host→device copy for this node into the captured graph.
+        self.staged_f32.remove(&node);
+        let dtype = self
+            .graph
+            .input_meta
+            .get(&node)
+            .map(|(_, dt)| *dt)
+            .unwrap_or(DType::F32);
+        // In-place upload to the input's resident (persistent under capture)
+        // device buffer — now, not at the next execute().
+        self.inner.set_data_f32_as(node, data, dtype);
+        Ok(())
+    }
+
+    fn set_input_i32_immediate_by_id(
+        &mut self,
+        id: HandoffId,
+        data: Vec<i32>,
+    ) -> Result<(), DynRuntimeError> {
+        let node = self
+            .node_for_input_id(id)
+            .ok_or_else(|| DynRuntimeError::UnknownTensor(format!("id {}", id.0)))?;
+        self.staged_i32.remove(&node);
+        self.inner.set_data_i32(node, data);
         Ok(())
     }
 

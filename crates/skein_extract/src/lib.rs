@@ -92,6 +92,17 @@ pub fn extract_plan(
         if force_parallelism_skip(&global.parallelism) {
             continue;
         }
+        // Debug override: SKEIN_FORCE_BATCH pins the decode batch width so a
+        // batch>1 graph can be compiled regardless of the cost ranking (the
+        // search otherwise picks max_batch=1 for single-stream latency). Used to
+        // build batched-throughput artifacts.
+        if let Some(fb) = std::env::var("SKEIN_FORCE_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            && global.batch.max_batch() != fb
+        {
+            continue;
+        }
         if let Some(reason) = constraints::reject(&global, cluster, ir, cost_model) {
             counters.reject(reason);
             continue;

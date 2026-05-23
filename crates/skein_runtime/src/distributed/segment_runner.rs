@@ -156,6 +156,23 @@ pub struct SegmentRunner {
     /// `handoffs` (shape [seq, kv_dim]) so the caller can write the N tokens'
     /// K/V into the decode runner's cache. See `RankServer::forward_prefill`.
     prefill_capture: bool,
+    /// When true (SKEIN_CAPTURE active), `run_segment` skips the two per-token
+    /// host→device scalar updates — the `input_tokens` feed and the
+    /// `set_decode_position` memcpy — so they are NOT recorded into the captured
+    /// full-step graph (a recorded host→device copy would bake in a now-freed
+    /// host source pointer and replay garbage). Instead they are written into
+    /// their persistent device buffers every step, outside the capture window, by
+    /// [`flush_step_device_inputs`](Self::flush_step_device_inputs).
+    capturing: bool,
+    /// Pre-resolved id of the `input_tokens` i32 input, so `run_segment` (skip
+    /// path) and `flush_step_device_inputs` (write path) agree on which input is
+    /// the per-token token id.
+    input_tokens_id: Option<HandoffId>,
+    /// Pre-resolved id of the `position` f32 input (the absolute decode position
+    /// the attention segments use for RoPE and to derive the KV length /
+    /// FlashInfer indptr). Same skip/flush treatment as `input_tokens` so it is
+    /// not frozen inside the captured full-step graph.
+    position_id: Option<HandoffId>,
     /// Resident bf16 buffer for all MoE gate scalars (set at bootstrap by
     /// [`SegmentRunner::set_gate_buffer`]). `None` until set / on the CPU build.
     #[cfg(feature = "cuda")]
@@ -308,6 +325,9 @@ impl SegmentRunner {
             kv,
             position: 0,
             prefill_capture: false,
+            capturing: false,
+            input_tokens_id: None,
+            position_id: None,
             #[cfg(feature = "cuda")]
             gate_buffer: None,
         }
@@ -478,6 +498,7 @@ impl SegmentRunner {
         // request was begun).
         let _ = self.kv.set_position(position);
         let id = self.intern_name("position");
+        self.position_id = Some(id);
         self.f32_slots[id.idx()] = Some(vec![position as f32]);
     }
 
@@ -485,7 +506,84 @@ impl SegmentRunner {
     /// feeds the last token id each decode step, matching the executor).
     pub fn set_input_tokens(&mut self, name: &str, tokens: Vec<i32>) {
         let id = self.intern_name(name);
+        self.input_tokens_id = Some(id);
         self.i32_slots[id.idx()] = Some(tokens);
+    }
+
+    /// Enable/disable captured-graph mode (SKEIN_CAPTURE). When on, `run_segment`
+    /// skips the per-token `input_tokens` feed and the `set_decode_position`
+    /// memcpy so they aren't recorded into the full-step graph;
+    /// [`flush_step_device_inputs`](Self::flush_step_device_inputs) writes them
+    /// into the persistent device buffers each step instead.
+    pub fn set_capturing(&mut self, on: bool) {
+        self.capturing = on;
+    }
+
+    /// SKEIN_CAPTURE: write this step's per-token device inputs — the decode
+    /// `position` (read by every captured `kv_slot_write` kernel) and the
+    /// `input_tokens` id (read by the captured embedding) — directly into their
+    /// persistent device buffers, OUTSIDE the captured graph. The buffers keep a
+    /// stable device pointer (the captured kernels read those pointers), so the
+    /// graph sees fresh values on every replay without any host→device copy being
+    /// recorded into it. Must be called every decode step before replay/capture,
+    /// on the shared capture stream (it is — these go through each segment's
+    /// runtime, which shares that stream under SKEIN_CAPTURE).
+    pub fn flush_step_device_inputs(&mut self, token: i32, position: usize) {
+        self.position = position;
+        let _ = self.kv.set_position(position);
+        let tok_id = self.input_tokens_id;
+        let pos_id = self.position_id;
+        let log = std::env::var_os("SKEIN_FI_LOG").is_some();
+        let (mut n_kv, mut n_tok, mut n_pos, mut n_err) = (0, 0, 0, 0);
+        for segment_idx in 0..self.segments.len() {
+            // decode position: every segment that writes a KV slot reads its own
+            // runtime's device position buffer in the captured kv_slot_write.
+            let writes_kv = self.segment_outputs[segment_idx]
+                .iter()
+                .any(|id| matches!(self.kind[id.idx()], HandoffKind::KvCache { .. }));
+            if writes_kv {
+                self.segments[segment_idx].runtime.set_decode_position(position);
+                n_kv += 1;
+            }
+            // input token: the segment(s) consuming `input_tokens` (the embedding).
+            // Use the IMMEDIATE setter (not the staging `set_tensor_i32_by_id`):
+            // staged values are only uploaded at `execute_segment`, which never
+            // runs on a captured-graph replay — so a staged token would freeze at
+            // its capture-time value (and the capture-step upload would record a
+            // freed-host-source copy into the graph). The immediate write lands in
+            // the resident device buffer now, outside the captured region.
+            if let Some(tok_id) = tok_id {
+                if self.segment_inputs[segment_idx].iter().any(|id| *id == tok_id) {
+                    match self.segments[segment_idx]
+                        .runtime
+                        .set_input_i32_immediate_by_id(tok_id, vec![token])
+                    {
+                        Ok(()) => n_tok += 1,
+                        Err(_) => n_err += 1,
+                    }
+                }
+            }
+            // position scalar: the attention segments use it for RoPE and to derive
+            // the KV validity mask — must be fresh each replay. Same immediate-write
+            // reasoning as the token above.
+            if let Some(pos_id) = pos_id {
+                if self.segment_inputs[segment_idx].iter().any(|id| *id == pos_id) {
+                    match self.segments[segment_idx]
+                        .runtime
+                        .set_input_f32_immediate_by_id(pos_id, vec![position as f32])
+                    {
+                        Ok(()) => n_pos += 1,
+                        Err(_) => n_err += 1,
+                    }
+                }
+            }
+        }
+        if log {
+            eprintln!(
+                "SKEIN_FLUSH pos={position} tok={token} fed: kv={n_kv} tok={n_tok} pos={n_pos} err={n_err} (segs={})",
+                self.segments.len()
+            );
+        }
     }
 
     /// Full-step CUDA graph (SKEIN_CAPTURE): drive capture/replay on the shared
@@ -766,6 +864,27 @@ impl LocalSegments for SegmentRunner {
         // feature off this is a zero-sized no-op — no `Instant::now()` here.
         let mut t = crate::perf_timing::SegTimer::start_in();
 
+        // DEBUG (SKEIN_DUMP_CAP): one-shot dump of each segment's inputs+kinds so
+        // we can see exactly which host-fed inputs land inside the capture window.
+        if std::env::var_os("SKEIN_DUMP_CAP").is_some() {
+            for i in 0..self.segment_inputs[segment_idx].len() {
+                let id = self.segment_inputs[segment_idx][i];
+                let name = self.id_to_name.get(id.idx()).cloned().unwrap_or_default();
+                eprintln!(
+                    "SKEIN_DUMP_CAP seg={segment_idx} in='{name}' kind={:?}",
+                    self.kind[id.idx()]
+                );
+            }
+            for i in 0..self.segment_outputs[segment_idx].len() {
+                let id = self.segment_outputs[segment_idx][i];
+                let name = self.id_to_name.get(id.idx()).cloned().unwrap_or_default();
+                eprintln!(
+                    "SKEIN_DUMP_CAP seg={segment_idx} OUT='{name}' kind={:?}",
+                    self.kind[id.idx()]
+                );
+            }
+        }
+
         // Feed inputs by pre-resolved id — no `Vec<String>` clone, no per-name
         // HashMap lookup. Each id's `kind` (fixed at construction) selects the
         // same dispatch the old string-keyed loop performed.
@@ -813,25 +932,47 @@ impl LocalSegments for SegmentRunner {
                     }
                 }
                 HandoffKind::I32 => {
-                    if let Some(data) = self.i32_slots[slot].clone() {
-                        crate::perf_counters::record_h2d(data.len() * std::mem::size_of::<i32>());
-                        self.segments[segment_idx]
-                            .runtime
-                            .set_tensor_i32_by_id(id, data)
-                            .map_err(&err)?;
+                    // SKEIN_CAPTURE: the `input_tokens` feed is handled outside the
+                    // captured graph by `flush_step_device_inputs` (writing into the
+                    // same persistent device buffer). Doing it here would record a
+                    // host→device copy into the graph from a freed host source.
+                    let skip = self.capturing && Some(id) == self.input_tokens_id
+                        && std::env::var_os("SKEIN_NO_SKIP").is_none();
+                    if !skip {
+                        if let Some(data) = self.i32_slots[slot].clone() {
+                            crate::perf_counters::record_h2d(
+                                data.len() * std::mem::size_of::<i32>(),
+                            );
+                            self.segments[segment_idx]
+                                .runtime
+                                .set_tensor_i32_by_id(id, data)
+                                .map_err(&err)?;
+                        }
                     }
                 }
                 HandoffKind::F32 | HandoffKind::HostCollective => {
+                    // SKEIN_CAPTURE: the `position` scalar is refreshed outside the
+                    // captured graph by `flush_step_device_inputs`; feeding it here
+                    // would record a host→device copy from a freed source (freezing
+                    // RoPE and the FlashInfer KV length). Collective results
+                    // (`logits` etc.) are NOT skipped — they live in the host tail,
+                    // outside the captured window, and are produced within the step.
+                    let skip = self.capturing && Some(id) == self.position_id
+                        && std::env::var_os("SKEIN_NO_SKIP").is_none();
                     // Peek (clone), not take: `position` is read by every attention
                     // segment within one step (it is staged once by `set_position`),
                     // so taking it would null it after the first reader. These host
                     // f32 inputs are all tiny (scalars / small collective results).
-                    if let Some(data) = self.f32_slots[slot].clone() {
-                        crate::perf_counters::record_h2d(data.len() * std::mem::size_of::<f32>());
-                        self.segments[segment_idx]
-                            .runtime
-                            .set_tensor_by_id(id, data)
-                            .map_err(&err)?;
+                    if !skip {
+                        if let Some(data) = self.f32_slots[slot].clone() {
+                            crate::perf_counters::record_h2d(
+                                data.len() * std::mem::size_of::<f32>(),
+                            );
+                            self.segments[segment_idx]
+                                .runtime
+                                .set_tensor_by_id(id, data)
+                                .map_err(&err)?;
+                        }
                     }
                 }
             }
@@ -872,7 +1013,14 @@ impl LocalSegments for SegmentRunner {
                                     // dest baked in). See piece 2 of the full-step
                                     // graph (SKEIN_DEVICE_KV).
                                     let rt = &self.segments[segment_idx].runtime;
-                                    rt.set_decode_position(self.position);
+                                    // SKEIN_CAPTURE: the position memcpy is done
+                                    // outside the graph by flush_step_device_inputs
+                                    // (recording it here would bake a freed host
+                                    // stack pointer into the graph). The captured
+                                    // kv_slot_write still reads the device buffer.
+                                    if !self.capturing || std::env::var_os("SKEIN_NO_SKIP").is_some() {
+                                        rt.set_decode_position(self.position);
+                                    }
                                     unsafe {
                                         rt.copy_output_to_kv_slot_by_id(id, base, out_bytes)
                                     };

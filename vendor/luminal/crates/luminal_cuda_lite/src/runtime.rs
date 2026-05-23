@@ -397,9 +397,57 @@ impl CudaRuntime {
 
     pub fn set_data(&mut self, id: impl ToId, data: impl ToCudaInput) {
         let id = id.to_id();
+        // A3 (in-place input reuse): if a device buffer of the same byte length is
+        // already registered for this id, overwrite its contents in place instead
+        // of allocating a fresh one. The device pointer then stays stable across
+        // executes, which a captured full-step graph (SKEIN_CAPTURE) requires — it
+        // bakes the input pointer in at capture time and reads from it on every
+        // replay. The buffer is also marked persistent so execute()'s consume pass
+        // keeps it (it would otherwise be freed after the forward and re-allocated
+        // at a new address next token).
+        let same_size = matches!(
+            self.hlir_buffers.get(&id),
+            Some(CudaInput::Buffer(buf)) if buf.len() == data.as_host_bytes().len()
+        );
+        let dbg_small = std::env::var_os("SKEIN_FI_LOG").is_some()
+            && data.as_host_bytes().len() <= 8;
+        if same_size {
+            let stream = self.cuda_stream.clone();
+            let mut p = 0u64;
+            if let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get_mut(&id) {
+                stream.memcpy_htod(data.as_host_bytes(), buf).unwrap();
+                if dbg_small {
+                    p = buf.device_ptr(&stream).0;
+                }
+            }
+            self.persistent_hlir_inputs.insert(id);
+            self.changed_hlir.insert(id);
+            if dbg_small {
+                eprintln!("SKEIN_SETDATA id={} INPLACE ptr=0x{:x} bytes={}", id.index(), p, data.as_host_bytes().len());
+            }
+            return;
+        }
+        let nbytes = data.as_host_bytes().len();
         let cuda_input = data.to_cuda_input(&self.cuda_stream);
+        if dbg_small {
+            if let CudaInput::Buffer(buf) = &cuda_input {
+                eprintln!("SKEIN_SETDATA id={} ALLOC   ptr=0x{:x} bytes={}", id.index(), buf.device_ptr(&self.cuda_stream).0, nbytes);
+            }
+        }
         self.hlir_buffers.insert(id, cuda_input);
         self.changed_hlir.insert(id);
+        // Under SKEIN_CAPTURE, mark the buffer persistent on its FIRST allocation
+        // too. Otherwise execute()'s consume pass frees it after this forward, so
+        // next step's set_data re-allocates at a NEW device address — and the
+        // captured full-step graph, which baked the buffer's pointer at capture
+        // time, would then read a stale/freed address on every replay (the cause
+        // of correct warmup but garbage replays). Persisting it keeps the address
+        // stable so the in-place branch above handles all subsequent steps and the
+        // captured graph always reads the current data.
+        static CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CAP.get_or_init(|| std::env::var_os("SKEIN_CAPTURE").is_some()) {
+            self.persistent_hlir_inputs.insert(id);
+        }
     }
 
     /// Mark an HLIR input node (e.g. a model weight) as persistent: its buffer
@@ -1433,65 +1481,56 @@ extern "C" __global__ void shm_allreduce2(
 
 pub trait ToCudaInput {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput;
+    /// Borrow the host bytes backing this input as a raw little-endian `&[u8]`.
+    /// Used by `set_data` for in-place buffer reuse (A3): when a same-size device
+    /// buffer already exists for an id, its contents are overwritten from these
+    /// bytes rather than allocating a fresh buffer, keeping the device pointer
+    /// stable across executes (required for captured-graph replay).
+    fn as_host_bytes(&self) -> &[u8];
 }
 
 impl ToCudaInput for &[f32] {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
+        CudaInput::Buffer(stream.clone_htod(self.as_host_bytes()).unwrap())
+    }
+    fn as_host_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4) }
     }
 }
 
 impl ToCudaInput for Vec<i32> {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
+        CudaInput::Buffer(stream.clone_htod(self.as_host_bytes()).unwrap())
+    }
+    fn as_host_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4) }
     }
 }
 
 impl ToCudaInput for Vec<f32> {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
+        CudaInput::Buffer(stream.clone_htod(self.as_host_bytes()).unwrap())
+    }
+    fn as_host_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4) }
     }
 }
 
 impl ToCudaInput for Vec<f16> {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 2)
-                })
-                .unwrap(),
-        )
+        CudaInput::Buffer(stream.clone_htod(self.as_host_bytes()).unwrap())
+    }
+    fn as_host_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 2) }
     }
 }
 
 impl ToCudaInput for Vec<bf16> {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 2)
-                })
-                .unwrap(),
-        )
+        CudaInput::Buffer(stream.clone_htod(self.as_host_bytes()).unwrap())
+    }
+    fn as_host_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 2) }
     }
 }
 
@@ -1499,11 +1538,17 @@ impl ToCudaInput for &[u8] {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
         CudaInput::Buffer(stream.clone_htod(self).unwrap())
     }
+    fn as_host_bytes(&self) -> &[u8] {
+        self
+    }
 }
 
 impl ToCudaInput for Vec<u8> {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
         CudaInput::Buffer(stream.clone_htod(&self).unwrap())
+    }
+    fn as_host_bytes(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -1994,6 +2039,17 @@ impl Runtime for CudaRuntime {
         if self.profiling {
             return;
         }
+        // SKEIN_CAPTURE: never free input buffers. The full-step graph bakes each
+        // input's device pointer at capture time; freeing+reallocating an input
+        // between steps (the normal consume behavior) would leave the replayed
+        // graph reading a stale/reused address — garbage. set_data overwrites the
+        // same-size buffer in place, so keeping them resident does NOT accumulate.
+        {
+            static CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CAP.get_or_init(|| std::env::var_os("SKEIN_CAPTURE").is_some()) {
+                return;
+            }
+        }
         let bucket = &self.compiled_buckets[self.active_bucket];
         let mut inputs_with_outputs = bucket.preserved_hlir_inputs.clone();
 
@@ -2020,6 +2076,14 @@ impl Runtime for CudaRuntime {
             .copied()
             .collect();
 
+        if std::env::var_os("SKEIN_FI_LOG").is_some() && !to_consume.is_empty() {
+            eprintln!(
+                "SKEIN_CONSUME removing {} bufs (persistent={}, hlir_total={})",
+                to_consume.len(),
+                self.persistent_hlir_inputs.len(),
+                self.hlir_buffers.len()
+            );
+        }
         for hlir_node in to_consume {
             self.hlir_buffers.remove(&hlir_node);
             self.external_buffers.remove(&hlir_node);

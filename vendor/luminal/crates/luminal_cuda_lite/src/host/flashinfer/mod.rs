@@ -254,6 +254,16 @@ impl HostOp for FlashInferAttention {
             let mut v = std::mem::ManuallyDrop::new(kv_indptr_host_bytes);
             Vec::from_raw_parts(v.as_mut_ptr() as *mut i32, r, r)
         };
+        if std::env::var_os("SKEIN_FI_LOG").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "SKEIN_FI_LOG call#{n} batch={batch_size} kv_len(last)={} indptr={:?}",
+                kv_indptr_host.last().copied().unwrap_or(-1),
+                &kv_indptr_host[..r.min(4)]
+            );
+        }
 
         // kv_last_page_len = [1; batch_size] when page_size=1.
         let last_page_host: Vec<i32> = vec![1; batch_size];

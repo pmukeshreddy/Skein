@@ -331,6 +331,13 @@ impl RankServer {
             hi
         };
 
+        if std::env::var_os("SKEIN_FI_LOG").is_some() {
+            eprintln!(
+                "SKEIN_SPLIT capture_lo={capture_lo} capture_hi={capture_hi} capture_split={capture_split} len={} rank={}",
+                schedule_resolved.len(),
+                layout.rank
+            );
+        }
         Ok(Self {
             layout,
             executor,
@@ -402,17 +409,45 @@ impl RankServer {
         // cuGraphLaunch. The host pre-region (the receiver's boundary recv) and
         // post-region (the sender's boundary send, or TP's logits all-gather +
         // read) run on the host every step, outside the capture.
-        const CAPTURE_AT: usize = 2;
+        let capture_at: usize = std::env::var("SKEIN_CAPTURE_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
         let lo = self.capture_lo;
-        let hi = self.capture_split;
+        // SKEIN_CAPTURE_HI: bisection knob — cap the captured window's upper bound
+        // so the segments in [hi, capture_split) run via run_segment (host) instead
+        // of the graph. Lets us find the first segment whose replay is wrong.
+        let cap_hi_override: Option<usize> = std::env::var("SKEIN_CAPTURE_HI")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let hi = match cap_hi_override {
+            Some(h) => h.min(self.capture_split),
+            None => self.capture_split,
+        };
         let len = self.schedule_resolved.len();
         // Capture only when there is a proper device-only window. Under PP the
         // window is always device-only; under TP require it to stop before the
         // host logits tail (`hi < len`).
         let window_ok = hi > lo && (self.pp > 1 || hi < len);
-        let capture = std::env::var_os("SKEIN_CAPTURE").is_some() && window_ok;
+        let capture = std::env::var_os("SKEIN_CAPTURE").is_some()
+            && window_ok
+            && std::env::var_os("SKEIN_NO_SPLIT").is_none();
+        // Captured-graph mode: run_segment must skip the per-token `input_tokens`
+        // feed and `set_decode_position` memcpy so they aren't recorded into the
+        // full-step graph (a recorded host→device copy bakes in a now-freed host
+        // source and replays garbage). flush_step_device_inputs writes them into
+        // the persistent device buffers every step instead.
+        self.executor.runner_mut().set_capturing(capture);
         if capture {
             self.decode_step += 1;
+            // Refresh this step's per-token device inputs (token id + decode
+            // position) into their persistent device buffers, OUTSIDE the captured
+            // region, so the captured kernels read fresh values on every replay.
+            if std::env::var_os("SKEIN_NO_FLUSH").is_none() {
+                self.executor
+                    .runner_mut()
+                    .flush_step_device_inputs(token as i32, position);
+            }
             // Host pre-region (e.g. last stage's boundary recv of the carry).
             if lo > 0 {
                 self.executor
@@ -420,14 +455,32 @@ impl RankServer {
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
             }
             // Captured/replayed compute region.
+            let dbg = std::env::var_os("SKEIN_FI_LOG").is_some() && self.layout.rank == 0;
             if self.executor.runner().has_captured() {
-                self.executor.runner().replay_captured();
-            } else if self.decode_step == CAPTURE_AT {
+                if dbg && self.decode_step <= capture_at + 3 {
+                    eprintln!("SKEIN_PHASE step={} REPLAY pos={position}", self.decode_step);
+                }
+                let ok = self.executor.runner().replay_captured();
+                if dbg && !ok {
+                    eprintln!("SKEIN_PHASE step={} REPLAY-RETURNED-FALSE", self.decode_step);
+                }
+            } else if self.decode_step == capture_at {
+                if dbg {
+                    eprintln!("SKEIN_PHASE step={} CAPTURE pos={position}", self.decode_step);
+                }
                 self.executor.runner().begin_capture();
                 self.executor
                     .run(&self.schedule_resolved[lo..hi], &self.collective)
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                 self.executor.runner().end_capture();
+                // Stream capture RECORDS the region without executing it, so the
+                // captured buffers still hold the previous step's values. Replay
+                // the just-captured graph once now so THIS step actually computes
+                // its output — otherwise the host post-region (and the KV-cache
+                // write for this position) run on stale data, permanently
+                // corrupting the cache slot at the capture position and degrading
+                // every subsequent decode step.
+                self.executor.runner().replay_captured();
             } else {
                 self.executor
                     .run(&self.schedule_resolved[lo..hi], &self.collective)

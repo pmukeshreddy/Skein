@@ -805,8 +805,20 @@ fn run_cublaslt_matmul(
     let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
     let mut algo_count: i32 = 0;
 
-    let workspace = unsafe { stream.alloc::<u8>(spec.workspace_size)? };
-    let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+    // SKEIN_CAPTURE: a per-call workspace is freed at scope end, so a captured
+    // full-step graph would replay this matmul reading a freed/reused workspace
+    // address — garbage. Use a persistent scratch buffer (matmuls are serialized
+    // on the shared capture stream, so one workspace is safe). Non-capture keeps
+    // the per-call buffer (held alive by `_workspace_owned`).
+    let _workspace_owned;
+    let workspace_ptr = if super::is_capture() {
+        super::capture_scratch(stream, 1, spec.workspace_size)
+    } else {
+        let ws = unsafe { stream.alloc::<u8>(spec.workspace_size)? };
+        let p = ws.device_ptr(stream).0;
+        _workspace_owned = ws;
+        p
+    };
 
     let a_scale = if cuda_dtype_needs_tensorwide_scale(spec.a.dtype) && ptrs.a_scale.is_none() {
         Some(stream.clone_htod(&[1.0f32])?)
@@ -871,6 +883,8 @@ fn run_cublaslt_matmul(
 
     let (a_scale_ptr, _a_scale_guard) = if let Some(ptr) = ptrs.a_scale {
         (Some(ptr), None)
+    } else if super::is_capture() && a_scale.is_some() {
+        (Some(super::capture_unit_scale(stream)), None)
     } else if let Some(scale) = &a_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
@@ -879,19 +893,25 @@ fn run_cublaslt_matmul(
     };
     let (b_scale_ptr, _b_scale_guard) = if let Some(ptr) = ptrs.b_scale {
         (Some(ptr), None)
+    } else if super::is_capture() && b_scale.is_some() {
+        (Some(super::capture_unit_scale(stream)), None)
     } else if let Some(scale) = &b_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
         (None, None)
     };
-    let (c_scale_ptr, _c_scale_guard) = if let Some(scale) = &c_scale {
+    let (c_scale_ptr, _c_scale_guard) = if super::is_capture() && c_scale.is_some() {
+        (Some(super::capture_unit_scale(stream)), None)
+    } else if let Some(scale) = &c_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
         (None, None)
     };
-    let (d_scale_ptr, _d_scale_guard) = if let Some(scale) = &d_scale {
+    let (d_scale_ptr, _d_scale_guard) = if super::is_capture() && d_scale.is_some() {
+        (Some(super::capture_unit_scale(stream)), None)
+    } else if let Some(scale) = &d_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
@@ -1327,6 +1347,15 @@ impl HostOp for CuBlasLt {
             workspace_size: WORKSPACE_SIZE,
         };
 
+        if std::env::var_os("SKEIN_FI_LOG").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 200 && n % 20 == 0 {
+                eprintln!("SKEIN_CUBLASLT call#{n} m={} n={} k={} ws={}",
+                    spec.problem.m, spec.problem.n, spec.problem.k, spec.workspace_size);
+            }
+        }
         run_cublaslt_matmul(stream, &cublaslt, &spec, ptrs)?;
 
         // No stream.synchronize() here — CUDA stream ordering guarantees
