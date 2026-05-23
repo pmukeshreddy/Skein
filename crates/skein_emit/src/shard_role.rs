@@ -76,8 +76,11 @@ pub fn shard_role_for_param(
         None => match &layer.kind {
             LayerKind::Embedding(_) => 0,
             LayerKind::Lmhead(_) => placement.pp - 1,
-            // Final RmsNorm / other non-block layers live on stage 0 by
-            // convention. Match `skein_cost` so the two stay aligned.
+            // The final RmsNorm (`model.norm`) feeds the LM head, so it lives on
+            // the LAST stage with it — `wire_final` runs there. Any other
+            // non-block layer defaults to stage 0. Must match `skein_cost`'s
+            // `weight_bytes_on_device` so placement and memory accounting agree.
+            LayerKind::RmsNorm(_) => placement.pp - 1,
             _ => 0,
         },
     };

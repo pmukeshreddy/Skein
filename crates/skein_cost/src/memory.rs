@@ -53,6 +53,9 @@ pub fn weight_bytes_on_device(plan: &Plan, ir: &Graph, device: DeviceIdx) -> u64
             None => match &layer.kind {
                 LayerKind::Embedding(_) => stage == 0,
                 LayerKind::Lmhead(_) => stage == placement.pp - 1,
+                // Final RmsNorm feeds the LM head → last stage (must match
+                // `shard_role_for_param`'s pipeline filter).
+                LayerKind::RmsNorm(_) => stage == placement.pp - 1,
                 _ => stage == 0,
             },
         };
