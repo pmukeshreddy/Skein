@@ -172,6 +172,17 @@ impl LocalTopology {
                 }
             }
             if all_device {
+                if std::env::var_os("SKEIN_AR_LOG").is_some() {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed);
+                    if k < 3 {
+                        eprintln!(
+                            "SKEIN_AR allreduce#{k} elems_per_rank={:?}",
+                            device_bufs.iter().map(|b| b.len()).collect::<Vec<_>>()
+                        );
+                    }
+                }
                 let sum = elementwise_sum(&device_bufs);
                 for &(pi, tid) in &pt {
                     self.runners[pi].write_device_handoff(tid, &sum);

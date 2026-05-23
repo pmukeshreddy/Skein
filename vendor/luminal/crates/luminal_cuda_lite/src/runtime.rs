@@ -191,6 +191,9 @@ pub struct CudaRuntime {
     decode_position: std::cell::RefCell<Option<CudaSlice<i32>>>,
     /// Lazily-compiled `kv_slot_write` kernel (module + function).
     kv_write_kernel: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// Lazily-compiled `kv_slot_write_batched` kernel (batched per-row KV append
+    /// for the single-process batched continuous-batch driver).
+    kv_write_batched_kernel: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
     /// Lazily-compiled `shm_allreduce2` kernel (module + function). Under
     /// SKEIN_CAPTURE the all-reduce must launch from luminal so it lands on
     /// luminal's shared capture stream (skein_runtime's cudarc can't reach the
@@ -780,6 +783,95 @@ extern "C" __global__ void kv_slot_write(
                 .launch(cfg)
                 .expect("launch kv_slot_write");
         }
+    }
+
+    /// Batched KV append: write the new token's K/V for every batch row into a
+    /// `[batch, cap, row_words]` cache at the shared decode `position`, i.e.
+    /// `dst[r, position, :] = src[r, :]`. The source `id` output is `[batch,
+    /// row_words]`. Used by the single-process batched continuous-batch driver
+    /// (synchronous/lockstep: all rows share `position`). Strided per row, one
+    /// kernel launch.
+    ///
+    /// # Safety
+    /// `base_ptr` is a valid `batch*cap*row_words*4`-byte device allocation;
+    /// `set_decode_position` must have been called.
+    pub unsafe fn copy_output_to_kv_slot_batched(
+        &self,
+        id: impl ToId,
+        base_ptr: u64,
+        batch: usize,
+        cap: usize,
+        row_bytes: usize,
+    ) {
+        debug_assert!(base_ptr != 0, "copy_output_to_kv_slot_batched null base");
+        let src = self.resolve_output_buffer(id);
+        debug_assert!(row_bytes % 4 == 0, "KV row bytes must be 4-aligned");
+        let row_words = (row_bytes / 4) as i32;
+        if row_words == 0 || batch == 0 {
+            return;
+        }
+        let src_ptr = src.ptr();
+        let pos_ptr = {
+            let slot = self.decode_position.borrow();
+            let buf = slot.as_ref().expect("set_decode_position before KV write");
+            buf.device_ptr(&self.cuda_stream).0
+        };
+        let func = self.kv_write_batched_fn().clone();
+        let total = (batch as i32) * row_words;
+        let cfg = LaunchConfig {
+            grid_dim: ((total as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let batch_i = batch as i32;
+        let cap_i = cap as i32;
+        unsafe {
+            self.cuda_stream
+                .launch_builder(&func)
+                .arg(&src_ptr)
+                .arg(&base_ptr)
+                .arg(&pos_ptr)
+                .arg(&row_words)
+                .arg(&batch_i)
+                .arg(&cap_i)
+                .launch(cfg)
+                .expect("launch kv_slot_write_batched");
+        }
+    }
+
+    fn kv_write_batched_fn(&self) -> &CudaFunction {
+        let (_, func) = self.kv_write_batched_kernel.get_or_init(|| {
+            let src = r#"
+extern "C" __global__ void kv_slot_write_batched(
+    unsigned long long src, unsigned long long base,
+    unsigned long long pos_ptr, int row_words, int batch, int cap
+) {
+    long long pos = (long long)(*((const int*)pos_ptr));
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)batch * (long long)row_words;
+    if ((long long)i >= total) return;
+    int r = i / row_words;
+    int w = i - r * row_words;
+    unsigned int* d = (unsigned int*)base;
+    const unsigned int* s = (const unsigned int*)src;
+    long long dst_idx = ((long long)r * (long long)cap + pos) * (long long)row_words + (long long)w;
+    long long src_idx = (long long)r * (long long)row_words + (long long)w;
+    d[dst_idx] = s[src_idx];
+}
+"#;
+            let ptx = crate::compile_module_image_for_current_device(self.cuda_stream.context(), src)
+                .expect("compile kv_slot_write_batched");
+            let module = self
+                .cuda_stream
+                .context()
+                .load_module(ptx)
+                .expect("load kv_slot_write_batched module");
+            let func = module
+                .load_function("kv_slot_write_batched")
+                .expect("load kv_slot_write_batched fn");
+            (module, func)
+        });
+        func
     }
 
     fn shm_allreduce_fn(&self) -> &CudaFunction {
@@ -1732,6 +1824,7 @@ impl Runtime for CudaRuntime {
             external_buffers: FxHashMap::default(),
             decode_position: std::cell::RefCell::new(None),
             kv_write_kernel: std::sync::OnceLock::new(),
+            kv_write_batched_kernel: std::sync::OnceLock::new(),
             shm_allreduce_kernel: std::sync::OnceLock::new(),
             captured_graph_exec: std::cell::RefCell::new(None),
         }

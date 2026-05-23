@@ -275,6 +275,21 @@ pub trait DynRuntime {
     /// `base_ptr` must be a valid device allocation; `set_decode_position` set.
     unsafe fn copy_output_to_kv_slot_by_id(&self, _id: HandoffId, _base_ptr: u64, _n_bytes: usize) {}
 
+    /// Batched KV append by id: write `[batch, row_bytes]` into a `[batch, cap,
+    /// row_bytes]` cache at the shared decode position. CUDA only; no-op default.
+    ///
+    /// # Safety
+    /// `base_ptr` is a valid `batch*cap*row_bytes` device allocation; position set.
+    unsafe fn copy_output_to_kv_slot_batched_by_id(
+        &self,
+        _id: HandoffId,
+        _base_ptr: u64,
+        _batch: usize,
+        _cap: usize,
+        _row_bytes: usize,
+    ) {
+    }
+
     /// Launch the 2-rank shm all-reduce on this runtime's stream (so it shares the
     /// SKEIN_CAPTURE stream with the segments). `data_ptr` is the handoff buffer;
     /// `shm_ptr` the cross-process mapped region. CUDA only; default no-op.
@@ -843,6 +858,22 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             unsafe {
                 self.inner
                     .copy_output_to_device_ptr_kv(node, base_ptr, n_bytes)
+            };
+        }
+    }
+
+    unsafe fn copy_output_to_kv_slot_batched_by_id(
+        &self,
+        id: HandoffId,
+        base_ptr: u64,
+        batch: usize,
+        cap: usize,
+        row_bytes: usize,
+    ) {
+        if let Some(node) = self.node_for_output_id(id) {
+            unsafe {
+                self.inner
+                    .copy_output_to_kv_slot_batched(node, base_ptr, batch, cap, row_bytes)
             };
         }
     }

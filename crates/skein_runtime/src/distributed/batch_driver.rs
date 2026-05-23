@@ -200,6 +200,73 @@ impl ContinuousBatchDriver {
         &self.metrics
     }
 
+    /// Synchronous batched decode of `prompts.len()` real sequences in lockstep
+    /// (must equal the graph's batch width). Truncates every prompt to the common
+    /// min length L (no padding → clean synchronous attention), prefills all rows
+    /// token-by-token to position L-1, then decodes `max_new` tokens with every
+    /// row sharing the position. Returns (per-row generated tokens, decode seconds
+    /// covering the `max_new` batched forwards). Real generation, real timing.
+    pub fn run_batched_lockstep(
+        &mut self,
+        prompts: &[Vec<u32>],
+        max_new: usize,
+    ) -> Result<(Vec<Vec<u32>>, f64), RuntimeError> {
+        let n = prompts.len();
+        let l = prompts.iter().map(|p| p.len()).min().unwrap_or(1).max(1);
+        let vocab = self.vocab as usize;
+        for r in self.topo.runners_mut() {
+            r.set_paged_device_kv(false);
+            r.set_decode_batch(n);
+        }
+        let mut cur: Vec<i32> = prompts.iter().map(|p| p[0] as i32).collect();
+        let mut genr: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut decode_start = Instant::now();
+        for pos in 0..(l - 1 + max_new) {
+            if pos == l - 1 {
+                decode_start = Instant::now();
+            }
+            for runner in self.topo.runners_mut() {
+                runner.set_input_tokens(INPUT_TOKENS, cur.clone());
+                runner.set_position(pos);
+            }
+            self.topo.run_step().map_err(rt)?;
+            let logits = self.topo.runner(0).read(LOGITS).map_err(rt)?;
+            // The logits AllGather concatenates the TP ranks' vocab-parallel
+            // partials RANK-major: the buffer is [num_ranks, batch, vocab_local]
+            // (each rank's full [batch, vocab_local] block back to back), not
+            // [batch, vocab]. De-interleave per row to argmax over the full vocab.
+            let ranks = self.topo.num_devices().max(1);
+            let vl = vocab / ranks; // vocab_local
+            let mut next = vec![0i32; n];
+            for (r, slot) in next.iter_mut().enumerate() {
+                let mut best_i = 0usize;
+                let mut best_v = f32::NEG_INFINITY;
+                for rk in 0..ranks {
+                    let base = (rk * n + r) * vl;
+                    for j in 0..vl {
+                        let v = logits[(base + j).min(logits.len().saturating_sub(1))];
+                        if v > best_v {
+                            best_v = v;
+                            best_i = rk * vl + j;
+                        }
+                    }
+                }
+                *slot = best_i as i32;
+            }
+            if pos < l - 1 {
+                for (r, c) in cur.iter_mut().enumerate() {
+                    *c = prompts[r][pos + 1] as i32;
+                }
+            } else {
+                for r in 0..n {
+                    genr[r].push(next[r] as u32);
+                    cur[r] = next[r];
+                }
+            }
+        }
+        Ok((genr, decode_start.elapsed().as_secs_f64()))
+    }
+
     /// Admit a request: through the batcher (SLO / inflight) and the paged
     /// allocator on every device (prefix match + page allocation). Returns the
     /// prefix-cache hit length (consistent across devices).

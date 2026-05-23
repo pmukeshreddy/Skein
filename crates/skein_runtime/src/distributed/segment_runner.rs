@@ -192,6 +192,11 @@ pub struct SegmentRunner {
     /// lazily (zeroed) on a request's first activation and reused across its
     /// decode steps. (Benchmark scope: freed in bulk at driver teardown.)
     kv_req_bufs: HashMap<RequestId, Vec<Option<u64>>>,
+    /// Decode batch width for synchronous batched decode (>1 = pack N sequences
+    /// as rows of the `[N, cap, kv_dim]` KV cache, all at the shared `position`).
+    /// When >1 the `kvcache_*` outputs are written with the batched (per-row,
+    /// strided) KV append. `1` = single-sequence decode (default).
+    decode_batch: usize,
 }
 
 /// Classify a handoff by its logical name. Mirrors the dispatch the previous
@@ -348,6 +353,7 @@ impl SegmentRunner {
             paged_device_kv: false,
             active_request: None,
             kv_req_bufs: HashMap::new(),
+            decode_batch: 1,
         }
     }
 
@@ -355,6 +361,12 @@ impl SegmentRunner {
     /// default so the single-request path keeps its single shared KV buffer.
     pub fn set_paged_device_kv(&mut self, on: bool) {
         self.paged_device_kv = on;
+    }
+
+    /// Set the synchronous batched decode width (rows packed per forward). >1
+    /// routes `kvcache_*` outputs through the batched per-row KV append.
+    pub fn set_decode_batch(&mut self, n: usize) {
+        self.decode_batch = n.max(1);
     }
 
     /// Get (or lazily allocate, zeroed) request `req`'s own contiguous device KV
@@ -1110,6 +1122,34 @@ impl LocalSegments for SegmentRunner {
                                 .runtime
                                 .output_device_ptr_by_id(id)
                             {
+                                // Synchronous batched decode: write all `decode_batch`
+                                // rows' new K/V into the [batch, cap, kv_dim] cache at
+                                // the shared `position` (strided per row). `base` is the
+                                // single batched KV buffer (full*2 bytes); the per-row
+                                // output is `out_bytes/batch`, and `cap` is the slot
+                                // count = (full*2)/out_bytes.
+                                if self.decode_batch > 1 {
+                                    let rt = &self.segments[segment_idx].runtime;
+                                    rt.set_decode_position(self.position);
+                                    let batch = self.decode_batch;
+                                    let row_bytes = out_bytes / batch;
+                                    let full2 = self.kv_full_elems[slot].unwrap_or(0) * 2;
+                                    let cap = if out_bytes > 0 { full2 / out_bytes } else { 0 };
+                                    if std::env::var_os("SKEIN_BKV_LOG").is_some() {
+                                        use std::sync::atomic::{AtomicBool, Ordering};
+                                        static D: AtomicBool = AtomicBool::new(false);
+                                        if !D.swap(true, Ordering::Relaxed) {
+                                            eprintln!("SKEIN_BKV batch={batch} out_bytes={out_bytes} row_bytes={row_bytes} full_elems={} cap={cap} pos={}", self.kv_full_elems[slot].unwrap_or(0), self.position);
+                                        }
+                                    }
+                                    unsafe {
+                                        rt.copy_output_to_kv_slot_batched_by_id(
+                                            id, base, batch, cap, row_bytes,
+                                        )
+                                    };
+                                    self.device_slots[slot] = None;
+                                    continue;
+                                }
                                 if device_kv {
                                     // Device-side append: kernel computes
                                     // `base + position*out_bytes` from the device

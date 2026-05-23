@@ -110,6 +110,35 @@ async fn run_batch_demo(args: ServeArgs) -> Result<(), CliError> {
         )
         .map_err(|e| e.to_string())?;
 
+        // SKEIN_LOCKSTEP: synchronous batched decode of exactly `max_batch` real
+        // prompts in lockstep (one batched forward per token). Reports real
+        // per-row generated tokens + decode throughput (batch*max_new / decode_s).
+        if std::env::var_os("SKEIN_LOCKSTEP").is_some() {
+            let gb = plan.batching.max_batch() as usize;
+            let mut bp: Vec<Vec<u32>> = tokenized.iter().map(|(_, t)| t.clone()).collect();
+            if bp.is_empty() {
+                return Err("no prompts".to_string());
+            }
+            let src_len = bp.len();
+            while bp.len() < gb {
+                bp.push(bp[bp.len() % src_len].clone());
+            }
+            bp.truncate(gb);
+            let (genr, dt) = driver
+                .run_batched_lockstep(&bp, max_new)
+                .map_err(|e| e.to_string())?;
+            let mut s = format!(
+                "=== Synchronous batched decode (real prompts, lockstep) ===\n  \
+                 batch={gb} max_new={max_new} decode_s={dt:.3} \
+                 decode_tokens_per_s={:.1}\n",
+                (gb * max_new) as f64 / dt.max(1e-9),
+            );
+            for (r, g) in genr.iter().enumerate() {
+                let head: Vec<u32> = g.iter().take(8).copied().collect();
+                s.push_str(&format!("  row{r} tokens[..8]={head:?}\n"));
+            }
+            return Ok(s);
+        }
         let now_ms = || {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

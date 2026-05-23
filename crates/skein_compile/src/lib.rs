@@ -161,6 +161,23 @@ pub trait ComputeRuntime: Sized {
         let _ = (id, base_ptr, n_bytes);
     }
 
+    /// Batched KV append: write `[batch, row_bytes]` output into a `[batch, cap,
+    /// row_bytes]` cache at the shared decode position (`dst[r,pos,:]=src[r,:]`).
+    /// CUDA only; no-op default.
+    ///
+    /// # Safety
+    /// `base_ptr` is a valid `batch*cap*row_bytes` device allocation; position set.
+    unsafe fn copy_output_to_kv_slot_batched(
+        &self,
+        id: NodeIndex,
+        base_ptr: u64,
+        batch: usize,
+        cap: usize,
+        row_bytes: usize,
+    ) {
+        let _ = (id, base_ptr, batch, cap, row_bytes);
+    }
+
     /// Launch a 2-rank shm all-reduce of `elems` bf16 at `data_ptr` on this
     /// runtime's stream (so it shares the SKEIN_CAPTURE stream). `shm_ptr` is the
     /// cross-process mapped shared region. CUDA only; no-op default.
@@ -529,6 +546,20 @@ mod cuda_impl {
 
         unsafe fn copy_output_to_device_ptr_kv(&self, id: NodeIndex, base_ptr: u64, n_bytes: usize) {
             unsafe { self.inner.copy_output_to_device_ptr_kv(id, base_ptr, n_bytes) };
+        }
+
+        unsafe fn copy_output_to_kv_slot_batched(
+            &self,
+            id: NodeIndex,
+            base_ptr: u64,
+            batch: usize,
+            cap: usize,
+            row_bytes: usize,
+        ) {
+            unsafe {
+                self.inner
+                    .copy_output_to_kv_slot_batched(id, base_ptr, batch, cap, row_bytes)
+            };
         }
 
         unsafe fn device_shm_all_reduce(
