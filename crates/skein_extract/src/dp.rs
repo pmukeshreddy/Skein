@@ -131,10 +131,18 @@ pub fn layer_dtype_dp(
     let mut combo_mem: Vec<Vec<u64>> = vec![vec![0; combos.len()]; num_blocks];
     let mut combo_drift: Vec<Vec<f64>> = vec![vec![0.0; combos.len()]; num_blocks];
     let mut combo_cost: Vec<Vec<f64>> = vec![vec![0.0; combos.len()]; num_blocks];
+    // Under pipeline parallelism the decoder blocks are *distributed* across
+    // `pp` stages (each device hosts ~num_blocks/pp whole blocks), not split
+    // within a block like tp/ep. `block_weight_bytes`/`block_kv_bytes` report a
+    // whole block's footprint on its host device; dividing by `pp` here turns
+    // the all-blocks sum into the per-device total. pp=1 is a no-op. This is an
+    // even-split approximation for the feasibility pre-filter; the authoritative
+    // per-device check is `peak_memory_bytes` (PP-aware via `block_to_stage`).
+    let pp = placement.pp.max(1) as u64;
     for b in 0..num_blocks {
         for (ci, c) in combos.iter().enumerate() {
-            let w_bytes = block_weight_bytes(b, ir, c.weight, placement);
-            let k_bytes = block_kv_bytes(ir, c.kv_cache, placement, &wl, global.kv_shard);
+            let w_bytes = block_weight_bytes(b, ir, c.weight, placement) / pp;
+            let k_bytes = block_kv_bytes(ir, c.kv_cache, placement, &wl, global.kv_shard) / pp;
             combo_mem[b][ci] = w_bytes.saturating_add(k_bytes);
             combo_drift[b][ci] =
                 drift_table.block_contribution(b, c.weight, c.activation, c.kv_cache);

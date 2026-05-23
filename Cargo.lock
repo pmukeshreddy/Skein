@@ -2782,6 +2782,7 @@ dependencies = [
  "cudarc 0.16.6",
  "futures-util",
  "half",
+ "memmap2",
  "prometheus",
  "safetensors 0.4.5",
  "serde",

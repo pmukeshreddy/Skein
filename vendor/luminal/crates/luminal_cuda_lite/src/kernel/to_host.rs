@@ -159,9 +159,20 @@ struct CudaGraphOpState {
     last_dyn_values: FxHashMap<char, usize>,
     /// Last buffer pointers (for change detection)
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
+    /// Per-kernel last-applied graph-node config (grid, block, shared, output_ptr,
+    /// input_ptrs). A node is fully determined by these (build_params has no
+    /// dyn_map access — dyn dims are read from the device dyn_dims buffer), so
+    /// when this is unchanged the cuGraphExecKernelNodeSetParams syscall is
+    /// redundant and skipped. Reset whenever the graph is (re)built.
+    last_applied: Vec<Option<NodeApply>>,
     /// Timing events for profiling
     timing_events: Vec<cudarc::driver::sys::CUevent>,
 }
+
+/// Fully determines a CUDA graph kernel node's config; see
+/// [`CudaGraphOpState::last_applied`]. (grid, block, shared_mem, output_ptr,
+/// input_ptrs).
+type NodeApply = ((u32, u32, u32), (u32, u32, u32), u32, u64, Vec<u64>);
 
 impl CudaGraphOpState {
     fn new(kernels: Vec<CompiledKernel>) -> Self {
@@ -174,6 +185,7 @@ impl CudaGraphOpState {
             kernel_params: Vec::new(),
             last_dyn_values: FxHashMap::default(),
             last_buffer_ptrs: FxHashMap::default(),
+            last_applied: Vec::new(),
             timing_events: Vec::new(),
         }
     }
@@ -479,6 +491,10 @@ impl CudaGraphOp {
         // Build CUDA graph if needed
         if state.cuda_graph.is_none() {
             self.build_graph(&mut state, stream, buffers, dyn_map)?;
+            // Fresh graph nodes: invalidate the per-node dirty cache so every
+            // node is set at least once before the first replay.
+            let n = state.kernels.len();
+            state.last_applied = vec![None; n];
         }
 
         // Collect current buffer pointers
@@ -511,19 +527,20 @@ impl CudaGraphOp {
             );
         }
 
-        // Check if we need to update the graph
-        let buffer_ptrs_changed = current_buffer_ptrs != state.last_buffer_ptrs;
-        let needs_update = dyn_map_changed || buffer_ptrs_changed;
-
-        if needs_update {
-            // Update kernel params
+        // SKEIN_RAW_LAUNCH (full-step graph piece 1): launch each kernel directly
+        // via cuLaunchKernel instead of building/replaying a per-segment CUDA
+        // graph. Same result (kernels serialize in-order on the stream), but the
+        // launches are recordable by an outer cuStreamBeginCapture — cuGraphLaunch
+        // is not. Prerequisite for capturing the whole forward into one graph.
+        static RAW_LAUNCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let raw_launch = *RAW_LAUNCH.get_or_init(|| std::env::var_os("SKEIN_RAW_LAUNCH").is_some());
+        if raw_launch {
             let dyn_dims_ptr = state
                 .dyn_dims_buffer
                 .as_ref()
                 .map(|buf| buf.device_ptr(stream).0)
                 .unwrap_or(0);
-
-            // Build params for each kernel first
+            let cu_stream = stream.cu_stream();
             let num_kernels = state.kernels.len();
             for idx in 0..num_kernels {
                 let kernel = &state.kernels[idx];
@@ -531,33 +548,72 @@ impl CudaGraphOp {
                 let input_ptrs: Vec<u64> = kernel
                     .inputs
                     .iter()
-                    .map(|inp| current_buffer_ptrs.get(inp).copied().unwrap_or(0))
+                    .map(|i| current_buffer_ptrs.get(i).copied().unwrap_or(0))
                     .collect();
-                Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
-                let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
+                let grid = (
+                    kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                    kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                    kernel.grid.2.exec(dyn_map).unwrap() as u32,
+                );
+                let block = (
+                    kernel.block.0.exec(dyn_map).unwrap() as u32,
+                    kernel.block.1.exec(dyn_map).unwrap() as u32,
+                    kernel.block.2.exec(dyn_map).unwrap() as u32,
+                );
+                let shared = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
+                let kdp = if kernel.has_dyn_dims_param {
                     dyn_dims_ptr
                 } else {
                     0
                 };
-                if kernel.has_dyn_dims_param && kernel_dyn_dims_ptr == 0 {
-                    anyhow::bail!(
-                        "missing dyn_dims buffer for CUDA kernel {} at LLIR node {:?}",
-                        kernel.kernel_name,
-                        kernel.node,
-                    );
-                }
-
-                let param_values = kernel.kernel_op.build_params(
+                Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
+                let pv = kernel.kernel_op.build_params(
                     stream,
                     output_ptr,
                     &input_ptrs,
                     &kernel.internal_bufs,
-                    kernel_dyn_dims_ptr,
+                    kdp,
                 );
-                state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
+                let mut params = UnifiedKernelParams::new(pv);
+                let params_ptr = params.as_cuda_params();
+                let cu_func = unsafe { kernel.function.raw_function() };
+                unsafe {
+                    cudarc::driver::sys::cuLaunchKernel(
+                        cu_func, grid.0, grid.1, grid.2, block.0, block.1, block.2, shared,
+                        cu_stream, params_ptr, std::ptr::null_mut(),
+                    )
+                    .result()
+                    .map_err(|e| anyhow::anyhow!("cuLaunchKernel (raw): {e:?}"))?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Check if we need to update the graph
+        let buffer_ptrs_changed = current_buffer_ptrs != state.last_buffer_ptrs;
+        let needs_update = dyn_map_changed || buffer_ptrs_changed;
+
+        if needs_update {
+            // SKEIN_GRAPH_DIRTY: skip the cuGraphExecKernelNodeSetParams syscall
+            // for nodes whose config is unchanged since the last replay. At decode
+            // dyn_map_changed fires every token (KV length grows), but only the
+            // attention nodes whose grid depends on it actually change — the
+            // MoE/MLP bulk does not, so re-setting them is wasted host time on the
+            // critical path.
+            static DIRTY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let dirty_skip = *DIRTY.get_or_init(|| std::env::var_os("SKEIN_GRAPH_DIRTY").is_some());
+
+            let dyn_dims_ptr = state
+                .dyn_dims_buffer
+                .as_ref()
+                .map(|buf| buf.device_ptr(stream).0)
+                .unwrap_or(0);
+
+            let num_kernels = state.kernels.len();
+            if state.last_applied.len() != num_kernels {
+                state.last_applied = vec![None; num_kernels];
             }
 
-            // Now update CUDA graph nodes
             state
                 .cuda_graph_exec
                 .as_ref()
@@ -566,19 +622,41 @@ impl CudaGraphOp {
                 .bind_to_thread()?;
 
             for idx in 0..num_kernels {
-                let kernel = &state.kernels[idx];
-                let graph_node = state.node_to_graph_node[&kernel.node];
+                // Gather this kernel's launch config (immutable-borrow scope).
+                let (grid_dim, block_dim, shared_mem, output_ptr, input_ptrs, kernel_dyn_dims_ptr) = {
+                    let kernel = &state.kernels[idx];
+                    let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
+                    let input_ptrs: Vec<u64> = kernel
+                        .inputs
+                        .iter()
+                        .map(|inp| current_buffer_ptrs.get(inp).copied().unwrap_or(0))
+                        .collect();
+                    let grid_dim = (
+                        kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                        kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                        kernel.grid.2.exec(dyn_map).unwrap() as u32,
+                    );
+                    let block_dim = (
+                        kernel.block.0.exec(dyn_map).unwrap() as u32,
+                        kernel.block.1.exec(dyn_map).unwrap() as u32,
+                        kernel.block.2.exec(dyn_map).unwrap() as u32,
+                    );
+                    let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
+                    let kdp = if kernel.has_dyn_dims_param {
+                        dyn_dims_ptr
+                    } else {
+                        0
+                    };
+                    if kernel.has_dyn_dims_param && kdp == 0 {
+                        anyhow::bail!(
+                            "missing dyn_dims buffer for CUDA kernel {} at LLIR node {:?}",
+                            kernel.kernel_name,
+                            kernel.node,
+                        );
+                    }
+                    (grid_dim, block_dim, shared_mem, output_ptr, input_ptrs, kdp)
+                };
 
-                let grid_dim = (
-                    kernel.grid.0.exec(dyn_map).unwrap() as u32,
-                    kernel.grid.1.exec(dyn_map).unwrap() as u32,
-                    kernel.grid.2.exec(dyn_map).unwrap() as u32,
-                );
-                let block_dim = (
-                    kernel.block.0.exec(dyn_map).unwrap() as u32,
-                    kernel.block.1.exec(dyn_map).unwrap() as u32,
-                    kernel.block.2.exec(dyn_map).unwrap() as u32,
-                );
                 if grid_dim.0 == 0
                     || grid_dim.1 == 0
                     || grid_dim.2 == 0
@@ -588,14 +666,34 @@ impl CudaGraphOp {
                 {
                     anyhow::bail!(
                         "invalid CUDA launch dimensions for kernel {} at LLIR node {:?}: grid={grid_dim:?} block={block_dim:?}",
-                        kernel.kernel_name,
-                        kernel.node,
+                        state.kernels[idx].kernel_name,
+                        state.kernels[idx].node,
                     );
                 }
-                let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
-                let cu_func = unsafe { kernel.function.raw_function() };
 
-                // Get params pointer first to avoid borrowing state twice
+                // Dirty check (see SKEIN_GRAPH_DIRTY above).
+                let key: NodeApply = (grid_dim, block_dim, shared_mem, output_ptr, input_ptrs);
+                if dirty_skip && state.last_applied[idx].as_ref() == Some(&key) {
+                    continue;
+                }
+                let input_ptrs: Vec<u64> = key.4.clone();
+
+                // Build params + validate (only for changed nodes).
+                {
+                    let kernel = &state.kernels[idx];
+                    Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
+                    let param_values = kernel.kernel_op.build_params(
+                        stream,
+                        output_ptr,
+                        &input_ptrs,
+                        &kernel.internal_bufs,
+                        kernel_dyn_dims_ptr,
+                    );
+                    state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
+                }
+
+                let graph_node = state.node_to_graph_node[&state.kernels[idx].node];
+                let cu_func = unsafe { state.kernels[idx].function.raw_function() };
                 let params_ptr = state.kernel_params[idx].as_cuda_params();
                 let exec = state.cuda_graph_exec.as_mut().unwrap();
                 unsafe {
@@ -603,6 +701,7 @@ impl CudaGraphOp {
                         graph_node, cu_func, grid_dim, block_dim, shared_mem, params_ptr,
                     )?;
                 }
+                state.last_applied[idx] = Some(key);
             }
 
             state.last_dyn_values = dyn_map.clone();

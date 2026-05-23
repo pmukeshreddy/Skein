@@ -173,4 +173,24 @@ pub trait RankCollective {
             "device bf16 all_reduce not supported on this backend".to_string(),
         ))
     }
+
+    /// `(shm_dev_ptr, rank, slot_bytes, max_elems)` for the custom mapped-memory
+    /// all-reduce, when set up (`SKEIN_SHM_ALLREDUCE`). Under SKEIN_CAPTURE the
+    /// executor launches it from luminal (shared capture stream) using this info,
+    /// for all-reduces with `elems <= max_elems`. Default `None` (use NCCL).
+    fn shm_all_reduce_info(&self) -> Option<(u64, i32, i32, usize)> {
+        None
+    }
+
+    /// Point-to-point send of `buf` to `peer` (the pipeline-parallel stage
+    /// handoff). Default: unsupported.
+    fn send_f32(&self, _buf: &[f32], _peer: usize) -> Result<(), CollectiveError> {
+        Err(CollectiveError::Nccl("send not supported on this backend".to_string()))
+    }
+
+    /// Point-to-point receive of `len` f32 from `peer` (the PP stage handoff).
+    /// Default: unsupported.
+    fn recv_f32(&self, _peer: usize, _len: usize) -> Result<Vec<f32>, CollectiveError> {
+        Err(CollectiveError::Nccl("recv not supported on this backend".to_string()))
+    }
 }

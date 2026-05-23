@@ -12,7 +12,7 @@ default = []
 # CUDA-gated paths: NCCL between graph runs, CUDA Graphs capture/dispatch,
 # RDMA for prefill/decode KV transfer. Pulls in `cudarc` (with its `nccl`
 # bindings); requires an NVIDIA toolchain, so it is off in the CPU/CI build.
-cuda = ["dep:cudarc", "dep:half", "skein_compile/cuda"]
+cuda = ["dep:cudarc", "dep:half", "dep:memmap2", "skein_compile/cuda"]
 # Development-only per-segment / per-step decode timing (see `perf_timing`).
 # OFF in production: with the feature off, the `SegTimer`/`StepTimer` types are
 # zero-sized no-ops, so a release build has zero `Instant::now()` calls in the
@@ -44,6 +44,9 @@ tokenizers = { workspace = true }
 cudarc     = { workspace = true, optional = true }
 # bf16 element type for device-resident NCCL all-reduce (cuda-gated).
 half       = { workspace = true, optional = true }
+# Cross-process shared host memory for the custom mapped-memory all-reduce
+# (src/cuda/shm_allreduce.rs); cuda-gated.
+memmap2    = { version = "0.9", optional = true }
 
 [dev-dependencies]
 safetensors = { workspace = true }

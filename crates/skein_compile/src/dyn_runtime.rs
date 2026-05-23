@@ -231,6 +231,47 @@ pub trait DynRuntime {
     /// `dest_ptr` must be a valid device allocation of at least `n_bytes`.
     unsafe fn copy_output_to_device_by_id(&self, _id: HandoffId, _dest_ptr: u64, _n_bytes: usize) {}
 
+    /// Device-resident decode position for the device-side KV append (CUDA only).
+    /// Default no-op.
+    fn set_decode_position(&self, _pos: usize) {}
+
+    /// Device-side KV append: copy a named **output** into `base_ptr` at slot
+    /// `position` (`base_ptr + position*n_bytes`), with `position` read from the
+    /// device buffer set by [`set_decode_position`] — so the append destination is
+    /// computed on device, not baked into a host DtoD, making it a
+    /// graph-capturable node. CUDA only; default no-op.
+    ///
+    /// # Safety
+    /// `base_ptr` must be a valid device allocation; `set_decode_position` set.
+    unsafe fn copy_output_to_kv_slot_by_id(&self, _id: HandoffId, _base_ptr: u64, _n_bytes: usize) {}
+
+    /// Launch the 2-rank shm all-reduce on this runtime's stream (so it shares the
+    /// SKEIN_CAPTURE stream with the segments). `data_ptr` is the handoff buffer;
+    /// `shm_ptr` the cross-process mapped region. CUDA only; default no-op.
+    ///
+    /// # Safety
+    /// Valid device pointers; both ranks call identically.
+    unsafe fn device_shm_all_reduce(
+        &self,
+        _data_ptr: u64,
+        _shm_ptr: u64,
+        _rank: i32,
+        _elems: usize,
+        _slot_bytes: i32,
+    ) {
+    }
+
+    /// Full-step CUDA graph capture/replay on the shared SKEIN_CAPTURE stream.
+    /// CUDA only; defaults no-op / `false`.
+    fn begin_stream_capture(&self) {}
+    fn end_stream_capture(&self) {}
+    fn replay_captured(&self) -> bool {
+        false
+    }
+    fn has_captured_graph(&self) -> bool {
+        false
+    }
+
     /// Set a dynamic-shape dimension (e.g. the cached-decode `past` length `'p'`)
     /// on the segment's graph before the next [`execute_segment`]. The default
     /// is a no-op (segments with only static shapes ignore it); the graph-owning
@@ -701,5 +742,45 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
                     .copy_output_to_device_ptr(node, dest_ptr, n_bytes)
             };
         }
+    }
+
+    fn set_decode_position(&self, pos: usize) {
+        self.inner.set_decode_position(pos);
+    }
+
+    unsafe fn copy_output_to_kv_slot_by_id(&self, id: HandoffId, base_ptr: u64, n_bytes: usize) {
+        if let Some(node) = self.node_for_output_id(id) {
+            unsafe {
+                self.inner
+                    .copy_output_to_device_ptr_kv(node, base_ptr, n_bytes)
+            };
+        }
+    }
+
+    unsafe fn device_shm_all_reduce(
+        &self,
+        data_ptr: u64,
+        shm_ptr: u64,
+        rank: i32,
+        elems: usize,
+        slot_bytes: i32,
+    ) {
+        unsafe {
+            self.inner
+                .device_shm_all_reduce(data_ptr, shm_ptr, rank, elems, slot_bytes)
+        };
+    }
+
+    fn begin_stream_capture(&self) {
+        self.inner.begin_stream_capture();
+    }
+    fn end_stream_capture(&self) {
+        self.inner.end_stream_capture();
+    }
+    fn replay_captured(&self) -> bool {
+        self.inner.replay_captured()
+    }
+    fn has_captured_graph(&self) -> bool {
+        self.inner.has_captured_graph()
     }
 }

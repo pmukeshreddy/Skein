@@ -65,6 +65,19 @@ pub struct RankServer {
     prefill_schedule_resolved: Option<Vec<ResolvedSequenceStep>>,
     prefill_seq: usize,
     num_layers: usize,
+    /// SKEIN_CAPTURE: decode-step counter and the schedule index where the logits
+    /// all-gather (a host sync, can't be captured) begins. The pre-split steps are
+    /// captured into a full-step graph and replayed; the post-split (all-gather +
+    /// logits read) runs on the host every step.
+    decode_step: usize,
+    capture_split: usize,
+    /// Pipeline-parallel coordination: under PP only the last stage computes
+    /// logits, so it samples the next token and broadcasts it to the earlier
+    /// stages (which need it for their next embed). `pp == 1` => TP, every rank
+    /// has full logits and samples locally (no broadcast).
+    pp: u32,
+    is_last_stage: bool,
+    last_stage_root: usize,
 }
 
 impl RankServer {
@@ -208,6 +221,44 @@ impl RankServer {
             }
         }
 
+        // Optional: isolate pure all-reduce latency (no decode work => no rank
+        // drift) to separate NCCL transport cost from in-context drift. Both
+        // ranks reach this together (post NCCL init), so the tight loop stays
+        // synced. hidden=4096 bf16 is the decode all-reduce size.
+        if std::env::var_os("SKEIN_ALLREDUCE_BENCH").is_some() {
+            collective.bench_all_reduce(4096, 2000);
+            collective.bench_all_reduce(4096, 2000);
+        }
+
+        // Split point for SKEIN_CAPTURE: capture everything up to and including the
+        // LAST RingAllReduce (the 32 layers — all device-resident, no host sync).
+        // The tail after it (final norm, logits projection, the logits all-gather,
+        // and the logits read) stays on the host: those segments produce host
+        // handoffs whose output-capture does a D2H, which is illegal mid-capture.
+        let capture_split = schedule_resolved
+            .iter()
+            .rposition(|s| {
+                matches!(
+                    s,
+                    ResolvedSequenceStep::Collective {
+                        collective: CollectiveKind::RingAllReduce,
+                        ..
+                    }
+                )
+            })
+            .map(|i| i + 1)
+            .unwrap_or(schedule_resolved.len());
+
+        // Pipeline-parallel stage coords (ranks are stage-major: rank = stage*tp*ep
+        // + tp_idx*ep + ep_idx, so stage = rank / (tp*ep)).
+        let pp = artifact.plan.parallelism.pp;
+        let tp = artifact.plan.parallelism.tp;
+        let ep = artifact.plan.parallelism.ep;
+        let group = (tp * ep).max(1) as usize;
+        let stage = (layout.rank as usize) / group;
+        let is_last_stage = stage as u32 == pp.saturating_sub(1);
+        let last_stage_root = (pp.saturating_sub(1) * tp * ep) as usize;
+
         Ok(Self {
             layout,
             executor,
@@ -218,6 +269,11 @@ impl RankServer {
             prefill_schedule_resolved,
             prefill_seq,
             num_layers: artifact.plan.model_meta.num_layers,
+            decode_step: 0,
+            capture_split,
+            pp,
+            is_last_stage,
+            last_stage_root,
         })
     }
 
@@ -262,16 +318,67 @@ impl RankServer {
     /// `position` tokens) and append this token's K/V. Returns this rank's logits
     /// — full vocab on TP ranks after the logits all-gather.
     pub fn forward_step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, RuntimeError> {
-        let runner = self.executor.runner_mut();
-        runner.set_input_tokens(INPUT_TOKENS, vec![token as i32]);
-        runner.set_position(position);
-        self.executor
-            .run(&self.schedule_resolved, &self.collective)
-            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+        {
+            let runner = self.executor.runner_mut();
+            runner.set_input_tokens(INPUT_TOKENS, vec![token as i32]);
+            runner.set_position(position);
+        }
+        // SKEIN_CAPTURE full-step graph: capture the pre-all-gather region once
+        // (after a few warmup steps so the arena/handoff buffers are stable), then
+        // replay it per token with one cuGraphLaunch; the logits all-gather + read
+        // run on the host every step.
+        const CAPTURE_AT: usize = 2;
+        let capture =
+            std::env::var_os("SKEIN_CAPTURE").is_some() && self.capture_split < self.schedule_resolved.len();
+        if capture {
+            self.decode_step += 1;
+            let split = self.capture_split;
+            if self.executor.runner().has_captured() {
+                self.executor.runner().replay_captured();
+            } else if self.decode_step == CAPTURE_AT {
+                self.executor.runner().begin_capture();
+                self.executor
+                    .run(&self.schedule_resolved[..split], &self.collective)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                self.executor.runner().end_capture();
+            } else {
+                self.executor
+                    .run(&self.schedule_resolved[..split], &self.collective)
+                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+            }
+            self.executor
+                .run(&self.schedule_resolved[split..], &self.collective)
+                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+        } else {
+            self.executor
+                .run(&self.schedule_resolved, &self.collective)
+                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+        }
+        // Under PP only the last stage produces logits; earlier stages return
+        // empty (the next token is broadcast to them by `sample_and_sync`).
+        if self.pp > 1 && !self.is_last_stage {
+            return Ok(Vec::new());
+        }
         self.executor
             .runner()
             .read(LOGITS)
             .map_err(|e| RuntimeError::ServerInit(e.to_string()))
+    }
+
+    /// Sample the next token and make every rank agree on it. Under TP each rank
+    /// already holds full logits, so it samples locally. Under PP only the last
+    /// stage has logits, so it samples and broadcasts the token to the earlier
+    /// stages (which need it for their next embed). Collective: all ranks call it.
+    fn sample_and_sync(&self, logits: &[f32]) -> Result<u32, RuntimeError> {
+        if self.pp <= 1 {
+            return Ok(argmax(logits));
+        }
+        let next = if self.is_last_stage { argmax(logits) } else { 0 };
+        let mut buf = [next as f32];
+        self.collective
+            .broadcast(&mut buf, self.last_stage_root)
+            .map_err(to_rt)?;
+        Ok(buf[0] as u32)
     }
 
     /// Batched prefill: process the WHOLE prompt (`prefill_seq` tokens) in ONE
@@ -418,7 +525,7 @@ impl RankServer {
         // can report H2D/D2H bytes + host materializations PER GENERATED TOKEN.
         let perf_before = crate::perf_counters::snapshot();
         for i in 0..max_new_tokens {
-            let next = argmax(&logits);
+            let next = self.sample_and_sync(&logits)?;
             generated.push(next);
             if i + 1 < max_new_tokens {
                 // Allocate the page covering this new token's slot before writing.

@@ -144,6 +144,51 @@ pub trait ComputeRuntime: Sized {
         let _ = (id, dest_ptr, n_bytes);
     }
 
+    /// Set the device-resident decode `position` for the device-side KV append.
+    /// CUDA only; no-op default.
+    fn set_decode_position(&self, pos: usize) {
+        let _ = pos;
+    }
+
+    /// Device-side KV append: copy output `id` into `base_ptr + position*n_bytes`
+    /// with `position` read from the device buffer set by [`set_decode_position`],
+    /// so the destination is computed on device (graph-capturable). CUDA only;
+    /// no-op default.
+    ///
+    /// # Safety
+    /// `base_ptr` must be a valid device allocation; `set_decode_position` set.
+    unsafe fn copy_output_to_device_ptr_kv(&self, id: NodeIndex, base_ptr: u64, n_bytes: usize) {
+        let _ = (id, base_ptr, n_bytes);
+    }
+
+    /// Launch a 2-rank shm all-reduce of `elems` bf16 at `data_ptr` on this
+    /// runtime's stream (so it shares the SKEIN_CAPTURE stream). `shm_ptr` is the
+    /// cross-process mapped shared region. CUDA only; no-op default.
+    ///
+    /// # Safety
+    /// `data_ptr`/`shm_ptr` valid device pointers; both ranks call identically.
+    unsafe fn device_shm_all_reduce(
+        &self,
+        data_ptr: u64,
+        shm_ptr: u64,
+        rank: i32,
+        elems: usize,
+        slot_bytes: i32,
+    ) {
+        let _ = (data_ptr, shm_ptr, rank, elems, slot_bytes);
+    }
+
+    /// Full-step CUDA graph capture/replay on the shared SKEIN_CAPTURE stream.
+    /// CUDA only; defaults are no-ops / `false`.
+    fn begin_stream_capture(&self) {}
+    fn end_stream_capture(&self) {}
+    fn replay_captured(&self) -> bool {
+        false
+    }
+    fn has_captured_graph(&self) -> bool {
+        false
+    }
+
     /// Free this runtime's intermediate-buffer arena (re-allocated lazily on the
     /// next execute). Persistent inputs/weights are untouched. Called after
     /// load/search and between the prefill and decode graphs so two graphs'
@@ -277,6 +322,12 @@ impl ComputeRuntime for NativeComputeRuntime {
 
 #[cfg(feature = "cuda")]
 pub use cuda_impl::CudaComputeRuntime;
+
+/// Re-export of luminal's shared `SKEIN_CAPTURE` stream raw handle (a `u64`, so it
+/// crosses the cudarc-version boundary) — lets the skein_runtime shm all-reduce
+/// launch on the same stream as the segments.
+#[cfg(feature = "cuda")]
+pub use luminal_cuda_lite::runtime::capture_stream_raw;
 
 /// Real per-segment CUDA-graph activity from the Luminal `CudaGraphOp` execution
 /// path: `(graph_instantiations, graph_launches)` since process start. These come
@@ -443,6 +494,43 @@ mod cuda_impl {
 
         unsafe fn copy_output_to_device_ptr(&self, id: NodeIndex, dest_ptr: u64, n_bytes: usize) {
             unsafe { self.inner.copy_output_to_device_ptr(id, dest_ptr, n_bytes) };
+        }
+
+        fn set_decode_position(&self, pos: usize) {
+            self.inner.set_decode_position(pos);
+        }
+
+        unsafe fn copy_output_to_device_ptr_kv(&self, id: NodeIndex, base_ptr: u64, n_bytes: usize) {
+            unsafe { self.inner.copy_output_to_device_ptr_kv(id, base_ptr, n_bytes) };
+        }
+
+        unsafe fn device_shm_all_reduce(
+            &self,
+            data_ptr: u64,
+            shm_ptr: u64,
+            rank: i32,
+            elems: usize,
+            slot_bytes: i32,
+        ) {
+            unsafe {
+                self.inner
+                    .device_shm_all_reduce(data_ptr, shm_ptr, rank, elems, slot_bytes)
+            };
+        }
+
+        fn begin_stream_capture(&self) {
+            self.inner
+                .begin_stream_capture()
+                .expect("begin_stream_capture");
+        }
+        fn end_stream_capture(&self) {
+            self.inner.end_stream_capture().expect("end_stream_capture");
+        }
+        fn replay_captured(&self) -> bool {
+            self.inner.replay_captured()
+        }
+        fn has_captured_graph(&self) -> bool {
+            self.inner.has_captured_graph()
         }
 
         fn set_data_i32(&mut self, id: NodeIndex, data: Vec<i32>) {

@@ -38,11 +38,14 @@ use super::{CollectiveError, RankCollective};
 pub enum ResolvedSequenceStep {
     /// Run segment `segment_idx` of device `device_idx`.
     ExecuteSegment { device_idx: u32, segment_idx: usize },
-    /// Issue a collective over the handoff tensor `tensor`.
+    /// Issue a collective over the handoff tensor `tensor`. `elems` is the tensor's
+    /// element count (from the topology shape) — needed by the receiver of a
+    /// `SendRecv` (PP stage handoff) to size its recv buffer.
     Collective {
         collective: CollectiveKind,
         participants: Vec<u32>,
         tensor: HandoffId,
+        elems: usize,
     },
     /// Sparse-MoE route+bind. `router_id` is the gate segment's router-logits
     /// handoff; `block` is the transformer block index (the gate buffer's layer
@@ -103,6 +106,23 @@ pub trait LocalSegments {
     /// for in-place all-reduce. Default `None`.
     fn output_device_ptr_by_id(&self, _id: HandoffId) -> Option<(u64, usize)> {
         None
+    }
+
+    /// Launch the custom shm all-reduce on a luminal segment runtime's stream (so
+    /// under SKEIN_CAPTURE it shares the capture stream with the segments).
+    /// `data_ptr` is the handoff buffer; `shm_ptr` the cross-process mapped
+    /// region (both raw device pointers). Default: unsupported.
+    fn device_shm_all_reduce(
+        &mut self,
+        _data_ptr: u64,
+        _shm_ptr: u64,
+        _rank: i32,
+        _elems: usize,
+        _slot_bytes: i32,
+    ) -> Result<(), RankExecError> {
+        Err(RankExecError::UnknownTensor(
+            "device_shm_all_reduce unsupported on this backend".to_string(),
+        ))
     }
 
     /// Sparse-MoE route+bind with everything pre-resolved (zero string hashing):
@@ -188,6 +208,9 @@ impl<S: LocalSegments> RankExecutor<S> {
         // MoE routing, summed over one forward. With the feature off, `StepTimer`
         // is a no-op and `time_seg`/`time_comm` just run the closure.
         let mut timer = crate::perf_timing::StepTimer::new();
+        // SKEIN_CAPTURE: route the device all-reduce through luminal (shared
+        // capture stream). Checked once per forward.
+        let capture = std::env::var_os("SKEIN_CAPTURE").is_some();
         for step in schedule {
             match step {
                 ResolvedSequenceStep::ExecuteSegment {
@@ -202,7 +225,30 @@ impl<S: LocalSegments> RankExecutor<S> {
                     collective: kind,
                     participants,
                     tensor,
+                    elems,
                 } => {
+                    // Pipeline-parallel stage handoff: one rank sends the boundary
+                    // hidden state to the next stage's rank (the ONLY cross-GPU comm
+                    // per token under PP — vs 64 all-reduces under TP). Host-staged
+                    // (read -> ncclSend / ncclRecv -> write); 1x/token so it's cheap.
+                    if *kind == CollectiveKind::SendRecv {
+                        let sender = participants.first().copied().unwrap_or(0) as usize;
+                        let receiver = participants.get(1).copied().unwrap_or(0) as usize;
+                        let is_sender = self.rank == sender;
+                        let is_receiver = self.rank == receiver;
+                        let runner = &mut self.runner;
+                        timer.time_comm(|| -> Result<(), RankExecError> {
+                            if is_sender {
+                                let buf = runner.read_by_id(*tensor)?;
+                                collective.send_f32(&buf, receiver)?;
+                            } else if is_receiver {
+                                let buf = collective.recv_f32(sender, *elems)?;
+                                runner.write_by_id(*tensor, buf)?;
+                            }
+                            Ok(())
+                        })?;
+                        continue;
+                    }
                     if participants.iter().any(|p| *p as usize == self.rank) {
                         let runner = &mut self.runner;
                         timer.time_comm(|| -> Result<(), RankExecError> {
@@ -218,7 +264,29 @@ impl<S: LocalSegments> RankExecutor<S> {
                                 _ => None,
                             };
                             if let Some((ptr, elems)) = device {
-                                unsafe { collective.all_reduce_sum_device_bf16(ptr, elems) }?;
+                                // SKEIN_CAPTURE: launch the custom shm all-reduce
+                                // from luminal so it lands on the shared capture
+                                // stream (skein_runtime's cudarc can't reach
+                                // luminal's stream). Else use the collective's own
+                                // device all-reduce (NCCL or skein_runtime shm).
+                                let routed = if capture {
+                                    if let Some((shm_ptr, ar_rank, slot_bytes, max_elems)) =
+                                        collective.shm_all_reduce_info()
+                                        && elems <= max_elems
+                                    {
+                                        runner.device_shm_all_reduce(
+                                            ptr, shm_ptr, ar_rank, elems, slot_bytes,
+                                        )?;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !routed {
+                                    unsafe { collective.all_reduce_sum_device_bf16(ptr, elems) }?;
+                                }
                             } else {
                                 // Host fallback: all_gather (logits), broadcast, or
                                 // a tensor not held device-resident.
@@ -375,6 +443,7 @@ mod tests {
                 collective: CollectiveKind::RingAllReduce,
                 participants: vec![0, 1],
                 tensor: X,
+                elems: 2,
             },
         ]);
 
@@ -402,6 +471,7 @@ mod tests {
             collective: CollectiveKind::AllToAll,
             participants: vec![0],
             tensor: X,
+            elems: 2,
         }];
         let coll = BarrierCollective::group(1).unwrap().pop().unwrap();
         let mut runner = MockSegments::new(0);

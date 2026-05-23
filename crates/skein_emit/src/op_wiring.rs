@@ -83,6 +83,8 @@ use luminal::prelude::{
 };
 
 use skein_cost::Cluster;
+use skein_cost::cluster::{Placement, block_to_stage};
+use skein_cost::collectives::CollectiveKind;
 use skein_ir::ir::{Graph, LayerKind, ModelMeta, Param};
 use skein_ir::plan::Plan;
 
@@ -142,15 +144,42 @@ pub fn wire_segments_with_seq(
     let points = device_collective_points(plan, ir, device_idx);
     let mut wiring = DeviceWiring::new(plan, cluster, ir, device_idx, seq)?;
 
+    // Under pipeline parallelism this device hosts only the decoder blocks of
+    // its stage; the embedding lives on stage 0 and the final norm + LM head on
+    // the last stage. Stage boundaries are crossed by a `SendRecv` of the hidden
+    // state. With pp=1 `stage` is 0, `owned` is every block, and this collapses
+    // to the original single-pass lowering.
+    let placement = skein_cost::cluster::Placement::from_plan(plan);
+    let num_blocks = ir.meta.num_layers;
+    let stage = placement.stage_of(device_idx).unwrap_or(0);
+    let owned: Vec<usize> = (0..num_blocks)
+        .filter(|&b| block_to_stage(b, num_blocks, placement.pp) == stage)
+        .collect();
+    let is_first_stage = stage == 0;
+    let is_last_stage = stage + 1 >= placement.pp.max(1);
+
     let mut point_iter = points.iter();
     // `wire_initial` consumes the vocab-parallel embedding AllReduce (if any),
     // each block consumes its TP/EP collectives, and `wire_final` consumes the
     // logits AllGather (if any).
-    wiring.wire_initial(&mut point_iter)?;
-    for block in 0..ir.meta.num_layers {
+    if is_first_stage {
+        wiring.wire_initial(&mut point_iter)?;
+    } else {
+        // Later stage: receive the previous stage's hidden state and open the
+        // first segment with it as the input handoff.
+        let first = *owned.first().expect("pipeline stage owns no blocks");
+        wiring.wire_stage_recv(first, &placement);
+    }
+    for &block in &owned {
         wiring.wire_block(block, &mut point_iter)?;
     }
-    wiring.wire_final(&mut point_iter)?;
+    if is_last_stage {
+        wiring.wire_final(&mut point_iter)?;
+    } else {
+        // Earlier stage: send the last block's hidden state to the next stage.
+        let boundary = *owned.last().expect("pipeline stage owns no blocks") + 1;
+        wiring.wire_stage_send(boundary, &placement);
+    }
 
     // Every collective point must have been consumed.
     assert!(point_iter.next().is_none(), "collective points exhausted");
@@ -669,6 +698,74 @@ impl<'a> DeviceWiring<'a> {
             }]);
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline-parallel stage boundaries
+    // -----------------------------------------------------------------------
+
+    /// SendRecv participants `[sender_leader, receiver_leader]` for the boundary
+    /// into `stage` (the receiving stage). The sender is `stage-1`'s leader, the
+    /// receiver is `stage`'s leader. With the lexicographic placement the leader
+    /// of a stage is `stage * tp * ep`. Both sides emit the *same* participant
+    /// pair so the runtime's SendRecv pairs them.
+    fn send_recv_participants(&self, recv_stage: u32, placement: &Placement) -> Vec<u32> {
+        let tp_ep = placement.tp * placement.ep;
+        let sender_leader = (recv_stage - 1) * tp_ep;
+        let receiver_leader = recv_stage * tp_ep;
+        vec![sender_leader, receiver_leader]
+    }
+
+    /// Open this stage's first segment with the hidden state received from the
+    /// previous stage. Pushes the `SendRecv` collective (this rank receives the
+    /// previous stage's `carry_pre_block(first)` into the host store) and opens a
+    /// fresh segment whose input handoff re-introduces it as an `Input`.
+    fn wire_stage_recv(&mut self, first: usize, placement: &Placement) {
+        let tensor = carry_pre_block(first);
+        let hidden_shape = vec![self.batch, self.seq, self.hidden];
+        let recv_stage = block_to_stage(first, self.ir.meta.num_layers, placement.pp);
+        self.sequencing.push(SequenceStep::Collective {
+            collective: CollectiveKind::SendRecv,
+            participants: self.send_recv_participants(recv_stage, placement),
+            tensor: tensor.clone(),
+            shape: hidden_shape.clone(),
+            dtype: self.activation_dtype,
+        });
+        self.open_new_segment(vec![HandoffSpec {
+            logical_name: tensor,
+            shape: hidden_shape,
+            dtype: self.activation_dtype,
+        }]);
+    }
+
+    /// Close this stage's last segment, emitting the boundary hidden state
+    /// `carry_pre_block(boundary)` as its output handoff, then push the
+    /// `SendRecv` collective (this rank sends it to the next stage). `boundary`
+    /// is the first block of the *next* stage.
+    fn wire_stage_send(&mut self, boundary: usize, placement: &Placement) {
+        let tensor = carry_pre_block(boundary);
+        let live = self
+            .live
+            .remove(&tensor)
+            .unwrap_or_else(|| panic!("stage-boundary carry {tensor} missing from live"));
+        let out = live.tensor.output();
+        let hidden_shape = live.shape.clone();
+        let dtype = live.dtype;
+        self.close_current_segment(vec![HandoffTensor {
+            logical_name: tensor.clone(),
+            luminal_id: out.id,
+            shape: hidden_shape.clone(),
+            dtype,
+        }]);
+        // `boundary` belongs to the next stage; that stage is the receiver.
+        let recv_stage = block_to_stage(boundary, self.ir.meta.num_layers, placement.pp);
+        self.sequencing.push(SequenceStep::Collective {
+            collective: CollectiveKind::SendRecv,
+            participants: self.send_recv_participants(recv_stage, placement),
+            tensor,
+            shape: hidden_shape,
+            dtype,
+        });
     }
 
     // -----------------------------------------------------------------------

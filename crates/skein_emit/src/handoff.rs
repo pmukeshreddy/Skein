@@ -129,7 +129,16 @@ pub fn device_collective_points(plan: &Plan, ir: &Graph, device_idx: u32) -> Vec
         });
     }
 
+    // Under PP this device wires only its own stage's blocks, so it issues
+    // collectives only for those blocks. Skip blocks on other stages (pp=1 →
+    // every block is on stage 0, no skip).
+    let device_stage = placement.stage_of(device_idx).unwrap_or(0);
     for block in 0..ir.meta.num_layers {
+        if skein_cost::cluster::block_to_stage(block, ir.meta.num_layers, placement.pp)
+            != device_stage
+        {
+            continue;
+        }
         let activation_dtype = plan
             .dtype_map
             .per_layer

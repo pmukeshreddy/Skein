@@ -116,10 +116,16 @@ pub fn global_memory_fits(
     let weight_dt = Dtype::Int4;
     let kv_dt = Dtype::Fp8E4m3;
 
+    // Pipeline parallelism distributes whole decoder blocks across `pp` stages,
+    // so each device holds ~num_blocks/pp of them. Divide the all-blocks sum by
+    // `pp` to get the per-device total (pp=1 is a no-op). Non-decoder weights
+    // (embedding on stage 0, lm_head on the last stage) are not distributed and
+    // stay whole — the conservative bound.
+    let pp = placement.pp.max(1) as u64;
     let mut total: u64 = 0;
     for b in 0..ir.meta.num_layers {
-        total = total.saturating_add(block_weight_bytes(b, ir, weight_dt, placement));
-        total = total.saturating_add(block_kv_bytes(ir, kv_dt, placement, &wl, global.kv_shard));
+        total = total.saturating_add(block_weight_bytes(b, ir, weight_dt, placement) / pp);
+        total = total.saturating_add(block_kv_bytes(ir, kv_dt, placement, &wl, global.kv_shard) / pp);
     }
     total = total.saturating_add(non_decoder_weight_bytes(ir, placement));
 

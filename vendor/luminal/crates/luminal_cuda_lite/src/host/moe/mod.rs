@@ -81,6 +81,8 @@ pub struct GLUMoE {
         CudaFunction, // quantize_fp8_rows
         CudaFunction, // moe_gate_up_act_fp8
         CudaFunction, // moe_down_combine_fp8
+        CudaFunction, // moe_gate_up_act_fp8_v2
+        CudaFunction, // moe_down_combine_fp8_v2
     )>,
     /// fp8 (E4M3) weight cache (SKEIN_MOE_FP8): raw device pointers to the
     /// quantized resident expert weights + per-row scales. Computed once on the
@@ -191,6 +193,8 @@ impl GLUMoE {
         stream: &Arc<CudaStream>,
     ) -> &(
         Arc<CudaModule>,
+        CudaFunction,
+        CudaFunction,
         CudaFunction,
         CudaFunction,
         CudaFunction,
@@ -493,6 +497,117 @@ extern "C" __global__ void moe_down_combine_fp8(
     }
     if (threadIdx.x == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
 }
+
+// ---- v2 (SKEIN_MOE_V2): warp-per-output-row + shared-memory staging of the
+// reused activation, single warp-shuffle reduction (no cross-warp shared reduce).
+// MEASURED REGRESSION (kept gated-off for the record): on RTX PRO 6000 Blackwell
+// at the decode shape (seq=1, top-2, hidden=4096, intermediate=7168) v2 is SLOWER
+// than v1 — gate_up 73%->70% peak, down 58%->33% peak. v1's much higher block
+// count (14336 / 4096 blocks) hides latency better than v2's shared-staging
+// barrier + lower occupancy (1024 blocks of 128 threads). Default stays v1.
+// gate_up: 8 rows/block (256 thr), x staged in shared (reused by all 8 warps).
+extern "C" __global__ void moe_gate_up_act_fp8_v2(
+    unsigned long long x_bf16_ptr, unsigned long long topk_idx_ptr,
+    unsigned long long gate_up_ptr, unsigned long long gate_up_scale_ptr, unsigned long long hid_ptr,
+    int hidden, int intermediate, int gate_up_dim, int top_k, int idx_stride, int seq, int act_mode
+) {
+    extern __shared__ __nv_bfloat16 sx[];   // [hidden]
+    int tj = blockIdx.y;
+    int t = tj / top_k, slot = tj % top_k;
+    if (t >= seq) return;
+    const __nv_bfloat16* xg = (const __nv_bfloat16*)x_bf16_ptr + (long long)t * hidden;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) sx[j] = xg[j];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, wpb = blockDim.x >> 5;
+    int o = blockIdx.x * wpb + warp;
+    if (o >= intermediate) return;
+    int expert = ((const int*)topk_idx_ptr)[(long long)t * idx_stride + slot];
+    const unsigned char* W = (const unsigned char*)gate_up_ptr + (long long)expert * gate_up_dim * hidden;
+    const unsigned char* gate_row = W + (long long)o * hidden;
+    const unsigned char* up_row   = W + (long long)(o + intermediate) * hidden;
+    const float* sc = (const float*)gate_up_scale_ptr + (long long)expert * gate_up_dim;
+    float gscale = sc[o], uscale = sc[o + intermediate];
+    float gacc = 0.f, uacc = 0.f;
+    int n16 = hidden >> 4;
+    const uint4* gp4 = (const uint4*)gate_row;
+    const uint4* up4 = (const uint4*)up_row;
+    for (int j = lane; j < n16; j += 32) {
+        uint4 gw = gp4[j], uw = up4[j];
+        const __nv_fp8_e4m3* gh = (const __nv_fp8_e4m3*)&gw;
+        const __nv_fp8_e4m3* uh = (const __nv_fp8_e4m3*)&uw;
+        int b = j << 4;
+        #pragma unroll
+        for (int e = 0; e < 16; e++) { float xf = __bfloat162float(sx[b + e]); gacc += (float)gh[e] * xf; uacc += (float)uh[e] * xf; }
+    }
+    for (int j = (n16 << 4) + lane; j < hidden; j += 32) {
+        float xf = __bfloat162float(sx[j]);
+        __nv_fp8_e4m3 gq; gq.__x = gate_row[j];
+        __nv_fp8_e4m3 uq; uq.__x = up_row[j];
+        gacc += (float)gq * xf; uacc += (float)uq * xf;
+    }
+    for (int s = 16; s > 0; s >>= 1) { gacc += __shfl_down_sync(0xffffffffu, gacc, s); uacc += __shfl_down_sync(0xffffffffu, uacc, s); }
+    if (lane == 0) {
+        float gate = gacc * gscale, up = uacc * uscale, act;
+        if (act_mode == 0) { act = gate / (1.0f + expf(-gate)); }
+        else { float scx = 1.5957691216f * gate * (1.0f + 0.044715f * gate * gate); act = gate / (1.0f + expf(-scx)); }
+        ((__nv_bfloat16*)hid_ptr)[(long long)tj * intermediate + o] = __float2bfloat16(act * up);
+    }
+}
+
+// down: 4 rows/block (128 thr); both experts' hd staged in shared (reused by all
+// 4 warps), top_k looped inside the warp so out[h] is written exactly once.
+extern "C" __global__ void moe_down_combine_fp8_v2(
+    unsigned long long hid_ptr, unsigned long long topk_idx_ptr, unsigned long long topk_vals_ptr,
+    unsigned long long scale_ptr, unsigned long long down_ptr, unsigned long long down_scale_ptr,
+    unsigned long long out_ptr,
+    int hidden, int intermediate, int top_k, int idx_stride, int vals_stride, int seq,
+    int normalize, int use_scale
+) {
+    extern __shared__ __nv_bfloat16 shd[];  // [top_k, intermediate]
+    int t = blockIdx.y;
+    if (t >= seq) return;
+    const int* idx = (const int*)topk_idx_ptr;
+    const float* vals = (const float*)topk_vals_ptr;
+    // Stage this token's top_k expert activations (contiguous) into shared.
+    const __nv_bfloat16* hbase = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k) * intermediate;
+    for (int j = threadIdx.x; j < top_k * intermediate; j += blockDim.x) shd[j] = hbase[j];
+    __syncthreads();
+    float inv_norm = 1.0f;
+    if (normalize) {
+        float ssum = 0.f;
+        for (int j = 0; j < top_k; j++) ssum += vals[(long long)t * vals_stride + j];
+        inv_norm = (ssum != 0.f) ? (1.0f / ssum) : 0.f;
+    }
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, wpb = blockDim.x >> 5;
+    int h = blockIdx.x * wpb + warp;
+    if (h >= hidden) return;
+    int n16 = intermediate >> 4;
+    float out_acc = 0.f;
+    for (int jx = 0; jx < top_k; jx++) {
+        int expert = idx[(long long)t * idx_stride + jx];
+        float w = vals[(long long)t * vals_stride + jx] * inv_norm;
+        if (use_scale) w *= ((const float*)scale_ptr)[expert];
+        const unsigned char* D = (const unsigned char*)down_ptr + (long long)expert * hidden * intermediate + (long long)h * intermediate;
+        float dscale = ((const float*)down_scale_ptr)[(long long)expert * hidden + h];
+        const __nv_bfloat16* hd = shd + (long long)jx * intermediate;
+        const uint4* dp4 = (const uint4*)D;
+        float dot = 0.f;
+        for (int j = lane; j < n16; j += 32) {
+            uint4 dw = dp4[j];
+            const __nv_fp8_e4m3* dh = (const __nv_fp8_e4m3*)&dw;
+            int b = j << 4;
+            #pragma unroll
+            for (int e = 0; e < 16; e++) dot += (float)dh[e] * __bfloat162float(hd[b + e]);
+        }
+        for (int j = (n16 << 4) + lane; j < intermediate; j += 32) {
+            __nv_fp8_e4m3 dq; dq.__x = D[j];
+            dot += (float)dq * __bfloat162float(hd[j]);
+        }
+        for (int s = 16; s > 0; s >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, s);
+        if (lane == 0) out_acc += w * dscale * dot;
+    }
+    if (lane == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
+}
 "#;
             let ptx = compile_module_image_for_current_device(stream.context(), src).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
@@ -503,6 +618,8 @@ extern "C" __global__ void moe_down_combine_fp8(
             let quant_fp8 = module.load_function("quantize_fp8_rows").unwrap();
             let gate_up_act_fp8 = module.load_function("moe_gate_up_act_fp8").unwrap();
             let down_combine_fp8 = module.load_function("moe_down_combine_fp8").unwrap();
+            let gate_up_act_fp8_v2 = module.load_function("moe_gate_up_act_fp8_v2").unwrap();
+            let down_combine_fp8_v2 = module.load_function("moe_down_combine_fp8_v2").unwrap();
             (
                 module,
                 f32_to_bf16,
@@ -512,6 +629,8 @@ extern "C" __global__ void moe_down_combine_fp8(
                 quant_fp8,
                 gate_up_act_fp8,
                 down_combine_fp8,
+                gate_up_act_fp8_v2,
+                down_combine_fp8_v2,
             )
         })
     }
@@ -868,22 +987,61 @@ impl HostOp for GLUMoE {
         let vals_stride_i = vals_stride as i32;
         let seq_i = seq as i32;
 
+        // --- Optional kernel timing (SKEIN_MOE_KTIME): CUDA events around the two
+        // MoE GEMVs, accumulated into module statics, logged with achieved GB/s vs
+        // peak every 64 calls. Adds a per-call stream sync so tok/s is INVALID
+        // during a ktime run; only the per-kernel GPU µs / GB/s are meaningful.
+        static KTIME: OnceLock<bool> = OnceLock::new();
+        static KT_GU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static KT_DN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static KT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ktime = *KTIME.get_or_init(|| std::env::var_os("SKEIN_MOE_KTIME").is_some());
+        static V2: OnceLock<bool> = OnceLock::new();
+        let use_v2 = *V2.get_or_init(|| std::env::var_os("SKEIN_MOE_V2").is_some());
+        let kt_events = if ktime {
+            // CU_EVENT_DEFAULT (=0) keeps timing enabled; None would default to
+            // CU_EVENT_DISABLE_TIMING and elapsed_ms would fail.
+            let f = Some(crate::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+            let ctx = stream.context();
+            Some((
+                ctx.new_event(f).unwrap(),
+                ctx.new_event(f).unwrap(),
+                ctx.new_event(f).unwrap(),
+            ))
+        } else {
+            None
+        };
+
         // gate_up GEMV + gated activation. Grid: (intermediate, seq*top_k).
         let grid_gu = LaunchConfig {
             grid_dim: (intermediate as u32, (seq * top_k) as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        if let Some((a, _, _)) = &kt_events {
+            a.record(stream).unwrap();
+        }
+        // v2 (SKEIN_MOE_V2, fp8 only): warp-per-row, 8 rows/block, x staged in shared.
+        let grid_gu_v2 = LaunchConfig {
+            grid_dim: ((intermediate as u32).div_ceil(8), (seq * top_k) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (hidden * 2) as u32,
+        };
         unsafe {
             if let Some(f8) = fp8w {
                 let gu_w = f8.gate_up_ptr;
                 let gu_s = f8.gate_up_scale_ptr;
+                let (gu_fn, gu_cfg) = if use_v2 {
+                    (&kernels.8, grid_gu_v2)
+                } else {
+                    (&kernels.6, grid_gu)
+                };
                 stream
-                    .launch_builder(&kernels.6)
+                    .launch_builder(gu_fn)
                     .arg(&xbf16_ptr).arg(&topk_idx_ptr).arg(&gu_w).arg(&gu_s).arg(&hid_ptr)
                     .arg(&hidden_i).arg(&intermediate_i).arg(&gate_up_dim_i).arg(&top_k_i)
                     .arg(&idx_stride_i).arg(&seq_i).arg(&act_mode)
-                    .launch(grid_gu)?;
+                    .launch(gu_cfg)?;
             } else {
                 stream
                     .launch_builder(gate_up_act_fn)
@@ -894,23 +1052,39 @@ impl HostOp for GLUMoE {
             }
         }
 
+        if let Some((_, b, _)) = &kt_events {
+            b.record(stream).unwrap();
+        }
+
         // down GEMV + weighted combine. Grid: (hidden, seq).
         let grid_dn = LaunchConfig {
             grid_dim: (hidden as u32, seq as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        // v2 (SKEIN_MOE_V2, fp8 only): warp-per-row, 4 rows/block, both experts'
+        // hd staged in shared (28 KB), top_k looped inside the warp.
+        let grid_dn_v2 = LaunchConfig {
+            grid_dim: ((hidden as u32).div_ceil(4), seq as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: (top_k * intermediate * 2) as u32,
+        };
         unsafe {
             if let Some(f8) = fp8w {
                 let dn_w = f8.down_ptr;
                 let dn_s = f8.down_scale_ptr;
+                let (dn_fn, dn_cfg) = if use_v2 {
+                    (&kernels.9, grid_dn_v2)
+                } else {
+                    (&kernels.7, grid_dn)
+                };
                 stream
-                    .launch_builder(&kernels.7)
+                    .launch_builder(dn_fn)
                     .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr)
                     .arg(&dn_w).arg(&dn_s).arg(&output_ptr)
                     .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
                     .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
-                    .launch(grid_dn)?;
+                    .launch(dn_cfg)?;
             } else {
                 stream
                     .launch_builder(down_combine_fn)
@@ -919,6 +1093,34 @@ impl HostOp for GLUMoE {
                     .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
                     .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
                     .launch(grid_dn)?;
+            }
+        }
+
+        if let Some((a, b, c)) = &kt_events {
+            use std::sync::atomic::Ordering::Relaxed;
+            c.record(stream).unwrap();
+            c.synchronize().unwrap();
+            // elapsed_ms is `end - self`: gate_up = a->b, down = b->c.
+            let gu_us = a.elapsed_ms(b).unwrap() as f64 * 1000.0;
+            let dn_us = b.elapsed_ms(c).unwrap() as f64 * 1000.0;
+            KT_GU_NS.fetch_add((gu_us * 1000.0) as u64, Relaxed);
+            KT_DN_NS.fetch_add((dn_us * 1000.0) as u64, Relaxed);
+            let n = KT_CALLS.fetch_add(1, Relaxed) + 1;
+            if n % 64 == 0 {
+                // fp8 weight bytes read per call: top_k experts' full matrices.
+                let gu_bytes = (gate_up_dim * hidden * top_k) as f64;
+                let dn_bytes = (hidden * intermediate * top_k) as f64;
+                let gu_us_avg = KT_GU_NS.load(Relaxed) as f64 / 1000.0 / n as f64;
+                let dn_us_avg = KT_DN_NS.load(Relaxed) as f64 / 1000.0 / n as f64;
+                let gu_gbs = gu_bytes / (gu_us_avg * 1e-6) / 1e9;
+                let dn_gbs = dn_bytes / (dn_us_avg * 1e-6) / 1e9;
+                let peak = 1790.0;
+                eprintln!(
+                    "SKEIN_MOE_KTIME n={n} gate_up: {gu_us_avg:.1}us {gu_gbs:.0}GB/s ({:.0}% peak) | down: {dn_us_avg:.1}us {dn_gbs:.0}GB/s ({:.0}% peak) | total {:.1}us/call",
+                    gu_gbs / peak * 100.0,
+                    dn_gbs / peak * 100.0,
+                    gu_us_avg + dn_us_avg,
+                );
             }
         }
 

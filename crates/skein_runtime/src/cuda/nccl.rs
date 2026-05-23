@@ -55,6 +55,10 @@ pub struct NcclCollective {
     /// steady-state path does no per-call `alloc_zeros`. Interior-mutable because
     /// the collective is borrowed `&self` per step (single rank thread).
     recv_cache: std::cell::RefCell<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    /// Custom mapped-shared-memory all-reduce (SKEIN_SHM_ALLREDUCE): bypasses
+    /// NCCL for small device bf16 all-reduces (decode hot path), eliminating
+    /// NCCL's ~105us-per-call cold-issue cost. `None` => always use NCCL.
+    shm: Option<super::shm_allreduce::ShmAllReduce>,
 }
 
 impl NcclCollective {
@@ -74,17 +78,53 @@ impl NcclCollective {
         }
         let ctx = CudaContext::new(0)
             .map_err(|e| CollectiveError::Nccl(format!("CudaContext::new(0): {e}")))?;
+        // Match the compute runtime (see luminal runtime.rs new_on): NCCL shares
+        // the single default stream, so disable cudarc per-buffer event tracking.
+        if std::env::var_os("SKEIN_NO_EVENT_TRACKING").is_some() {
+            unsafe { ctx.disable_event_tracking() };
+        }
+        // SKEIN_CTX_SPIN: busy-wait at syncs (low wake latency) on the shared
+        // primary context; see luminal runtime.rs new_on.
+        if std::env::var_os("SKEIN_CTX_SPIN").is_some() {
+            let _ = ctx.bind_to_thread();
+            let _ = ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_SPIN);
+        }
         let stream = ctx.default_stream();
         let id = id_from_bytes(id_bytes)?;
         let comm = Comm::from_rank(stream.clone(), rank, world_size, id)
             .map_err(|e| CollectiveError::Nccl(format!("ncclCommInitRank: {e:?}")))?;
-        Ok(Self {
+
+        // SKEIN_SHM_ALLREDUCE: custom mapped-shared-memory all-reduce for the
+        // decode hot path (world_size==2 only). Falls back to NCCL on any setup
+        // error so a failure never breaks correctness.
+        let shm = if world_size == 2 && std::env::var_os("SKEIN_SHM_ALLREDUCE").is_some() {
+            match super::shm_allreduce::ShmAllReduce::new(stream.clone(), rank, id_bytes) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(rank, "SHM all-reduce setup failed ({e}); using NCCL");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let me = Self {
             comm,
             stream,
             rank,
             world_size,
             recv_cache: std::cell::RefCell::new(None),
-        })
+            shm,
+        };
+
+        // Cross-rank barrier so both ranks have zeroed the shm seq flags before
+        // the first custom all-reduce (a NCCL all-reduce flushes + synchronizes).
+        if me.shm.is_some() {
+            let mut barrier = [0.0f32; 1];
+            me.all_reduce_sum(&mut barrier)?;
+        }
+        Ok(me)
     }
 }
 
@@ -151,6 +191,15 @@ impl RankCollective for NcclCollective {
         if ptr == 0 || elems == 0 {
             return Ok(());
         }
+        // Custom mapped-shared-memory all-reduce (decode hot path): kernel-only,
+        // no NCCL collective issue cost. Both ranks take this path identically
+        // (same `elems` from the schedule), so the seq flags stay in lockstep.
+        if let Some(shm) = &self.shm {
+            if elems <= super::shm_allreduce::MAX_ELEMS {
+                return unsafe { shm.all_reduce(ptr, elems) }
+                    .map_err(CollectiveError::Nccl);
+            }
+        }
         // View the producer segment's output buffer as bf16 WITHOUT taking
         // ownership (ManuallyDrop ⇒ no cuMemFree on drop; the Luminal arena owns
         // it). NCCL all-reduces device→device; the result is copied back into the
@@ -183,6 +232,83 @@ impl RankCollective for NcclCollective {
             .map_err(cuda_err)?;
         Ok(())
     }
+
+    fn shm_all_reduce_info(&self) -> Option<(u64, i32, i32, usize)> {
+        self.shm.as_ref().map(|s| s.info())
+    }
+
+    fn send_f32(&self, buf: &[f32], peer: usize) -> Result<(), CollectiveError> {
+        let dev = self.stream.memcpy_stod(buf).map_err(cuda_err)?;
+        self.comm
+            .send(&dev, peer as i32)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclSend: {e:?}")))?;
+        self.stream.synchronize().map_err(cuda_err)?;
+        Ok(())
+    }
+
+    fn recv_f32(&self, peer: usize, len: usize) -> Result<Vec<f32>, CollectiveError> {
+        let mut dev = self.stream.alloc_zeros::<f32>(len).map_err(cuda_err)?;
+        self.comm
+            .recv(&mut dev, peer as i32)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclRecv: {e:?}")))?;
+        self.stream.synchronize().map_err(cuda_err)?;
+        self.stream.memcpy_dtov(&dev).map_err(cuda_err)
+    }
+}
+
+impl NcclCollective {
+    /// Microbenchmark: in-isolation latency of the device bf16 all-reduce. Both
+    /// ranks run a tight all-reduce loop on `elems` bf16 — the loop self-syncs
+    /// every iteration, so rank drift cannot accumulate. This isolates NCCL
+    /// transport+protocol cost from the in-context per-barrier drift wait (the
+    /// ~105us gaps nsys saw before each all-reduce). Gated by the caller
+    /// (SKEIN_ALLREDUCE_BENCH). Both ranks MUST call it (it is collective).
+    pub fn bench_all_reduce(&self, elems: usize, iters: usize) {
+        // gap_us: busy-spin the host this long BETWEEN all-reduces (each rank,
+        // synchronizing after each so the gap is a real spacing). This replicates
+        // the in-context situation where ~250us of segment work sits between
+        // barriers and NCCL's SHM proxy thread goes idle. If latency jumps with a
+        // gap, the in-context cost is proxy-wakeup/overhead (a custom kernel-only
+        // all-reduce avoids it); if it stays flat, it's genuine GPU rank drift.
+        for gap_us in [0u64, 100, 300] {
+            self.bench_one(elems, iters.min(if gap_us == 0 { iters } else { 400 }), gap_us);
+        }
+    }
+
+    fn bench_one(&self, elems: usize, iters: usize, gap_us: u64) {
+        use cudarc::driver::DevicePtr;
+        let buf = match self.stream.alloc_zeros::<half::bf16>(elems) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("SKEIN_ALLREDUCE_BENCH alloc failed: {e:?}");
+                return;
+            }
+        };
+        let (ptr, _g) = buf.device_ptr(&self.stream);
+        for _ in 0..50 {
+            let _ = unsafe { self.all_reduce_sum_device_bf16(ptr, elems) };
+        }
+        let _ = self.stream.synchronize();
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..iters {
+            if gap_us > 0 {
+                // Sync first so the gap is a real idle period (proxy can sleep),
+                // then busy-spin the host, then time the single all-reduce.
+                let _ = self.stream.synchronize();
+                let spin_end = std::time::Instant::now() + std::time::Duration::from_micros(gap_us);
+                while std::time::Instant::now() < spin_end {}
+            }
+            let t = std::time::Instant::now();
+            let _ = unsafe { self.all_reduce_sum_device_bf16(ptr, elems) };
+            let _ = self.stream.synchronize();
+            total += t.elapsed();
+        }
+        let per_us = total.as_micros() as f64 / iters as f64;
+        eprintln!(
+            "SKEIN_ALLREDUCE_BENCH rank={} elems={} gap_us={} iters={} per_allreduce_us={:.2}",
+            self.rank, elems, gap_us, iters, per_us
+        );
+    }
 }
 
 fn cuda_err(e: cudarc::driver::DriverError) -> CollectiveError {
@@ -213,6 +339,17 @@ impl NcclKvTransport {
         }
         let ctx = CudaContext::new(0)
             .map_err(|e| CollectiveError::Nccl(format!("CudaContext::new(0): {e}")))?;
+        // Match the compute runtime (see luminal runtime.rs new_on): NCCL shares
+        // the single default stream, so disable cudarc per-buffer event tracking.
+        if std::env::var_os("SKEIN_NO_EVENT_TRACKING").is_some() {
+            unsafe { ctx.disable_event_tracking() };
+        }
+        // SKEIN_CTX_SPIN: busy-wait at syncs (low wake latency) on the shared
+        // primary context; see luminal runtime.rs new_on.
+        if std::env::var_os("SKEIN_CTX_SPIN").is_some() {
+            let _ = ctx.bind_to_thread();
+            let _ = ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_SPIN);
+        }
         let stream = ctx.default_stream();
         let id = id_from_bytes(id_bytes)?;
         let comm = Comm::from_rank(stream.clone(), rank, world_size, id)

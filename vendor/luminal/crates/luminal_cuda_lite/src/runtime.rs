@@ -2,7 +2,9 @@ use crate::{
     host::{DeviceBuffer, HostOp},
     kernel::{CudaGraphTiming, KernelOp, record_cuda_graph_timings},
 };
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result};
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, result,
+};
 
 use fixedbitset::FixedBitSet;
 use half::{bf16, f16};
@@ -112,6 +114,11 @@ pub(crate) struct CompiledBucket {
     pub(crate) bucket_indices: FxHashMap<char, usize>,
     /// Whether HLIR pointers have been synced into this bucket's cached_buffer_ptrs
     pub(crate) hlir_synced: bool,
+    /// Cached topological execution order of `exec_graph`. The graph is fixed
+    /// after build, so the order is computed once and reused every execute
+    /// instead of re-running `toposort` (which allocates) on the per-token hot
+    /// path. Empty = not yet computed.
+    pub(crate) exec_order: Vec<NodeIndex>,
 }
 
 impl CompiledBucket {
@@ -125,6 +132,7 @@ impl CompiledBucket {
             logical_buffer_bytes: FxHashMap::default(),
             cached_buffer_ptrs: FxHashMap::default(),
             buffer_specs: FxHashMap::default(),
+            exec_order: Vec::new(),
             input_dtypes: FxHashMap::default(),
             llir_to_hlir: FxHashMap::default(),
             hlir_to_llir: FxHashMap::default(),
@@ -174,6 +182,50 @@ pub struct CudaRuntime {
     /// Non-owning CudaSlice views of external output pointers, keyed by LLIR data node
     /// ManuallyDrop prevents cuMemFree -- Pytorch owns the memory
     external_output_buffers: FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
+
+    /// Device buffer (1 i32) holding the current decode `position`, updated via
+    /// [`set_decode_position`](Self::set_decode_position). Read by the
+    /// `kv_slot_write` kernel so the KV-append destination offset is computed on
+    /// device (not baked into a host-issued DtoD) — making the append a
+    /// graph-capturable node for the full-step CUDA graph.
+    decode_position: std::cell::RefCell<Option<CudaSlice<i32>>>,
+    /// Lazily-compiled `kv_slot_write` kernel (module + function).
+    kv_write_kernel: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// Lazily-compiled `shm_allreduce2` kernel (module + function). Under
+    /// SKEIN_CAPTURE the all-reduce must launch from luminal so it lands on
+    /// luminal's shared capture stream (skein_runtime's cudarc can't reach the
+    /// raw function/stream across the version boundary). skein_runtime owns the
+    /// cross-process shm setup and passes the raw shm device pointer.
+    shm_allreduce_kernel: std::sync::OnceLock<(Arc<CudaModule>, CudaFunction)>,
+    /// Full-step CUDA graph captured from the shared stream (SKEIN_CAPTURE): the
+    /// whole pre-all-gather decode forward recorded once, replayed per token with
+    /// one `cuGraphLaunch` instead of ~12k host CUDA calls.
+    captured_graph_exec: std::cell::RefCell<Option<cudarc::driver::sys::CUgraphExec>>,
+}
+
+/// Process-wide shared **non-default** CUDA stream for the `SKEIN_CAPTURE` path.
+/// Stream capture is impossible on the legacy default stream (handle 0), so under
+/// capture every segment runtime + KV writes (luminal) AND the cross-process shm
+/// all-reduce (skein_runtime, via [`capture_stream_raw`]) share ONE non-default
+/// stream — preserving the single-stream ordering the device-resident handoffs
+/// rely on. A rank process owns one device, so a single global stream is correct.
+static SHARED_CAPTURE_STREAM: std::sync::OnceLock<Arc<CudaStream>> = std::sync::OnceLock::new();
+
+fn capture_stream(ctx: &Arc<cudarc::driver::CudaContext>) -> Arc<CudaStream> {
+    SHARED_CAPTURE_STREAM
+        .get_or_init(|| ctx.new_stream().expect("create shared SKEIN_CAPTURE stream"))
+        .clone()
+}
+
+/// Raw `CUstream` handle (as `u64`) of the shared capture stream, or 0 if not yet
+/// created. Returned as a plain integer so skein_runtime (a different cudarc
+/// version) can launch the shm all-reduce on this exact stream via `cuLaunchKernel`
+/// without needing the typed `CudaStream` to cross the version boundary.
+pub fn capture_stream_raw() -> u64 {
+    SHARED_CAPTURE_STREAM
+        .get()
+        .map(|s| s.cu_stream() as usize as u64)
+        .unwrap_or(0)
 }
 
 impl CudaRuntime {
@@ -189,8 +241,32 @@ impl CudaRuntime {
     pub fn new_on(device: usize) -> Result<Self, cudarc::driver::DriverError> {
         let ctx = cudarc::driver::CudaContext::new(device)?;
         ctx.bind_to_thread()?;
-        ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
-        let stream = ctx.default_stream();
+        // SKEIN_CTX_SPIN: busy-wait at syncs instead of sleeping. BLOCKING_SYNC
+        // host wake latency was measured at ~56us/sync in this VM, which inflates
+        // every NCCL/stream wait; SPIN trades a hot CPU core for low-latency wakes
+        // (right for a dedicated latency-critical decode loop).
+        let sched = if std::env::var_os("SKEIN_CTX_SPIN").is_some() {
+            cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_SPIN
+        } else {
+            cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC
+        };
+        ctx.set_flags(sched)?;
+        // Single default stream per device (compute kernels, graphs, memcpy, and
+        // NCCL all share `ctx.default_stream()`), so cudarc's per-buffer-usage
+        // CudaEvent tracking is pure host overhead — nsys measured ~11k
+        // cuEventRecord/token (~6ms host) that starves the GPU during decode.
+        // Under single-stream execution none of the documented hazards apply, so
+        // disabling it is safe. Must be set before any CudaSlice is allocated.
+        if std::env::var_os("SKEIN_NO_EVENT_TRACKING").is_some() {
+            unsafe { ctx.disable_event_tracking() };
+        }
+        // SKEIN_CAPTURE: share one non-default stream (capture can't run on the
+        // legacy default stream); see `capture_stream`.
+        let stream = if std::env::var_os("SKEIN_CAPTURE").is_some() {
+            capture_stream(&ctx)
+        } else {
+            ctx.default_stream()
+        };
 
         Ok(Self::initialize(stream))
     }
@@ -564,6 +640,242 @@ impl CudaRuntime {
         }
         // The DtoD copy is stream-ordered on the rank's shared default stream
         // with the consumer that later reads it, so no host sync is needed here.
+    }
+
+    /// Update the device-resident decode `position` (one i32). Stream-ordered, so
+    /// a subsequent [`copy_output_to_device_ptr_kv`](Self::copy_output_to_device_ptr_kv)
+    /// on the same stream reads the new value.
+    pub fn set_decode_position(&self, pos: usize) {
+        let mut slot = self.decode_position.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(
+                self.cuda_stream
+                    .alloc_zeros::<i32>(1)
+                    .expect("alloc decode_position"),
+            );
+        }
+        let buf = slot.as_mut().unwrap();
+        self.cuda_stream
+            .memcpy_htod(&[pos as i32], buf)
+            .expect("memcpy_htod decode_position");
+    }
+
+    fn kv_write_fn(&self) -> &CudaFunction {
+        let (_, func) = self.kv_write_kernel.get_or_init(|| {
+            // dst = base + position * (n_words*4) bytes; copy n_words u32 words.
+            // position is read from the device buffer at launch (kernel) time, so
+            // the launch is identical every step and is graph-capturable.
+            let src = r#"
+extern "C" __global__ void kv_slot_write(
+    unsigned long long src, unsigned long long base,
+    unsigned long long pos_ptr, int n_words
+) {
+    long long pos = (long long)(*((const int*)pos_ptr));
+    unsigned int* d = (unsigned int*)(base + (unsigned long long)pos * (unsigned long long)n_words * 4ULL);
+    const unsigned int* s = (const unsigned int*)src;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_words) d[i] = s[i];
+}
+"#;
+            let ptx = crate::compile_module_image_for_current_device(self.cuda_stream.context(), src)
+                .expect("compile kv_slot_write");
+            let module = self
+                .cuda_stream
+                .context()
+                .load_module(ptx)
+                .expect("load kv_slot_write module");
+            let func = module
+                .load_function("kv_slot_write")
+                .expect("load kv_slot_write fn");
+            (module, func)
+        });
+        func
+    }
+
+    /// Device-side KV append: copy this output tensor into `base_ptr` at slot
+    /// `position` (read from the device buffer set by [`set_decode_position`]),
+    /// i.e. `base_ptr + position * n_bytes`. Replaces the host-issued DtoD whose
+    /// destination was baked in per step, so the append can live inside a
+    /// replayable full-step CUDA graph.
+    ///
+    /// # Safety
+    /// `base_ptr` must be a valid device allocation; `set_decode_position` must
+    /// have been called.
+    pub unsafe fn copy_output_to_device_ptr_kv(&self, id: impl ToId, base_ptr: u64, n_bytes: usize) {
+        debug_assert!(base_ptr != 0, "copy_output_to_device_ptr_kv null base");
+        let src = self.resolve_output_buffer(id);
+        let copy_bytes = n_bytes.min(src.len());
+        debug_assert!(copy_bytes % 4 == 0, "KV slot bytes must be 4-aligned");
+        let n_words = (copy_bytes / 4) as i32;
+        if n_words == 0 {
+            return;
+        }
+        let src_ptr = src.ptr();
+        let pos_ptr = {
+            let slot = self.decode_position.borrow();
+            let buf = slot.as_ref().expect("set_decode_position before KV write");
+            buf.device_ptr(&self.cuda_stream).0
+        };
+        let func = self.kv_write_fn().clone();
+        let cfg = LaunchConfig {
+            grid_dim: ((n_words as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.cuda_stream
+                .launch_builder(&func)
+                .arg(&src_ptr)
+                .arg(&base_ptr)
+                .arg(&pos_ptr)
+                .arg(&n_words)
+                .launch(cfg)
+                .expect("launch kv_slot_write");
+        }
+    }
+
+    fn shm_allreduce_fn(&self) -> &CudaFunction {
+        let (_, func) = self.shm_allreduce_kernel.get_or_init(|| {
+            // 2-rank one-shot all-reduce over mapped shared host memory. flags[]
+            // are self-incremented generations (persist across graph replays), so
+            // no host seq is baked in -> valid as a static node in a replayed
+            // full-step graph. bf16 summed in fp32 (round-to-nearest-even).
+            let src = r#"
+extern "C" __global__ void shm_allreduce2(
+    unsigned long long my_data, unsigned long long shm,
+    int my_rank, int elems, int slot_bytes
+) {
+    volatile unsigned long long* flags = (volatile unsigned long long*)shm;
+    char* base = (char*)shm + 64;
+    int peer = 1 - my_rank;
+    unsigned short* my_slot   = (unsigned short*)(base + (long long)my_rank * slot_bytes);
+    unsigned short* peer_slot = (unsigned short*)(base + (long long)peer    * slot_bytes);
+    unsigned short* d = (unsigned short*)my_data;
+    int tid = threadIdx.x, n = blockDim.x;
+    for (int i = tid; i < elems; i += n) my_slot[i] = d[i];
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        unsigned long long g = flags[my_rank] + 1ULL;
+        flags[my_rank] = g;
+        __threadfence_system();
+        while (flags[peer] < g) { }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int i = tid; i < elems; i += n) {
+        unsigned int ua = ((unsigned int)d[i]) << 16;
+        unsigned int ub = ((unsigned int)peer_slot[i]) << 16;
+        float s = __uint_as_float(ua) + __uint_as_float(ub);
+        unsigned int us = __float_as_uint(s);
+        unsigned int r = us + 0x7FFFu + ((us >> 16) & 1u);
+        d[i] = (unsigned short)(r >> 16);
+    }
+}
+"#;
+            let ptx = crate::compile_module_image_for_current_device(self.cuda_stream.context(), src)
+                .expect("compile shm_allreduce2");
+            let module = self
+                .cuda_stream
+                .context()
+                .load_module(ptx)
+                .expect("load shm_allreduce2 module");
+            let func = module
+                .load_function("shm_allreduce2")
+                .expect("load shm_allreduce2 fn");
+            (module, func)
+        });
+        func
+    }
+
+    /// In-place 2-rank sum all-reduce of `elems` bf16 at device pointer `data_ptr`,
+    /// launched on THIS runtime's stream (so under SKEIN_CAPTURE it lands on the
+    /// shared capture stream). `shm_ptr` is the cross-process mapped shared-memory
+    /// device pointer (set up by skein_runtime); `slot_bytes` is its per-rank slot
+    /// size. Both ranks must call with identical `elems`.
+    ///
+    /// # Safety
+    /// `data_ptr` is a valid device buffer of `elems` bf16; `shm_ptr` is the
+    /// registered shared region.
+    pub unsafe fn device_shm_all_reduce(
+        &self,
+        data_ptr: u64,
+        shm_ptr: u64,
+        rank: i32,
+        elems: usize,
+        slot_bytes: i32,
+    ) {
+        let func = self.shm_allreduce_fn().clone();
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let elems_i = elems as i32;
+        unsafe {
+            self.cuda_stream
+                .launch_builder(&func)
+                .arg(&data_ptr)
+                .arg(&shm_ptr)
+                .arg(&rank)
+                .arg(&elems_i)
+                .arg(&slot_bytes)
+                .launch(cfg)
+                .expect("launch shm_allreduce2");
+        }
+    }
+
+    // ---- Full-step CUDA graph capture/replay on the shared stream (SKEIN_CAPTURE).
+    // Any segment runtime can drive these: they all share the one capture stream,
+    // so a capture begun here records every kernel any runtime launches on it.
+
+    /// Begin recording the shared stream into a CUDA graph.
+    pub fn begin_stream_capture(&self) -> Result<(), cudarc::driver::DriverError> {
+        let s = self.cuda_stream.cu_stream();
+        unsafe {
+            cudarc::driver::sys::cuStreamBeginCapture_v2(
+                s,
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .result()
+        }
+    }
+
+    /// End recording, instantiate the executable graph, and store it for replay.
+    pub fn end_stream_capture(&self) -> Result<(), cudarc::driver::DriverError> {
+        let s = self.cuda_stream.cu_stream();
+        let mut graph = std::mem::MaybeUninit::uninit();
+        let mut exec = std::mem::MaybeUninit::uninit();
+        unsafe {
+            cudarc::driver::sys::cuStreamEndCapture(s, graph.as_mut_ptr()).result()?;
+            let graph = graph.assume_init();
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), graph, 0).result()?;
+            cudarc::driver::sys::cuGraphDestroy(graph);
+            *self.captured_graph_exec.borrow_mut() = Some(exec.assume_init());
+        }
+        Ok(())
+    }
+
+    /// Replay the captured full-step graph on the shared stream. Returns false if
+    /// nothing is captured yet.
+    pub fn replay_captured(&self) -> bool {
+        let exec = *self.captured_graph_exec.borrow();
+        match exec {
+            Some(exec) => {
+                let s = self.cuda_stream.cu_stream();
+                unsafe {
+                    cudarc::driver::sys::cuGraphLaunch(exec, s)
+                        .result()
+                        .expect("cuGraphLaunch (captured full-step)");
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn has_captured_graph(&self) -> bool {
+        self.captured_graph_exec.borrow().is_some()
     }
 
     /// Resolve pending output pointer registrations into external_output_buffers.
@@ -1320,6 +1632,10 @@ impl Runtime for CudaRuntime {
             output_ptr_registrations: FxHashMap::default(),
             external_output_buffers: FxHashMap::default(),
             external_buffers: FxHashMap::default(),
+            decode_position: std::cell::RefCell::new(None),
+            kv_write_kernel: std::sync::OnceLock::new(),
+            shm_allreduce_kernel: std::sync::OnceLock::new(),
+            captured_graph_exec: std::cell::RefCell::new(None),
         }
     }
 
@@ -1573,15 +1889,25 @@ impl Runtime for CudaRuntime {
         // Resolve external output pointer registrations (zero-copy output path)
         self.apply_output_ptr_registrations();
 
+        // Cache the toposort order once (exec_graph is fixed after build) so the
+        // per-token hot path doesn't re-run `toposort` (which allocates) for
+        // every segment, every step.
+        if self.compiled_buckets[self.active_bucket].exec_order.is_empty() {
+            let order = toposort(&self.compiled_buckets[self.active_bucket].exec_graph, None)
+                .expect("exec_graph has a cycle");
+            self.compiled_buckets[self.active_bucket].exec_order = order;
+        }
+
         let total_start = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
 
-        for exec_node in toposort(&bucket.exec_graph, None).unwrap() {
+        // Reused across nodes to avoid a per-node hashmap allocation on the hot path.
+        let mut buffer_map: FxHashMap<NodeIndex, DeviceBuffer> = FxHashMap::default();
+        for &exec_node in &bucket.exec_order {
             let exec_op = &bucket.exec_graph[exec_node];
             trace!("Executing: {:?}", exec_op);
 
-            // Build buffer map for the HostOp interface
-            let mut buffer_map: FxHashMap<NodeIndex, DeviceBuffer> = FxHashMap::default();
+            buffer_map.clear();
 
             if let Some(buf) = Self::resolve_runtime_buffer(
                 bucket,

@@ -61,6 +61,11 @@ pub fn cuda_lite_factory(
     args: BackendCompileArgs,
 ) -> Result<Box<dyn DynBackend>, String> {
     let cuda_ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e}"))?;
+    // See runtime.rs new_on: single-stream execution, so disable cudarc's
+    // per-buffer event tracking (large host overhead) when requested.
+    if std::env::var_os("SKEIN_NO_EVENT_TRACKING").is_some() {
+        unsafe { cuda_ctx.disable_event_tracking() };
+    }
     let stream = cuda_ctx.default_stream();
     compile_backend::<CudaRuntime>(
         graph,

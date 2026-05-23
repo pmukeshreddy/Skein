@@ -5,3 +5,5 @@
 pub mod nccl;
 #[cfg(feature = "cuda")]
 pub mod rdma;
+#[cfg(feature = "cuda")]
+pub mod shm_allreduce;

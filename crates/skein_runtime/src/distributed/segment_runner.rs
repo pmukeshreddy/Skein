@@ -488,6 +488,32 @@ impl SegmentRunner {
         self.i32_slots[id.idx()] = Some(tokens);
     }
 
+    /// Full-step CUDA graph (SKEIN_CAPTURE): drive capture/replay on the shared
+    /// stream via any segment runtime (they all share it). `begin`/`end` wrap the
+    /// pre-all-gather schedule walk; `replay` relaunches it; `has_captured` gates.
+    pub fn begin_capture(&self) {
+        if let Some(seg) = self.segments.first() {
+            seg.runtime.begin_stream_capture();
+        }
+    }
+    pub fn end_capture(&self) {
+        if let Some(seg) = self.segments.first() {
+            seg.runtime.end_stream_capture();
+        }
+    }
+    pub fn replay_captured(&self) -> bool {
+        self.segments
+            .first()
+            .map(|seg| seg.runtime.replay_captured())
+            .unwrap_or(false)
+    }
+    pub fn has_captured(&self) -> bool {
+        self.segments
+            .first()
+            .map(|seg| seg.runtime.has_captured_graph())
+            .unwrap_or(false)
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
@@ -518,11 +544,13 @@ impl SegmentRunner {
                     collective,
                     participants,
                     tensor,
+                    shape,
                     ..
                 } => ResolvedSequenceStep::Collective {
                     collective: *collective,
                     participants: participants.clone(),
                     tensor: self.intern_name(tensor),
+                    elems: shape.iter().product::<usize>().max(1),
                 },
                 SequenceStep::MoeRoute {
                     device_idx,
@@ -711,6 +739,12 @@ impl LocalSegments for SegmentRunner {
         }
         let err = Self::segment_err(segment_idx);
 
+        // SKEIN_DEVICE_KV (full-step graph piece 2): append the new token's K/V via
+        // a device kernel that reads `position` from a device buffer, instead of a
+        // host-issued DtoD with a baked-in destination offset.
+        static DEVICE_KV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let device_kv = *DEVICE_KV.get_or_init(|| std::env::var_os("SKEIN_DEVICE_KV").is_some());
+
         // --- profiling (compile-time gated by `perf-trace`): host-input staging
         // vs GPU launch vs host-output capture (the dtoh in capture forces a
         // sync, so host_out_us absorbs the actual GPU compute wait). With the
@@ -816,12 +850,25 @@ impl LocalSegments for SegmentRunner {
                                 .runtime
                                 .output_device_ptr_by_id(id)
                             {
-                                let dest = base + (self.position * out_bytes) as u64;
-                                unsafe {
-                                    self.segments[segment_idx]
-                                        .runtime
-                                        .copy_output_to_device_by_id(id, dest, out_bytes)
-                                };
+                                if device_kv {
+                                    // Device-side append: kernel computes
+                                    // `base + position*out_bytes` from the device
+                                    // position buffer (graph-capturable, no host
+                                    // dest baked in). See piece 2 of the full-step
+                                    // graph (SKEIN_DEVICE_KV).
+                                    let rt = &self.segments[segment_idx].runtime;
+                                    rt.set_decode_position(self.position);
+                                    unsafe {
+                                        rt.copy_output_to_kv_slot_by_id(id, base, out_bytes)
+                                    };
+                                } else {
+                                    let dest = base + (self.position * out_bytes) as u64;
+                                    unsafe {
+                                        self.segments[segment_idx]
+                                            .runtime
+                                            .copy_output_to_device_by_id(id, dest, out_bytes)
+                                    };
+                                }
                                 self.device_slots[slot] = None;
                                 continue;
                             }
@@ -926,6 +973,22 @@ impl LocalSegments for SegmentRunner {
             .copied()
             .flatten()
             .map(|h| (h.ptr, h.elems))
+    }
+
+    fn device_shm_all_reduce(
+        &mut self,
+        data_ptr: u64,
+        shm_ptr: u64,
+        rank: i32,
+        elems: usize,
+        slot_bytes: i32,
+    ) -> Result<(), RankExecError> {
+        // Any segment runtime works: all share the device's primary context +
+        // (under SKEIN_CAPTURE) the one capture stream. Launch the all-reduce
+        // there so it lands on that stream, capturable into the full-step graph.
+        let rt = &self.segments[0].runtime;
+        unsafe { rt.device_shm_all_reduce(data_ptr, shm_ptr, rank, elems, slot_bytes) };
+        Ok(())
     }
 
     fn route_moe_resolved(
