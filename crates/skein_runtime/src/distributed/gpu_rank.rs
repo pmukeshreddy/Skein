@@ -130,7 +130,7 @@ impl RankServer {
         // / final; their read/write host path is kept). RingAllReduce tensors and
         // every internal activation handoff stay device-resident — RingAllReduce
         // is all-reduced in place on the device by the rank executor.
-        let host_tensors: HashSet<String> = schedule
+        let mut host_tensors: HashSet<String> = schedule
             .iter()
             .filter_map(|s| match s {
                 SequenceStep::Collective {
@@ -139,6 +139,12 @@ impl RankServer {
                 _ => None,
             })
             .collect();
+        // `forward_step` reads the final logits host-side via `read(LOGITS)`, which
+        // only sees `f32_slots`. Under TP the logits all-gather already host-stages
+        // them; under PP with tp=1 there is no all-gather (logits are the last
+        // stage's plain segment output → device_slots), so mark LOGITS host here to
+        // materialize it to f32_slots. Idempotent if the all-gather already added it.
+        host_tensors.insert(LOGITS.to_string());
         executor.runner_mut().set_host_tensors(host_tensors.clone());
 
         // Sparse MoE: the FFN segments declare every expert (so they load

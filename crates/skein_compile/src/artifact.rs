@@ -160,41 +160,106 @@ impl DeviceArtifactLoaded {
 }
 
 /// Merge the per-device sequencings into one global schedule the rank executor
-/// walks: at each step **every** device runs its own segment, then the shared
-/// collective fires **once**. The per-device sequencings are structurally
-/// aligned for tp/ep (the same collective sequence, differing only in each
-/// `ExecuteSegment`'s `device_idx`), so we walk by position. Concatenating them
-/// instead (`flat_map`) made each collective appear before the later-listed
-/// devices had run their producing segment — so a rank reached, e.g., the
-/// `embed_out` all-reduce and read a handoff it had not yet produced. NOTE:
-/// pipeline parallelism (pp > 1) has device-specific collectives and would need
-/// a topological merge; the planner targeted here is tp/ep only.
+/// walks: each device runs only its own `ExecuteSegment`/`MoeRoute` steps, and
+/// every `Collective` fires **once** across its participants. This is a
+/// topological *rendezvous* merge:
+///
+/// - `ExecuteSegment` / `MoeRoute` are device-private — emitted in device order
+///   as soon as a device reaches them (concatenating naively instead made a
+///   collective appear before a later-listed device had run its producing
+///   segment).
+/// - A `Collective` is a synchronization point — emitted once, only when **all**
+///   its participants have reached the identical step (same kind, participants,
+///   tensor). On emit, every device currently parked at that identical step
+///   advances past it: its participants, plus any non-participant device that
+///   lists the same step as a no-op (e.g. a non-leader TP rank sitting on a PP
+///   stage-boundary `SendRecv`).
+///
+/// For tp/ep-only plans (`pp == 1`) every device's sequencing is structurally
+/// identical, so this yields the same per-block grouping as a position walk. For
+/// `pp > 1` the per-stage sequencings differ (stage 0 ends with the boundary
+/// `SendRecv`, stage 1 begins with it), and the rendezvous orders them
+/// stage-by-stage: `[stage0 segs…, SendRecv, stage1 segs…, …]` — so the global
+/// schedule actually contains every stage's segments and exactly one SendRecv
+/// per boundary.
 fn interleave_sequencing(per_device: &[&[SequenceStep]]) -> Vec<SequenceStep> {
-    let Some(first) = per_device.first() else {
+    let n = per_device.len();
+    if n == 0 {
         return Vec::new();
-    };
-    let mut merged = Vec::with_capacity(first.len() * per_device.len());
-    for (i, step) in first.iter().enumerate() {
-        match step {
-            SequenceStep::ExecuteSegment { .. } => {
-                for dev in per_device {
-                    if let Some(s) = dev.get(i) {
-                        merged.push(s.clone());
-                    }
-                }
-            }
-            SequenceStep::Collective { .. } => merged.push(step.clone()),
-            // Per-device (like ExecuteSegment): each rank binds its own FFN
-            // segment's slots, so emit every device's MoeRoute at this position.
-            SequenceStep::MoeRoute { .. } => {
-                for dev in per_device {
-                    if let Some(s) = dev.get(i) {
-                        merged.push(s.clone());
-                    }
-                }
-            }
+    }
+    let lens: Vec<usize> = per_device.iter().map(|s| s.len()).collect();
+    let mut cursors = vec![0usize; n];
+    let mut merged = Vec::with_capacity(lens.iter().sum());
+
+    // A collective's rendezvous identity: (kind, participants, tensor). Two
+    // devices reference the same collective iff these match.
+    fn coll_key(
+        s: &SequenceStep,
+    ) -> Option<(&skein_cost::collectives::CollectiveKind, &[u32], &str)> {
+        match s {
+            SequenceStep::Collective {
+                collective,
+                participants,
+                tensor,
+                ..
+            } => Some((collective, participants.as_slice(), tensor.as_str())),
+            _ => None,
         }
     }
+    let is_private = |s: &SequenceStep| !matches!(s, SequenceStep::Collective { .. });
+
+    loop {
+        let mut progressed = false;
+
+        // 1. Emit every device's leading private steps (segments / MoE routes).
+        for d in 0..n {
+            while cursors[d] < lens[d] && is_private(&per_device[d][cursors[d]]) {
+                merged.push(per_device[d][cursors[d]].clone());
+                cursors[d] += 1;
+                progressed = true;
+            }
+        }
+
+        // 2. Emit one collective whose participants are all aligned on it.
+        for d in 0..n {
+            if cursors[d] >= lens[d] {
+                continue;
+            }
+            let Some((kind, parts, tensor)) = coll_key(&per_device[d][cursors[d]]) else {
+                continue;
+            };
+            let ready = parts.iter().all(|&p| {
+                let p = p as usize;
+                p < n
+                    && cursors[p] < lens[p]
+                    && coll_key(&per_device[p][cursors[p]]) == Some((kind, parts, tensor))
+            });
+            if ready {
+                merged.push(per_device[d][cursors[d]].clone());
+                // Advance every device parked at this identical step (the
+                // participants, plus any non-participant no-op'ing through it).
+                for q in 0..n {
+                    if cursors[q] < lens[q]
+                        && coll_key(&per_device[q][cursors[q]]) == Some((kind, parts, tensor))
+                    {
+                        cursors[q] += 1;
+                    }
+                }
+                progressed = true;
+                break;
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+    }
+
+    debug_assert!(
+        cursors == lens,
+        "interleave_sequencing left steps unmerged (collective rendezvous never \
+         aligned — malformed schedule): cursors={cursors:?} lens={lens:?}"
+    );
     merged
 }
 
