@@ -179,6 +179,22 @@ fn build_artifact<R: ComputeRuntime>(
         let mut artifact =
             skein_emit::lower_per_device(plan, cluster, ir, device_idx, weights_dir)?;
         for segment in &mut artifact.graph.segments {
+            // Bind luminal's sequence dim `s` to this segment's token count,
+            // exactly as the serve-time `compile_segment` does. The fused GLUMoE
+            // MoE op (on-device sparse path) shapes its output `[s, hidden]` with
+            // a symbolic `s`; without binding it the search cannot size the buffer
+            // and "fails to find a viable initial genome". Token count is the
+            // product of the leading dims of any 3D activation handoff.
+            if let Some(tokens) = segment
+                .output_handoff
+                .iter()
+                .chain(segment.input_handoff.iter())
+                .filter(|h| h.shape.len() == 3)
+                .map(|h| h.shape[..h.shape.len() - 1].iter().product::<usize>())
+                .find(|t| *t > 0)
+            {
+                segment.graph.set_dim('s', tokens);
+            }
             let input_zeros = skein_compile::segment_input_zero_bytes(segment);
             let _ = R::build_and_search_cached(
                 &mut segment.graph,
