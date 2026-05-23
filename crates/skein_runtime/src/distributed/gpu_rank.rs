@@ -155,13 +155,16 @@ impl RankServer {
         host_tensors.insert(LOGITS.to_string());
         executor.runner_mut().set_host_tensors(host_tensors.clone());
 
-        // Sparse MoE: the FFN segments declare every expert (so they load
-        // GPU-resident) but compute only the bound slots, so lazy-on-execute
-        // would never upload the experts. Free the per-segment search arenas
-        // FIRST (otherwise they coexist with the ~46 GB/card of weights and OOM),
-        // then materialize so the MoeRoute step can resolve each selected
-        // expert's resident device pointer.
-        if std::env::var_os("SKEIN_SPARSE_MOE").is_some() {
+        // Sparse / on-device MoE: the FFN segments declare every expert (so they
+        // load GPU-resident — sparse binds the top-k slots; on-device GLUMoE
+        // `gather`s them by device index), so lazy-on-execute would never upload
+        // the experts. Free the per-segment search arenas FIRST (otherwise they
+        // coexist with the ~46 GB/card of weights and OOM — the on-device path
+        // hit signal-9 OOM at serve without this), then materialize so the
+        // route/gather resolves each expert's resident device pointer.
+        if std::env::var_os("SKEIN_SPARSE_MOE").is_some()
+            || std::env::var_os("SKEIN_ONDEVICE_MOE").is_some()
+        {
             executor.runner_mut().clear_intermediates();
             executor.runner_mut().materialize_weights();
         }
