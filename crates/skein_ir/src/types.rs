@@ -23,6 +23,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dtype {
+    /// 32-bit float. Not a planner-selectable weight dtype (absent from
+    /// [`Dtype::ALL`]); used for scalar side tensors like the fp8 GEMM's
+    /// per-tensor `weight_scale` / `input_scale` runtime inputs.
+    F32,
     Bf16,
     Fp16,
     Fp8E4m3,
@@ -37,6 +41,7 @@ impl Dtype {
     /// byte — so this returns 4, not 8.
     pub const fn bits(self) -> u32 {
         match self {
+            Dtype::F32 => 32,
             Dtype::Bf16 | Dtype::Fp16 => 16,
             Dtype::Fp8E4m3 | Dtype::Fp8E5m2 | Dtype::Int8 => 8,
             Dtype::Int4 => 4,
@@ -55,7 +60,7 @@ impl Dtype {
     pub const fn is_float(self) -> bool {
         matches!(
             self,
-            Dtype::Bf16 | Dtype::Fp16 | Dtype::Fp8E4m3 | Dtype::Fp8E5m2
+            Dtype::F32 | Dtype::Bf16 | Dtype::Fp16 | Dtype::Fp8E4m3 | Dtype::Fp8E5m2
         )
     }
 

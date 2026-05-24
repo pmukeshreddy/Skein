@@ -28,7 +28,9 @@ pub struct DtypeTable {
 impl DtypeTable {
     pub fn get(self, d: Dtype) -> f64 {
         match d {
-            Dtype::Bf16 => self.bf16,
+            // F32 is not a planner-selectable weight dtype (scale side tensors
+            // only), so it is never costed; fall back to the bf16 entry.
+            Dtype::F32 | Dtype::Bf16 => self.bf16,
             Dtype::Fp16 => self.fp16,
             Dtype::Fp8E4m3 => self.fp8_e4m3,
             Dtype::Fp8E5m2 => self.fp8_e5m2,

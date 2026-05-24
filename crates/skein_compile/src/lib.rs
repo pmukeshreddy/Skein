@@ -60,7 +60,7 @@ pub trait ComputeRuntime: Sized {
     fn build_and_search_with_input_zeros(
         cx: &mut Graph,
         budget: usize,
-        input_zeros: &[(NodeIndex, usize)],
+        input_zeros: &[(NodeIndex, usize, f32)],
     ) -> Result<Self, CompileError> {
         let _ = input_zeros;
         Self::build_and_search(cx, budget)
@@ -75,7 +75,7 @@ pub trait ComputeRuntime: Sized {
     fn build_and_search_cached(
         cx: &mut Graph,
         budget: usize,
-        input_zeros: &[(NodeIndex, usize)],
+        input_zeros: &[(NodeIndex, usize, f32)],
         cache_dir: Option<&Path>,
     ) -> Result<Self, CompileError> {
         let _ = cache_dir;
@@ -103,6 +103,14 @@ pub trait ComputeRuntime: Sized {
     /// input buffers); the CUDA backend overrides it to keep the buffer alive.
     fn set_data_persistent_f32_as(&mut self, id: NodeIndex, data: Vec<f32>, dtype: DType) {
         self.set_data_f32_as(id, data, dtype);
+    }
+
+    /// Upload raw low-precision weight `bytes` (e.g. fp8 E4M3) directly into the
+    /// device buffer for input `id`, marking it persistent — no f32 widening or
+    /// re-encoding. CUDA only; the default is a no-op (the CPU backend works in
+    /// f32 and never sees fp8 weights). Used for AutoFP8 attention weights.
+    fn set_data_persistent_bytes(&mut self, id: NodeIndex, bytes: Vec<u8>) {
+        let _ = (id, bytes);
     }
 
     /// Device pointer of an already-resident input buffer (e.g. a loaded weight),
@@ -329,7 +337,7 @@ impl ComputeRuntime for NativeComputeRuntime {
     fn build_and_search_cached(
         cx: &mut Graph,
         budget: usize,
-        _input_zeros: &[(NodeIndex, usize)],
+        _input_zeros: &[(NodeIndex, usize, f32)],
         cache_dir: Option<&Path>,
     ) -> Result<Self, CompileError> {
         let inner = crate::search_cache::cached_search::<NativeRuntime>(
@@ -425,7 +433,7 @@ mod cuda_impl {
         fn build_and_search_with_input_zeros(
             cx: &mut Graph,
             budget: usize,
-            input_zeros: &[(NodeIndex, usize)],
+            input_zeros: &[(NodeIndex, usize, f32)],
         ) -> Result<Self, CompileError> {
             Self::build_and_search_cached(cx, budget, input_zeros, None)
         }
@@ -433,7 +441,7 @@ mod cuda_impl {
         fn build_and_search_cached(
             cx: &mut Graph,
             budget: usize,
-            input_zeros: &[(NodeIndex, usize)],
+            input_zeros: &[(NodeIndex, usize, f32)],
             cache_dir: Option<&Path>,
         ) -> Result<Self, CompileError> {
             let inner = crate::search_cache::cached_search::<CudaRuntime>(
@@ -453,8 +461,15 @@ mod cuda_impl {
                 // after compile). Only the miss path profiles, so this runs
                 // only when a real search happens.
                 |runtime| {
-                    for (id, num_bytes) in input_zeros {
-                        runtime.set_zeros(*id, *num_bytes);
+                    for (id, num_bytes, fill) in input_zeros {
+                        if *fill != 0.0 {
+                            // Scale inputs: stage the scalar `fill` (1.0) so the
+                            // fp8 quantize divide doesn't NaN during profiling.
+                            let n = (*num_bytes / 4).max(1);
+                            runtime.set_data(*id, vec![*fill; n]);
+                        } else {
+                            runtime.set_zeros(*id, *num_bytes);
+                        }
                     }
                 },
             )?;
@@ -496,6 +511,14 @@ mod cuda_impl {
             // keeps the buffer across forwards instead of consuming it — weights
             // are uploaded once, not re-fed every step.
             self.set_data_f32_as(id, data, dtype);
+            self.inner.mark_hlir_persistent(id);
+        }
+
+        fn set_data_persistent_bytes(&mut self, id: NodeIndex, bytes: Vec<u8>) {
+            // Raw fp8 (E4M3) bytes straight to the device buffer (Vec<u8> uploads
+            // as raw bytes), then persist. The graph types this Input as F8E4M3,
+            // so cublasLt reads it as fp8 at half the bf16 HBM bandwidth.
+            self.inner.set_data(id, bytes);
             self.inner.mark_hlir_persistent(id);
         }
 

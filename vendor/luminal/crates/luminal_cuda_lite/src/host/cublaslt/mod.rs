@@ -33,7 +33,7 @@ use crate::{
                 cublasLtMatrixLayoutSetAttribute, cublasLtOrder_t, cudaDataType,
             },
         },
-        driver::{CudaStream, DevicePtr},
+        driver::{CudaFunction, CudaModule, CudaStream, DevicePtr, LaunchConfig, PushKernelArg},
     },
     host::{DeviceBuffer, HostOp, cublas::parse_cublas_op},
     try_create_cublaslt,
@@ -786,6 +786,105 @@ fn set_scalar_scale_pointer(
     Ok(())
 }
 
+/// Custom fp8 GEMV for small-M (single-token decode) projections. cuBLASLt's
+/// fp8 GEMM pads M up to 16, so at M=1 it does ~16x the necessary work; this
+/// warp-per-output-row kernel reads each fp8 weight row once at ~HBM peak,
+/// mirroring the on-device MoE fp8 kernels in `host/moe/mod.rs`. W8A8: fp8
+/// weight `[out,k]` (row-major) x fp8 activation `[rows,k]`, f32 accumulate,
+/// scaled by `weight_scale * input_scale`; output f32 col-major `[out,rows]`.
+const LINEAR_FP8_GEMV_SRC: &str = r#"
+#include <cuda_fp8.h>
+extern "C" __global__ void linear_fp8_gemv(
+    unsigned long long w_ptr, unsigned long long a_ptr,
+    unsigned long long wscale_ptr, unsigned long long iscale_ptr,
+    unsigned long long d_ptr, int out_dim, int rows, int k
+) {
+    int o = blockIdx.x;
+    int t = blockIdx.y;
+    if (o >= out_dim || t >= rows) return;
+    const unsigned char* W = (const unsigned char*)w_ptr + (long long)o * k;
+    const unsigned char* A = (const unsigned char*)a_ptr + (long long)t * k;
+    float acc = 0.f;
+    int n16 = k >> 4;
+    const uint4* wp4 = (const uint4*)W;
+    const uint4* ap4 = (const uint4*)A;
+    for (int j = threadIdx.x; j < n16; j += blockDim.x) {
+        uint4 ww = wp4[j], aa = ap4[j];
+        const __nv_fp8_e4m3* wh = (const __nv_fp8_e4m3*)&ww;
+        const __nv_fp8_e4m3* ah = (const __nv_fp8_e4m3*)&aa;
+        #pragma unroll
+        for (int e = 0; e < 16; e++) acc += (float)wh[e] * (float)ah[e];
+    }
+    for (int j = (n16 << 4) + (int)threadIdx.x; j < k; j += blockDim.x) {
+        __nv_fp8_e4m3 wq; wq.__x = W[j];
+        __nv_fp8_e4m3 aq; aq.__x = A[j];
+        acc += (float)wq * (float)aq;
+    }
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s);
+    __shared__ float sm[32];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    if (lane == 0) sm[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        acc = (lane < nwarp) ? sm[lane] : 0.f;
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s);
+        if (lane == 0) {
+            float ws = ((const float*)wscale_ptr)[0];
+            float is = ((const float*)iscale_ptr)[0];
+            ((float*)d_ptr)[(long long)t * out_dim + o] = acc * ws * is;
+        }
+    }
+}
+"#;
+
+#[allow(clippy::too_many_arguments)]
+fn launch_linear_fp8_gemv(
+    stream: &Arc<CudaStream>,
+    w_ptr: u64,
+    a_ptr: u64,
+    wscale_ptr: u64,
+    iscale_ptr: u64,
+    d_ptr: u64,
+    out_dim: usize,
+    rows: usize,
+    k: usize,
+) -> anyhow::Result<()> {
+    static CACHE: OnceLock<Mutex<Option<(Arc<CudaModule>, CudaFunction)>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap();
+    if guard.is_none() {
+        let ptx = crate::compile_module_image_for_current_device(
+            stream.context(),
+            LINEAR_FP8_GEMV_SRC,
+        )
+        .map_err(|e| anyhow::anyhow!("compile linear_fp8_gemv: {e}"))?;
+        let module = stream.context().load_module(ptx)?;
+        let func = module.load_function("linear_fp8_gemv")?;
+        *guard = Some((module, func));
+    }
+    let func = &guard.as_ref().unwrap().1;
+    let cfg = LaunchConfig {
+        grid_dim: (out_dim as u32, rows as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (od, rw, kk) = (out_dim as i32, rows as i32, k as i32);
+    unsafe {
+        stream
+            .launch_builder(func)
+            .arg(&w_ptr)
+            .arg(&a_ptr)
+            .arg(&wscale_ptr)
+            .arg(&iscale_ptr)
+            .arg(&d_ptr)
+            .arg(&od)
+            .arg(&rw)
+            .arg(&kk)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 fn run_cublaslt_matmul(
     stream: &Arc<CudaStream>,
     cublaslt: &Arc<CudaBlasLT>,
@@ -799,6 +898,34 @@ fn run_cublaslt_matmul(
             spec.problem.n,
             spec.problem.k
         ));
+    }
+
+    // Custom fp8 GEMV for the small-M (single-token decode) attention projections.
+    // The egg lowering stores m=out_dim, n=rows(tokens), k; the output D is
+    // col-major [out_dim, rows]. cuBLASLt's fp8 GEMM pads rows->16, so at decode
+    // (rows=1) it wastes ~15/16 of the work; route those to the warp-per-row
+    // kernel instead (weight read once at ~HBM peak). cuBLASLt still handles the
+    // large-M prefill GEMMs. Tensor-wide fp8 scales required (per-tensor path).
+    if cuda_dtype_needs_tensorwide_scale(spec.a.dtype)
+        && cuda_dtype_needs_tensorwide_scale(spec.b.dtype)
+        && spec.d.dtype == cudaDataType::CUDA_R_32F
+        && spec.problem.batch_count <= 1
+        && spec.problem.n <= 8
+    {
+        if let (Some(wscale), Some(iscale)) = (ptrs.a_scale, ptrs.b_scale) {
+            launch_linear_fp8_gemv(
+                stream,
+                ptrs.a,
+                ptrs.b,
+                wscale,
+                iscale,
+                ptrs.d,
+                spec.problem.m as usize,
+                spec.problem.n as usize,
+                spec.problem.k as usize,
+            )?;
+            return Ok(());
+        }
     }
 
     let mut resources = LtRawDescriptors::default();

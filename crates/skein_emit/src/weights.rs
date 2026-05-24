@@ -177,6 +177,10 @@ pub fn build_weight_shard(
 
     let mut slices: Vec<WeightSlice> = Vec::new();
     let mut total_bytes: u64 = 0;
+    // SKEIN_ATTN_FP8: the q/k/v/o attention weights come from an AutoFP8
+    // checkpoint as E4M3 + per-tensor `weight_scale`/`input_scale` (bf16 [1])
+    // siblings. Slice the weight as fp8 and copy the two scalar scales through.
+    let attn_fp8 = std::env::var_os("SKEIN_ATTN_FP8").is_some();
 
     for layer in &ir.layers {
         for param in &layer.params {
@@ -200,16 +204,41 @@ pub fn build_weight_shard(
                 .collect();
             let strategy = strategy_for_role(&role, &source_shape);
             let dest_shape = shard_param_dims(param, &role)?;
+            let is_attn_proj = attn_fp8
+                && param.name.contains(".self_attn.")
+                && param.name.ends_with("_proj.weight");
+            let source_dtype = if is_attn_proj {
+                Dtype::Fp8E4m3
+            } else {
+                param.dtype
+            };
             let dest_bytes: u64 = dest_shape.iter().map(|d| *d as u64).product::<u64>()
-                * (param.dtype.bits() as u64).div_ceil(8);
+                * (source_dtype.bits() as u64).div_ceil(8);
             total_bytes = total_bytes.saturating_add(dest_bytes);
             slices.push(WeightSlice {
                 source_key: param.name.clone(),
-                source_shape,
-                source_dtype: param.dtype,
-                dest_shape,
+                source_shape: source_shape.clone(),
+                source_dtype,
+                dest_shape: dest_shape.clone(),
                 strategy,
             });
+            if is_attn_proj {
+                // Per-tensor scalar scales, replicated to every shard (the
+                // per-tensor scale is identical regardless of TP row split).
+                // AutoFP8 names scales `...q_proj.weight_scale` (the `.weight`
+                // suffix is replaced, not appended), so strip it off the base.
+                let base = param.name.strip_suffix(".weight").unwrap_or(&param.name);
+                for suffix in [".weight_scale", ".input_scale"] {
+                    slices.push(WeightSlice {
+                        source_key: format!("{base}{suffix}"),
+                        source_shape: vec![1],
+                        source_dtype: Dtype::Bf16,
+                        dest_shape: vec![1],
+                        strategy: ShardStrategy::Whole,
+                    });
+                    total_bytes = total_bytes.saturating_add(2);
+                }
+            }
         }
     }
 
@@ -271,6 +300,7 @@ fn resolve_source_files(
 
 fn safetensors_dtype(dtype: Dtype) -> safetensors::Dtype {
     match dtype {
+        Dtype::F32 => safetensors::Dtype::F32,
         Dtype::Bf16 => safetensors::Dtype::BF16,
         Dtype::Fp16 => safetensors::Dtype::F16,
         // FP8 / Int4 variants don't have stable safetensors codes in 0.4.x;

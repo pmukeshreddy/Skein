@@ -137,6 +137,7 @@ pub fn shard_param_dims(param: &Param, role: &ShardRole) -> Result<Vec<usize>, E
 /// to exactly one Luminal dtype.
 pub fn to_luminal_dtype(d: Dtype) -> DType {
     match d {
+        Dtype::F32 => DType::F32,
         Dtype::Bf16 => DType::Bf16,
         Dtype::Fp16 => DType::F16,
         Dtype::Fp8E4m3 => DType::F8E4M3,

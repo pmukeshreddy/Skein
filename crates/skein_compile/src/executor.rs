@@ -25,11 +25,17 @@ use crate::{
 /// these zeros are placeholders (real data is loaded after compile). The
 /// `input_tokens` handoff is an i32 index tensor (4 bytes/elem) regardless of
 /// its marker dtype.
-pub fn segment_input_zero_bytes(segment: &Segment) -> Vec<(NodeIndex, usize)> {
+/// Per-input search-staging spec: `(node, byte_len, fill)`. `fill` is the scalar
+/// value to stage (0.0 for the usual zero buffers). The fp8 attention
+/// `*.weight_scale` / `*.input_scale` inputs stage as **1.0** so the search's
+/// `(activation / input_scale)` quantize step doesn't divide by zero and produce
+/// NaN outputs (which would make every candidate genome non-viable).
+pub fn segment_input_zero_bytes(segment: &Segment) -> Vec<(NodeIndex, usize, f32)> {
     let mut out = Vec::with_capacity(segment.declared.len() + segment.input_handoff.len());
-    for d in segment.declared.values() {
+    for (name, d) in segment.declared.iter() {
         let n: usize = d.shape.iter().product();
-        out.push((d.id, d.dtype.bytes_for(n as u64) as usize));
+        let fill = if name.ends_with("_scale") { 1.0 } else { 0.0 };
+        out.push((d.id, d.dtype.bytes_for(n as u64) as usize, fill));
     }
     for h in &segment.input_handoff {
         let n: usize = h.shape.iter().product();
@@ -44,7 +50,7 @@ pub fn segment_input_zero_bytes(segment: &Segment) -> Vec<(NodeIndex, usize)> {
         } else {
             h.dtype.bytes_for(n as u64) as usize
         };
-        out.push((h.luminal_id, bytes));
+        out.push((h.luminal_id, bytes, 0.0));
     }
     out
 }
@@ -759,6 +765,7 @@ fn weight_dtype(tensor: &str, dtype: SafeDtype) -> Result<WeightDtype, CompileEr
         SafeDtype::F32 => Ok(WeightDtype::F32),
         SafeDtype::BF16 => Ok(WeightDtype::Bf16),
         SafeDtype::F16 => Ok(WeightDtype::F16),
+        SafeDtype::F8_E4M3 => Ok(WeightDtype::F8E4M3),
         dtype => Err(CompileError::UnsupportedWeightDtype {
             tensor: tensor.to_string(),
             dtype,

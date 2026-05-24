@@ -237,6 +237,10 @@ struct DeviceWiring<'a> {
     // dump them op-by-op for HF bisection. Off by default: production graphs
     // (the KL gate) are byte-identical to the untapped lowering.
     debug_taps: bool,
+    /// `SKEIN_ATTN_FP8`: lower q/k/v/o attention projections as cublasLt fp8
+    /// GEMMs, with per-tensor `weight_scale`/`input_scale` loaded as runtime
+    /// inputs (from an AutoFP8 checkpoint). Everything downstream stays bf16/f32.
+    attn_fp8: bool,
 }
 
 impl<'a> DeviceWiring<'a> {
@@ -284,6 +288,7 @@ impl<'a> DeviceWiring<'a> {
             hidden,
             activation_dtype,
             debug_taps: std::env::var_os("SKEIN_DEBUG_TAPS").is_some(),
+            attn_fp8: std::env::var_os("SKEIN_ATTN_FP8").is_some(),
         })
     }
 
@@ -986,9 +991,20 @@ impl<'a> DeviceWiring<'a> {
         // f32 cache. Only the final attention output is cast back to the
         // activation dtype for `o_proj`. This replaces the old stateless `seq=1`,
         // position-0 lowering.
-        let q = normed.matmul(q_w.permute((1, 0))).cast(DType::F32);
-        let k_new = normed.matmul(k_w.permute((1, 0))).cast(DType::F32);
-        let v_new = normed.matmul(v_w.permute((1, 0))).cast(DType::F32);
+        let (q, k_new, v_new) = if self.attn_fp8 {
+            // fp8 q/k/v projections (cublasLt fp8 GEMM). Output is f32; KV cache,
+            // RoPE, scores and softmax below are unchanged (bf16/f32).
+            let qf = self.fp8_proj(normed, &format!("model.layers.{block}.self_attn.q_proj.weight"))?;
+            let kf = self.fp8_proj(normed, &format!("model.layers.{block}.self_attn.k_proj.weight"))?;
+            let vf = self.fp8_proj(normed, &format!("model.layers.{block}.self_attn.v_proj.weight"))?;
+            (qf, kf, vf)
+        } else {
+            (
+                normed.matmul(q_w.permute((1, 0))).cast(DType::F32),
+                normed.matmul(k_w.permute((1, 0))).cast(DType::F32),
+                normed.matmul(v_w.permute((1, 0))).cast(DType::F32),
+            )
+        };
         if block == 0 {
             self.debug_tap("dbg_l0_q_proj", q);
             self.debug_tap("dbg_l0_k_proj", k_new);
@@ -1070,7 +1086,65 @@ impl<'a> DeviceWiring<'a> {
         });
 
         let attn = attn.cast(lum_act);
-        Ok(attn.matmul(o_w.permute((1, 0))))
+        if self.attn_fp8 {
+            let o = self.fp8_proj(attn, &format!("model.layers.{block}.self_attn.o_proj.weight"))?;
+            Ok(o.cast(lum_act))
+        } else {
+            Ok(attn.matmul(o_w.permute((1, 0))))
+        }
+    }
+
+    /// Lower `x @ Wᵀ` as a cublasLt fp8 GEMM. `W` is an E4M3 weight; `iscale`
+    /// (`.input_scale`) and `wscale` (`.weight_scale`) are per-tensor f32 scalars
+    /// loaded as runtime inputs from the AutoFP8 checkpoint. The scaled form
+    /// `(x/iscale).cast(E4M3) @ W * (iscale·wscale)` is what the cublasLt fp8
+    /// rewrite folds into a scaled fp8 matmul (scales become the GEMM's
+    /// A/B_SCALE_POINTERs). `x` is `[batch, seq, k]`; returns f32 `[batch, seq, out]`.
+    fn fp8_proj(&mut self, x: GraphTensor, wname: &str) -> Result<GraphTensor, EmitError> {
+        let w = self.weight(wname)?.as_dtype(DType::F8E4M3);
+        if let Some(d) = self.cur_declared.get_mut(wname) {
+            d.dtype = skein_ir::types::Dtype::Fp8E4m3;
+        }
+        let (out_dim, k) = {
+            let d = self.cur_declared.get(wname).expect("weight just declared");
+            (d.shape[0], d.shape[1])
+        };
+        let (b, s) = (self.batch, self.seq);
+        let m = b * s;
+        // Scale tensor names replace the `.weight` suffix (AutoFP8 convention),
+        // matching the shard keys written by build_weight_shard.
+        let base = wname.strip_suffix(".weight").unwrap_or(wname);
+        let iscale = self.declare_scale(&format!("{base}.input_scale"));
+        let wscale = self.declare_scale(&format!("{base}.weight_scale"));
+        // Collapse [b, s, k] -> [m, k] so this is the exact 2D `[m,k]@[k,n]`
+        // shape the cublasLt fp8 rewrite matches; split back to [b, s, out].
+        let xm = x.cast(DType::F32).merge_dims(0, 1);
+        let scaled_a = (xm / iscale.expand_rhs((m, k))).cast(DType::F8E4M3);
+        let out2d = scaled_a.matmul(w.permute((1, 0))).cast(DType::F32)
+            * (iscale * wscale).expand_rhs((m, out_dim));
+        Ok(out2d.split_dims(0, s))
+    }
+
+    /// Declare a per-tensor f32 scale as a replicated weight input (so it loads
+    /// from the shard and is search-staged). Returns its `[1]` handle.
+    fn declare_scale(&mut self, name: &str) -> GraphTensor {
+        if let Some(d) = self.cur_declared.get(name) {
+            return handle_for_declared(&mut self.cur_cx, d);
+        }
+        // Scalar `()` (not `[1]`) so `expand_rhs` broadcasts it into the matmul
+        // shapes; the checkpoint's `[1]` scale (one element) loads into it fine.
+        let t = self
+            .cur_cx
+            .named_tensor(name.to_string(), ())
+            .as_dtype(DType::F32);
+        let d = DeclaredTensor {
+            id: t.id,
+            shape: vec![1],
+            dtype: skein_ir::types::Dtype::F32,
+            role: ShardRole::Replicated,
+        };
+        self.cur_declared.insert(name.to_string(), d);
+        t
     }
 
     /// Declare a runtime-fed Input in the current segment: registers it as an

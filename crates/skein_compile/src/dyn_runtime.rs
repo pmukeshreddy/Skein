@@ -39,6 +39,9 @@ pub enum WeightDtype {
     F32,
     F16,
     Bf16,
+    /// E4M3 fp8 (e.g. AutoFP8/llm-compressor attention weights). Loaded as raw
+    /// bytes straight to the device fp8 buffer — never widened to f32.
+    F8E4M3,
 }
 
 impl WeightDtype {
@@ -47,6 +50,7 @@ impl WeightDtype {
         match self {
             WeightDtype::F32 => 4,
             WeightDtype::F16 | WeightDtype::Bf16 => 2,
+            WeightDtype::F8E4M3 => 1,
         }
     }
 }
@@ -81,6 +85,11 @@ pub fn decode_weight_bytes(
             .chunks_exact(2)
             .map(|c| f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
+        // fp8 weights are uploaded as raw bytes (no f32 widening); the caller
+        // routes them around this decoder.
+        WeightDtype::F8E4M3 => {
+            unreachable!("fp8 weights use the raw-bytes upload path, not decode_weight_bytes")
+        }
     };
     Ok(values)
 }
@@ -443,6 +452,9 @@ pub struct DynRuntimeWrapper<R: ComputeRuntime> {
     /// Unlike `staged_f32` (per-step handoffs re-applied every forward), weights
     /// are uploaded exactly once — avoiding a ~90 GB re-upload per forward.
     staged_weights: HashMap<NodeIndex, Vec<f32>>,
+    /// Raw fp8 (E4M3) weight bytes staged for one-time persistent upload — kept
+    /// as bytes (never widened to f32) so the device buffer stays 1-byte fp8.
+    staged_weight_bytes: HashMap<NodeIndex, Vec<u8>>,
     weights_loaded: bool,
 }
 
@@ -473,6 +485,7 @@ impl<R: ComputeRuntime> DynRuntimeWrapper<R> {
             staged_i32: HashMap::new(),
             external_f32: HashMap::new(),
             staged_weights: HashMap::new(),
+            staged_weight_bytes: HashMap::new(),
             weights_loaded: false,
         }
     }
@@ -609,6 +622,12 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
         // uploaded ONCE as persistent inputs on the first execute, instead of
         // landing in staged_f32 and being re-uploaded every forward.
         let node = self.input_node_for(name)?;
+        // fp8 (E4M3) weights: keep the raw checkpoint bytes and upload them
+        // straight to the device fp8 buffer — no f32 widening, no re-encoding.
+        if dtype == WeightDtype::F8E4M3 {
+            self.staged_weight_bytes.insert(node, bytes.to_vec());
+            return Ok(());
+        }
         let data = decode_weight_bytes(name, bytes, dtype)?;
         self.staged_weights.insert(node, data);
         Ok(())
@@ -627,6 +646,11 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
                 .map(|(_, dt)| *dt)
                 .unwrap_or(DType::F32);
             self.inner.set_data_persistent_f32_as(node, data, dtype);
+        }
+        // Raw fp8 weight bytes → persistent device fp8 buffers.
+        let weight_bytes = std::mem::take(&mut self.staged_weight_bytes);
+        for (node, bytes) in weight_bytes {
+            self.inner.set_data_persistent_bytes(node, bytes);
         }
         self.weights_loaded = true;
     }
