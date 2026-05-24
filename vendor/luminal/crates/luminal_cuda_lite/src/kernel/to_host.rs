@@ -26,7 +26,7 @@ use crate::{
     host::{DeviceBuffer, HostOp},
     kernel::{
         CudaFunctionExt, CudaGraphExecHandle, CudaGraphHandle, KernelOp, create_cuda_event,
-        destroy_cuda_event,
+        destroy_cuda_event, event_elapsed_ms, record_event_on_stream,
         fusion::region_codegen::{self, CompileUnit},
         hlir::{clear_global_dyn_dims, get_global_dyn_dims, set_global_dyn_dims},
     },
@@ -542,6 +542,25 @@ impl CudaGraphOp {
                 .unwrap_or(0);
             let cu_stream = stream.cu_stream();
             let num_kernels = state.kernels.len();
+            // SKEIN_KERNEL_TIMING (non-captured): record a CUDA event between every
+            // raw-launched kernel on the stream, then attribute the elapsed GPU span
+            // to each kernel_name. The kernels serialize in-order on cu_stream, so
+            // consecutive events bracket each kernel exactly. Adds a per-step stream
+            // sync (tok/s invalid during a timing run) but yields the true in-segment
+            // breakdown — this is what decomposes the opaque "CudaGraph" op.
+            static KT_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let kt_on = *KT_ON.get_or_init(|| {
+                std::env::var_os("SKEIN_KERNEL_TIMING").is_some()
+                    && std::env::var_os("SKEIN_CAPTURE").is_none()
+            });
+            let kt_ctx = stream.context();
+            let mut kt_ev: Vec<cudarc::driver::sys::CUevent> = Vec::new();
+            let mut kt_names: Vec<&'static str> = Vec::new();
+            if kt_on {
+                let e = create_cuda_event(&kt_ctx)?;
+                record_event_on_stream(&kt_ctx, e, stream)?;
+                kt_ev.push(e);
+            }
             for idx in 0..num_kernels {
                 let kernel = &state.kernels[idx];
                 let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
@@ -584,6 +603,52 @@ impl CudaGraphOp {
                     )
                     .result()
                     .map_err(|e| anyhow::anyhow!("cuLaunchKernel (raw): {e:?}"))?;
+                }
+                if kt_on {
+                    let e = create_cuda_event(&kt_ctx)?;
+                    record_event_on_stream(&kt_ctx, e, stream)?;
+                    kt_ev.push(e);
+                    kt_names.push(state.kernels[idx].kernel_name);
+                }
+            }
+            if kt_on && kt_ev.len() >= 2 {
+                stream.synchronize()?;
+                static ACC: std::sync::OnceLock<
+                    std::sync::Mutex<(std::collections::BTreeMap<String, (f64, u64)>, u64)>,
+                > = std::sync::OnceLock::new();
+                let mut g = ACC
+                    .get_or_init(|| std::sync::Mutex::new((std::collections::BTreeMap::new(), 0)))
+                    .lock()
+                    .unwrap();
+                for i in 0..kt_names.len() {
+                    if let Ok(ms) = event_elapsed_ms(&kt_ctx, kt_ev[i], kt_ev[i + 1]) {
+                        let e = g.0.entry(kt_names[i].to_string()).or_insert((0.0, 0));
+                        e.0 += ms as f64 * 1000.0;
+                        e.1 += 1;
+                    }
+                }
+                g.1 += 1;
+                let passes = g.1;
+                if passes % 512 == 0 {
+                    let total: f64 = g.0.values().map(|v| v.0).sum();
+                    let mut rows: Vec<(&String, &(f64, u64))> = g.0.iter().collect();
+                    rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+                    eprintln!(
+                        "=== SKEIN_KERNEL_TIMING passes={passes} total_in_graph_kernel_us={total:.0} (raw-launch segments; share-of-fused-graph) ===",
+                    );
+                    for (name, (us, cnt)) in rows.iter().take(25) {
+                        eprintln!(
+                            "  {:<34} {:5.1}%  {:9.0}us total  {:.2}us/firing x{}",
+                            name,
+                            us / total * 100.0,
+                            us,
+                            us / *cnt as f64,
+                            cnt
+                        );
+                    }
+                }
+                for e in kt_ev {
+                    destroy_cuda_event(&kt_ctx, e);
                 }
             }
             return Ok(());

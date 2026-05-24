@@ -1422,6 +1422,11 @@ impl HostOp for GLUMoE {
         let ktime = *KTIME.get_or_init(|| std::env::var_os("SKEIN_MOE_KTIME").is_some());
         static V2: OnceLock<bool> = OnceLock::new();
         let use_v2 = *V2.get_or_init(|| std::env::var_os("SKEIN_MOE_V2").is_some());
+        // A/B: SKEIN_MOE_DOWN_MONO forces the old single-kernel down (top_k loop in
+        // one block) instead of the two-kernel GEMV+sum split — same binary, for an
+        // apples-to-apples end-to-end delta.
+        static DOWN_MONO: OnceLock<bool> = OnceLock::new();
+        let down_mono = *DOWN_MONO.get_or_init(|| std::env::var_os("SKEIN_MOE_DOWN_MONO").is_some());
         let kt_events = if ktime {
             // CU_EVENT_DEFAULT (=0) keeps timing enabled; None would default to
             // CU_EVENT_DISABLE_TIMING and elapsed_ms would fail.
@@ -1580,6 +1585,15 @@ impl HostOp for GLUMoE {
                         .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
                         .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
                         .launch(grid_dn_v2)?;
+                } else if down_mono {
+                    // Old single-kernel down (A/B baseline via SKEIN_MOE_DOWN_MONO).
+                    stream
+                        .launch_builder(&kernels.7)
+                        .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr)
+                        .arg(&dn_w).arg(&dn_s).arg(&output_ptr)
+                        .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
+                        .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
+                        .launch(grid_dn)?;
                 } else {
                     // v1 two-kernel split (vLLM pattern). KERNEL 1: per-expert GEMV
                     // on grid (hidden, seq*top_k) — same block count as gate_up, no

@@ -2092,6 +2092,25 @@ impl Runtime for CudaRuntime {
         let total_start = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
 
+        // SKEIN_OP_PROFILE (non-captured only): attribute the decode step across op
+        // types by recording a CUDA timing event between every op and accumulating
+        // GPU span per op-label into a process-global table (logged every 64 steps).
+        // Disabled under SKEIN_CAPTURE (the step collapses to one fused-graph op, and
+        // events are illegal inside a capturing stream anyway).
+        static OP_PROF_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let op_prof_on = *OP_PROF_ON.get_or_init(|| {
+            std::env::var_os("SKEIN_OP_PROFILE").is_some()
+                && std::env::var_os("SKEIN_CAPTURE").is_none()
+        });
+        let mut prof_ev = Vec::new();
+        let mut prof_lbl: Vec<String> = Vec::new();
+        if op_prof_on {
+            let f = Some(crate::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+            let ev = self.cuda_stream.context().new_event(f).unwrap();
+            ev.record(&self.cuda_stream).unwrap();
+            prof_ev.push(ev);
+        }
+
         // Reused across nodes to avoid a per-node hashmap allocation on the hot path.
         let mut buffer_map: FxHashMap<NodeIndex, DeviceBuffer> = FxHashMap::default();
         for &exec_node in &bucket.exec_order {
@@ -2160,6 +2179,57 @@ impl Runtime for CudaRuntime {
                         exec_op.internal.stats_name().unwrap_or("unknown")
                     );
                 });
+            if op_prof_on {
+                let lbl = match exec_op.internal.stats_name() {
+                    Some(n) => n.to_string(),
+                    None => {
+                        // First identifier of the op's Debug repr (its type tag).
+                        let d = format!("{:?}", exec_op.internal);
+                        d.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .find(|s| !s.is_empty())
+                            .unwrap_or("op")
+                            .to_string()
+                    }
+                };
+                let f = Some(crate::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+                let ev = self.cuda_stream.context().new_event(f).unwrap();
+                ev.record(&self.cuda_stream).unwrap();
+                prof_ev.push(ev);
+                prof_lbl.push(lbl);
+            }
+        }
+        if op_prof_on && prof_ev.len() >= 2 {
+            prof_ev.last().unwrap().synchronize().unwrap();
+            static OP_PROF: std::sync::OnceLock<
+                std::sync::Mutex<(std::collections::BTreeMap<String, f64>, u64)>,
+            > = std::sync::OnceLock::new();
+            let mut g = OP_PROF
+                .get_or_init(|| std::sync::Mutex::new((std::collections::BTreeMap::new(), 0)))
+                .lock()
+                .unwrap();
+            for i in 0..prof_lbl.len() {
+                let us = prof_ev[i].elapsed_ms(&prof_ev[i + 1]).unwrap() as f64 * 1000.0;
+                *g.0.entry(prof_lbl[i].clone()).or_insert(0.0) += us;
+            }
+            g.1 += 1;
+            let steps = g.1;
+            if steps % 64 == 0 {
+                let total: f64 = g.0.values().sum();
+                let mut rows: Vec<(&String, &f64)> = g.0.iter().collect();
+                rows.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+                eprintln!(
+                    "=== SKEIN_OP_PROFILE steps={steps} GPU-busy={:.1}us/token (sum of op spans, uncaptured) ===",
+                    total / steps as f64
+                );
+                for (lbl, us) in rows.iter().take(20) {
+                    eprintln!(
+                        "  {:<30} {:9.2} us/tok  {:5.1}%",
+                        lbl,
+                        *us / steps as f64,
+                        *us / total * 100.0
+                    );
+                }
+            }
         }
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
 
