@@ -1024,6 +1024,9 @@ extern "C" __global__ void shm_allreduce2(
 
     /// Begin recording the shared stream into a CUDA graph.
     pub fn begin_stream_capture(&self) -> Result<(), cudarc::driver::DriverError> {
+        // SKEIN_GRAPH_KERNEL_TIMING: drop any prior event chain — this capture
+        // rebuilds it as event-record nodes interleaved with the kernels.
+        crate::host::graph_kt_reset();
         let s = self.cuda_stream.cu_stream();
         unsafe {
             cudarc::driver::sys::cuStreamBeginCapture_v2(
@@ -1060,6 +1063,13 @@ extern "C" __global__ void shm_allreduce2(
                     cudarc::driver::sys::cuGraphLaunch(exec, s)
                         .result()
                         .expect("cuGraphLaunch (captured full-step)");
+                }
+                // SKEIN_GRAPH_KERNEL_TIMING: sync + read the per-kernel event chain
+                // recorded during capture. Adds a per-replay sync (tok/s invalid in
+                // a timing run) but yields the true in-graph per-kernel breakdown.
+                if crate::host::graph_kt_on() {
+                    let _ = self.cuda_stream.synchronize();
+                    crate::host::graph_kt_read(&self.cuda_stream);
                 }
                 true
             }

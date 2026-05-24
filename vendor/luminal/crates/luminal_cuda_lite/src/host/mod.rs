@@ -57,6 +57,158 @@ pub fn capture_unit_scale(stream: &Arc<CudaStream>) -> u64 {
     ptr
 }
 
+/// SKEIN_GRAPH_KERNEL_TIMING: per-kernel GPU timing INSIDE the captured full-step
+/// graph. A fresh `cuEventRecord` issued while the stream is capturing becomes an
+/// event-record NODE in the graph (legal — unlike recording on a live stream); on
+/// every replay those nodes fire, and `cuEventElapsedTime` between consecutive
+/// nodes yields each kernel's true in-graph GPU span. This is the only profile
+/// that reflects the production captured path (no launch-latency inflation). Only
+/// meaningful under SKEIN_CAPTURE.
+pub fn graph_kt_on() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("SKEIN_GRAPH_KERNEL_TIMING").is_some() && is_capture())
+}
+
+// Event handles stored as usize: the raw `sys::CUevent` (*mut) is !Send, so it
+// can't live in a `static Mutex`. Cast back to CUevent at read time.
+//
+// DAG-aware design: each kernel gets its OWN before+after event pair, so a
+// kernel's compute time (elapsed before_i -> after_i) is always read from two
+// nodes that fire in the SAME replay — robust to the captured graph's side-stream
+// all-reduce waits and to stale/orphaned nodes. The whole-graph span is read once
+// (before[0] -> after[last]); STALL = span - sum(compute) is the inter-kernel wait
+// (cross-GPU all-reduce / sync), reported as its own bucket instead of being
+// (mis)dumped onto whatever kernel happens to precede a wait.
+type GraphKtChain = (Vec<usize>, Vec<usize>, Vec<&'static str>); // before, after, name
+fn graph_kt_chain() -> &'static std::sync::Mutex<GraphKtChain> {
+    static C: std::sync::OnceLock<std::sync::Mutex<GraphKtChain>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new((Vec::new(), Vec::new(), Vec::new())))
+}
+
+/// Clear the chain at the start of a (re)capture. Old event handles leak — fine
+/// for a diagnostic run.
+pub fn graph_kt_reset() {
+    if !graph_kt_on() {
+        return;
+    }
+    let mut c = graph_kt_chain().lock().unwrap();
+    c.0.clear();
+    c.1.clear();
+    c.2.clear();
+}
+
+/// During capture, just BEFORE launching kernel `name`: record its start event.
+pub fn graph_kt_before(stream: &Arc<CudaStream>, name: &'static str) {
+    if !graph_kt_on() {
+        return;
+    }
+    let ctx = stream.context();
+    if let Ok(ev) = crate::kernel::create_cuda_event(&ctx) {
+        let _ = crate::kernel::record_event_on_stream(&ctx, ev, stream);
+        let mut c = graph_kt_chain().lock().unwrap();
+        c.0.push(ev as usize);
+        c.2.push(name);
+    }
+}
+
+/// During capture, just AFTER launching the current kernel: record its end event.
+pub fn graph_kt_after(stream: &Arc<CudaStream>) {
+    if !graph_kt_on() {
+        return;
+    }
+    let ctx = stream.context();
+    if let Ok(ev) = crate::kernel::create_cuda_event(&ctx) {
+        let _ = crate::kernel::record_event_on_stream(&ctx, ev, stream);
+        graph_kt_chain().lock().unwrap().1.push(ev as usize);
+    }
+}
+
+/// After a replay (caller must have synced the stream): per-kernel compute =
+/// elapsed(before_i, after_i); whole-graph span = elapsed(before_0, after_last);
+/// STALL = span - sum(compute). Values outside [0, 60ms] are treated as bogus
+/// (cross-replay/stale) and counted, not summed. Logs every 256 replays.
+pub fn graph_kt_read(stream: &Arc<CudaStream>) {
+    if !graph_kt_on() {
+        return;
+    }
+    let c = graph_kt_chain().lock().unwrap();
+    let n = c.0.len().min(c.1.len()).min(c.2.len());
+    if n == 0 {
+        return;
+    }
+    let ctx = stream.context();
+    let ev = |x: usize| x as crate::cudarc::driver::sys::CUevent;
+    let sane = |us: f64| (0.0..=60_000.0).contains(&us);
+
+    let mut compute_sum = 0.0_f64;
+    let mut bogus = 0u64;
+    let mut local: std::collections::BTreeMap<&'static str, f64> = std::collections::BTreeMap::new();
+    for i in 0..n {
+        if let Ok(ms) = crate::kernel::event_elapsed_ms(&ctx, ev(c.0[i]), ev(c.1[i])) {
+            let us = ms as f64 * 1000.0;
+            if sane(us) {
+                *local.entry(c.2[i]).or_insert(0.0) += us;
+                compute_sum += us;
+            } else {
+                bogus += 1;
+            }
+        }
+    }
+    // Whole-graph span (first kernel start -> last kernel end): one robust pair.
+    let span = crate::kernel::event_elapsed_ms(&ctx, ev(c.0[0]), ev(c.1[n - 1]))
+        .map(|ms| ms as f64 * 1000.0)
+        .ok()
+        .filter(|&us| sane(us))
+        .unwrap_or(compute_sum);
+
+    #[allow(clippy::type_complexity)]
+    static ACC: std::sync::OnceLock<
+        std::sync::Mutex<(std::collections::BTreeMap<String, f64>, f64, f64, u64, u64)>,
+    > = std::sync::OnceLock::new();
+    // (per-name compute_us, span_us, compute_sum_us, bogus, passes)
+    let mut g = ACC
+        .get_or_init(|| std::sync::Mutex::new((std::collections::BTreeMap::new(), 0.0, 0.0, 0, 0)))
+        .lock()
+        .unwrap();
+    for (name, us) in local {
+        *g.0.entry(name.to_string()).or_insert(0.0) += us;
+    }
+    g.1 += span;
+    g.2 += compute_sum;
+    g.3 += bogus;
+    g.4 += 1;
+    let passes = g.4;
+    if passes % 256 == 0 {
+        let p = passes as f64;
+        let span_us = g.1 / p;
+        let compute_us = g.2 / p;
+        let stall_us = (span_us - compute_us).max(0.0);
+        // Build the whole block as one string + single write so the two ranks'
+        // reports interleave at block granularity, not per-line.
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = write!(
+            out,
+            "=== SKEIN_GRAPH_KERNEL_TIMING passes={passes} | graph_span={span_us:.0}us/tok  compute={compute_us:.0}us/tok ({:.0}%)  STALL/sync={stall_us:.0}us/tok ({:.0}%)  bogus_pairs={:.1}/tok ===",
+            compute_us / span_us * 100.0,
+            stall_us / span_us * 100.0,
+            g.3 as f64 / p,
+        );
+        let mut rows: Vec<(&String, &f64)> = g.0.iter().collect();
+        rows.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+        for (name, us) in rows.iter().take(25) {
+            let _ = write!(
+                out,
+                "\n  {:<34} {:9.1}us/tok  {:5.1}% of compute",
+                name,
+                *us / p,
+                **us / g.2 * 100.0
+            );
+        }
+        eprintln!("{out}");
+    }
+}
+
 pub type Ops = (
     // cublas::CuBlasSgemmV2,
     cublaslt::CuBlasLt,

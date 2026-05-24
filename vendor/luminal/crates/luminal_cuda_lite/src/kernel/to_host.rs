@@ -556,11 +556,6 @@ impl CudaGraphOp {
             let kt_ctx = stream.context();
             let mut kt_ev: Vec<cudarc::driver::sys::CUevent> = Vec::new();
             let mut kt_names: Vec<&'static str> = Vec::new();
-            if kt_on {
-                let e = create_cuda_event(&kt_ctx)?;
-                record_event_on_stream(&kt_ctx, e, stream)?;
-                kt_ev.push(e);
-            }
             for idx in 0..num_kernels {
                 let kernel = &state.kernels[idx];
                 let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
@@ -596,6 +591,17 @@ impl CudaGraphOp {
                 let mut params = UnifiedKernelParams::new(pv);
                 let params_ptr = params.as_cuda_params();
                 let cu_func = unsafe { kernel.function.raw_function() };
+                // SKEIN_KERNEL_TIMING (uncaptured): event BEFORE this kernel so
+                // consecutive events bracket it. SKEIN_GRAPH_KERNEL_TIMING (captured):
+                // same, but the cuEventRecord is captured as a graph node and read
+                // back on replay. Both no-op unless their flag is set.
+                if kt_on {
+                    let e = create_cuda_event(&kt_ctx)?;
+                    record_event_on_stream(&kt_ctx, e, stream)?;
+                    kt_ev.push(e);
+                    kt_names.push(kernel.kernel_name);
+                }
+                crate::host::graph_kt_before(stream, kernel.kernel_name);
                 unsafe {
                     cudarc::driver::sys::cuLaunchKernel(
                         cu_func, grid.0, grid.1, grid.2, block.0, block.1, block.2, shared,
@@ -604,14 +610,14 @@ impl CudaGraphOp {
                     .result()
                     .map_err(|e| anyhow::anyhow!("cuLaunchKernel (raw): {e:?}"))?;
                 }
-                if kt_on {
-                    let e = create_cuda_event(&kt_ctx)?;
-                    record_event_on_stream(&kt_ctx, e, stream)?;
-                    kt_ev.push(e);
-                    kt_names.push(state.kernels[idx].kernel_name);
-                }
+                crate::host::graph_kt_after(stream);
             }
-            if kt_on && kt_ev.len() >= 2 {
+            if kt_on && !kt_names.is_empty() {
+                // Closing event so consecutive events bracket each kernel: kt_ev has
+                // one entry per kernel (recorded before launch) plus this final one.
+                let e = create_cuda_event(&kt_ctx)?;
+                record_event_on_stream(&kt_ctx, e, stream)?;
+                kt_ev.push(e);
                 stream.synchronize()?;
                 static ACC: std::sync::OnceLock<
                     std::sync::Mutex<(std::collections::BTreeMap<String, (f64, u64)>, u64)>,
