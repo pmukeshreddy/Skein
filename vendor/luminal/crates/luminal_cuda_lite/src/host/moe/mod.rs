@@ -88,6 +88,8 @@ pub struct GLUMoE {
         CudaFunction, // moe_down_combine_fp8_grouped
         CudaFunction, // moe_gate_up_act_fp8_binned (token-permuted, active-only)
         CudaFunction, // moe_down_combine_fp8_binned
+        CudaFunction, // moe_down_gemv_fp8 (v1 two-kernel: per-expert GEMV)
+        CudaFunction, // moe_sum_fp8 (v1 two-kernel: weighted reduction)
     )>,
     /// fp8 (E4M3) weight cache (SKEIN_MOE_FP8): raw device pointers to the
     /// quantized resident expert weights + per-row scales. Computed once on the
@@ -212,6 +214,8 @@ impl GLUMoE {
         CudaFunction,
         CudaFunction,
         CudaFunction,
+        CudaFunction, // moe_down_gemv_fp8
+        CudaFunction, // moe_sum_fp8
     ) {
         self.module.get_or_init(|| {
             let src = r#"
@@ -506,6 +510,83 @@ extern "C" __global__ void moe_down_combine_fp8(
         __syncthreads();
     }
     if (threadIdx.x == 0) ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
+}
+
+// ---- v1 two-kernel split (vLLM pattern, default decode path) ----------------
+// KERNEL 1 (heavy): one block computes ONE expert's down-GEMV for ONE output
+// element. Grid (hidden, seq*top_k) — matches gate_up, so the down phase gets
+// the same block count (28672 vs the old 4096) and hides HBM latency far better
+// than the old single grid that looped top_k inside the block with a per-expert
+// __syncthreads. Applies the per-output down weight_scale and writes the partial
+// (no accumulation; the cheap KERNEL 2 does the weighted reduction).
+extern "C" __global__ void moe_down_gemv_fp8(
+    unsigned long long hid_ptr, unsigned long long topk_idx_ptr,
+    unsigned long long down_ptr, unsigned long long down_scale_ptr,
+    unsigned long long partials_ptr,
+    int hidden, int intermediate, int top_k, int idx_stride, int seq
+) {
+    int h = blockIdx.x;
+    int tj = blockIdx.y;
+    int t = tj / top_k, jx = tj % top_k;
+    if (t >= seq || h >= hidden) return;
+    int expert = ((const int*)topk_idx_ptr)[(long long)t * idx_stride + jx];
+    const unsigned char* D = (const unsigned char*)down_ptr + (long long)expert * hidden * intermediate + (long long)h * intermediate;
+    const __nv_bfloat16* hd = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k + jx) * intermediate;
+    float dscale = ((const float*)down_scale_ptr)[(long long)expert * hidden + h];
+    float dot = 0.f;
+    int n16 = intermediate >> 4;
+    const uint4* dp4 = (const uint4*)D;
+    for (int j = threadIdx.x; j < n16; j += blockDim.x) {
+        uint4 dw = dp4[j];
+        const __nv_fp8_e4m3* dh = (const __nv_fp8_e4m3*)&dw;
+        int b = j << 4;
+        #pragma unroll
+        for (int e = 0; e < 16; e++) dot += (float)dh[e] * __bfloat162float(hd[b + e]);
+    }
+    for (int j = (n16 << 4) + (int)threadIdx.x; j < intermediate; j += blockDim.x) {
+        __nv_fp8_e4m3 dq; dq.__x = D[j];
+        dot += (float)dq * __bfloat162float(hd[j]);
+    }
+    for (int s = 16; s > 0; s >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, s);
+    __shared__ float sd[32];
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarp = (blockDim.x + 31) >> 5;
+    if (lane == 0) sd[warp] = dot;
+    __syncthreads();
+    if (warp == 0) {
+        float r = (lane < nwarp) ? sd[lane] : 0.f;
+        for (int s = 16; s > 0; s >>= 1) r += __shfl_down_sync(0xffffffffu, r, s);
+        if (lane == 0) ((float*)partials_ptr)[(long long)(t * top_k + jx) * hidden + h] = dscale * r;
+    }
+}
+
+// KERNEL 2 (cheap, ~15 lines): mirror of vLLM's moe_sum_kernel
+// (csrc/moe/moe_align_sum_kernels.cu). One thread per output element sums the
+// top_k partials, applying routing_weight x normalize (x optional expert scale).
+extern "C" __global__ void moe_sum_fp8(
+    unsigned long long partials_ptr, unsigned long long topk_idx_ptr, unsigned long long topk_vals_ptr,
+    unsigned long long scale_ptr, unsigned long long out_ptr,
+    int hidden, int top_k, int idx_stride, int vals_stride, int seq,
+    int normalize, int use_scale
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (t >= seq || h >= hidden) return;
+    const int* idx = (const int*)topk_idx_ptr;
+    const float* vals = (const float*)topk_vals_ptr;
+    float inv_norm = 1.0f;
+    if (normalize) {
+        float ssum = 0.f;
+        for (int j = 0; j < top_k; j++) ssum += vals[(long long)t * vals_stride + j];
+        inv_norm = (ssum != 0.f) ? (1.0f / ssum) : 0.f;
+    }
+    float out_acc = 0.f;
+    for (int jx = 0; jx < top_k; jx++) {
+        int expert = idx[(long long)t * idx_stride + jx];
+        float w = vals[(long long)t * vals_stride + jx] * inv_norm;
+        if (use_scale) w *= ((const float*)scale_ptr)[expert];
+        out_acc += w * ((const float*)partials_ptr)[(long long)(t * top_k + jx) * hidden + h];
+    }
+    ((float*)out_ptr)[(long long)t * hidden + h] = out_acc;
 }
 
 // ---- v2 (SKEIN_MOE_V2): warp-per-output-row + shared-memory staging of the
@@ -856,6 +937,8 @@ extern "C" __global__ void moe_down_combine_fp8_binned(
             let down_combine_fp8_grouped = module.load_function("moe_down_combine_fp8_grouped").unwrap();
             let gate_up_act_fp8_binned = module.load_function("moe_gate_up_act_fp8_binned").unwrap();
             let down_combine_fp8_binned = module.load_function("moe_down_combine_fp8_binned").unwrap();
+            let down_gemv_fp8 = module.load_function("moe_down_gemv_fp8").unwrap();
+            let sum_fp8 = module.load_function("moe_sum_fp8").unwrap();
             (
                 module,
                 f32_to_bf16,
@@ -872,6 +955,8 @@ extern "C" __global__ void moe_down_combine_fp8_binned(
                 down_combine_fp8_grouped,
                 gate_up_act_fp8_binned,
                 down_combine_fp8_binned,
+                down_gemv_fp8,
+                sum_fp8,
             )
         })
     }
@@ -1194,6 +1279,7 @@ impl HostOp for GLUMoE {
         // because the MoE layers run serialized on the shared capture stream).
         let _x_owned;
         let _hid_owned;
+        let _partials_owned;
         let (xbf16_ptr, hid_ptr) = if super::is_capture() {
             (
                 super::capture_scratch(stream, 2, seq * hidden * 2),
@@ -1486,19 +1572,52 @@ impl HostOp for GLUMoE {
                         .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
                         .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale).arg(&num_experts_i)
                         .launch(grid_dn_grouped)?;
+                } else if use_v2 {
+                    stream
+                        .launch_builder(&kernels.9)
+                        .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr)
+                        .arg(&dn_w).arg(&dn_s).arg(&output_ptr)
+                        .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
+                        .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
+                        .launch(grid_dn_v2)?;
                 } else {
-                let (dn_fn, dn_cfg) = if use_v2 {
-                    (&kernels.9, grid_dn_v2)
-                } else {
-                    (&kernels.7, grid_dn)
-                };
-                stream
-                    .launch_builder(dn_fn)
-                    .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr)
-                    .arg(&dn_w).arg(&dn_s).arg(&output_ptr)
-                    .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i)
-                    .arg(&vals_stride_i).arg(&seq_i).arg(&normalize).arg(&use_scale)
-                    .launch(dn_cfg)?;
+                    // v1 two-kernel split (vLLM pattern). KERNEL 1: per-expert GEMV
+                    // on grid (hidden, seq*top_k) — same block count as gate_up, no
+                    // top_k loop, no per-expert __syncthreads — writes scaled partials.
+                    // KERNEL 2: cheap weighted reduction over top_k → final out.
+                    // partials [seq, top_k, hidden] f32. Under capture it must be a
+                    // persistent scratch (distinct key 4) so the replayed graph hits a
+                    // stable address; off-capture it's a per-call alloc kept alive to
+                    // function scope (matches x/hid scratch lifetimes).
+                    let partials_ptr = if super::is_capture() {
+                        super::capture_scratch(stream, 4, seq * top_k * hidden * 4)
+                    } else {
+                        let buf = stream.alloc::<u8>(seq * top_k * hidden * 4)?;
+                        let p = slice_ptr(&buf, stream);
+                        _partials_owned = buf;
+                        p
+                    };
+                    let grid_gemv = LaunchConfig {
+                        grid_dim: (hidden as u32, (seq * top_k) as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    stream
+                        .launch_builder(&kernels.15)
+                        .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&dn_w).arg(&dn_s).arg(&partials_ptr)
+                        .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i).arg(&seq_i)
+                        .launch(grid_gemv)?;
+                    let grid_sum = LaunchConfig {
+                        grid_dim: ((hidden as u32).div_ceil(128), seq as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    stream
+                        .launch_builder(&kernels.16)
+                        .arg(&partials_ptr).arg(&topk_idx_ptr).arg(&topk_vals_ptr).arg(&scale_ptr).arg(&output_ptr)
+                        .arg(&hidden_i).arg(&top_k_i).arg(&idx_stride_i).arg(&vals_stride_i).arg(&seq_i)
+                        .arg(&normalize).arg(&use_scale)
+                        .launch(grid_sum)?;
                 }
             } else {
                 stream
