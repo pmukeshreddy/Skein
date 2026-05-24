@@ -90,6 +90,11 @@ pub struct RankServer {
     /// rows the decode graph processes per forward. `generate_batched` packs this
     /// many sequences into each captured step.
     batch_width: usize,
+    /// SKEIN_DEVICE_LOGITS: the next-token index computed on-device by the logits
+    /// all-gather + argmax (greedy, TP path). Set by `forward_step` after the
+    /// forward, consumed by `sample_and_sync` in place of a host argmax. `None`
+    /// when the lever is off or on the PP path.
+    device_token: std::cell::Cell<Option<u32>>,
 }
 
 impl RankServer {
@@ -156,7 +161,39 @@ impl RankServer {
         // them; under PP with tp=1 there is no all-gather (logits are the last
         // stage's plain segment output → device_slots), so mark LOGITS host here to
         // materialize it to f32_slots. Idempotent if the all-gather already added it.
-        host_tensors.insert(LOGITS.to_string());
+        //
+        // SKEIN_DEVICE_LOGITS: keep LOGITS device-resident (bf16) so the all-gather
+        // + argmax run on-device (see rank_executor's device-logits path); marking
+        // it host would force the full-vocab f32 D2H this lever removes. Only the
+        // TP path is changed — PP (no all-gather) still needs the host read.
+        let device_logits = std::env::var_os("SKEIN_DEVICE_LOGITS").is_some();
+        if device_logits {
+            // Keep LOGITS device-resident (bf16). TP (pp=1): the AllGather output
+            // stays in device_slots for the on-device gather+argmax. PP: the last
+            // stage's full-vocab logits stay device-resident so the next token is
+            // argmaxed on the GPU (read-only) instead of read full-vocab to host.
+            // The collective filter above may have added it (TP AllGather); remove
+            // it either way so it is not materialized to f32_slots.
+            host_tensors.remove(LOGITS);
+        } else {
+            host_tensors.insert(LOGITS.to_string());
+        }
+        // SKEIN_DEVICE_SENDRECV: keep the pipeline-parallel boundary handoff
+        // (the SendRecv carry tensors) device-resident so the producer stage's
+        // output stays in `device_slots` (ncclSend straight from it) and the
+        // consumer stage binds the ncclRecv'd device buffer — no host round-trip.
+        if std::env::var_os("SKEIN_DEVICE_SENDRECV").is_some() {
+            for s in &schedule {
+                if let SequenceStep::Collective {
+                    collective: CollectiveKind::SendRecv,
+                    tensor,
+                    ..
+                } = s
+                {
+                    host_tensors.remove(tensor);
+                }
+            }
+        }
         executor.runner_mut().set_host_tensors(host_tensors.clone());
 
         // Sparse / on-device MoE: the FFN segments declare every expert (so they
@@ -335,12 +372,42 @@ impl RankServer {
             hi
         };
 
+        // SKEIN_DEVICE_SENDRECV / SKEIN_DEVICE_LOGITS make a PP boundary/last-stage
+        // tensor device-resident, which flips `segment_has_host_output` for that
+        // stage to false and would otherwise extend the full-step capture window to
+        // cover a stage's segment. skein's stream-capture of a stage conflicts with
+        // luminal's internal per-segment CUDA graphs (CUDA_ERROR_STREAM_CAPTURE_-
+        // UNSUPPORTED), and PP already decodes without full-step capture, so keep
+        // the window empty — these levers win on host-traffic, not stage capture.
+        let capture_hi = if pp > 1
+            && (std::env::var_os("SKEIN_DEVICE_SENDRECV").is_some()
+                || std::env::var_os("SKEIN_DEVICE_LOGITS").is_some())
+        {
+            capture_lo
+        } else {
+            capture_hi
+        };
+
         if std::env::var_os("SKEIN_FI_LOG").is_some() {
             eprintln!(
                 "SKEIN_SPLIT capture_lo={capture_lo} capture_hi={capture_hi} capture_split={capture_split} len={} rank={}",
                 schedule_resolved.len(),
                 layout.rank
             );
+            for (i, s) in schedule_resolved.iter().enumerate() {
+                let desc = match s {
+                    ResolvedSequenceStep::ExecuteSegment { device_idx, segment_idx } => {
+                        format!("ExecuteSegment dev={device_idx} seg={segment_idx}")
+                    }
+                    ResolvedSequenceStep::Collective { collective, participants, tensor, elems } => {
+                        format!("Collective {collective:?} parts={participants:?} tensor={tensor:?} elems={elems}")
+                    }
+                    ResolvedSequenceStep::MoeRoute { ffn_segment_idx, block, .. } => {
+                        format!("MoeRoute ffn_seg={ffn_segment_idx} block={block}")
+                    }
+                };
+                eprintln!("SKEIN_SCHED[{i}] rank={} {desc}", layout.rank);
+            }
         }
         Ok(Self {
             layout,
@@ -359,6 +426,7 @@ impl RankServer {
             is_last_stage,
             last_stage_root,
             batch_width: artifact.plan.batching.max_batch() as usize,
+            device_token: std::cell::Cell::new(None),
         })
     }
 
@@ -522,6 +590,47 @@ impl RankServer {
         if self.pp > 1 && !self.is_last_stage {
             return Ok(Vec::new());
         }
+        // SKEIN_DEVICE_LOGITS: compute the next token on-device and skip the
+        // full-vocab host logits read.
+        if std::env::var_os("SKEIN_DEVICE_LOGITS").is_some() {
+            // TP (pp=1): the executor's AllGather hook already argmaxed the gathered
+            // logits and stashed the token on the collective.
+            if let Some(tok) = self.collective.take_device_token() {
+                self.device_token.set(Some(tok));
+                return Ok(Vec::new());
+            }
+            // PP last stage (no AllGather): the full-vocab logits are this stage's
+            // own device-resident output — argmax them on the GPU (read-only) and
+            // return the 4-byte token via `device_token`.
+            if let Some((_stale_ptr, e)) = self.executor.runner().output_device_ptr(LOGITS) {
+                // `output_device_ptr` is a stale output slot for a host-staged
+                // handoff. D2D-copy the *computed* logits into a scratch buffer
+                // (the live-value path KV writes use), then argmax that. Avoids the
+                // full-vocab host read entirely; only the 4-byte token comes back.
+                let dest = self.collective.logits_scratch_ptr(e);
+                let copied = dest != 0
+                    && self
+                        .executor
+                        .runner()
+                        .copy_output_to_device(LOGITS, dest, e * 2);
+                if std::env::var_os("SKEIN_FI_LOG").is_some() {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static ONCE: AtomicBool = AtomicBool::new(false);
+                    if !ONCE.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "SKEIN_DEVICE_LOGITS(PP): elems={e} vocab={} copied={copied}",
+                            self.vocab
+                        );
+                    }
+                }
+                if copied {
+                    let tok = unsafe { self.collective.logits_argmax_local_device(dest, e) }
+                        .map_err(to_rt)?;
+                    self.device_token.set(Some(tok));
+                    return Ok(Vec::new());
+                }
+            }
+        }
         self.executor
             .runner()
             .read(LOGITS)
@@ -534,9 +643,22 @@ impl RankServer {
     /// stages (which need it for their next embed). Collective: all ranks call it.
     fn sample_and_sync(&self, logits: &[f32]) -> Result<u32, RuntimeError> {
         if self.pp <= 1 {
+            // SKEIN_DEVICE_LOGITS: the next token was argmaxed on-device this step;
+            // consume it (clearing the slot) instead of a host argmax over a
+            // full-vocab f32 vector that was never materialized.
+            if let Some(tok) = self.device_token.take() {
+                return Ok(tok);
+            }
             return Ok(argmax(logits));
         }
-        let next = if self.is_last_stage { argmax(logits) } else { 0 };
+        // PP: only the last stage has logits. Under SKEIN_DEVICE_LOGITS it already
+        // argmaxed them on-device (device_token); else host argmax. Broadcast the
+        // chosen token to the earlier stages (which need it for their next embed).
+        let next = if self.is_last_stage {
+            self.device_token.take().unwrap_or_else(|| argmax(logits))
+        } else {
+            0
+        };
         let mut buf = [next as f32];
         self.collective
             .broadcast(&mut buf, self.last_stage_root)
@@ -594,6 +716,19 @@ impl RankServer {
                         );
                     }
                 }
+            }
+        }
+        // SKEIN_DEVICE_LOGITS (TP): the prefill all-gather already argmaxed the
+        // first token on-device and stashed it; take it and return empty logits
+        // (consumed via `device_token` in `sample_and_sync`). No host logits read
+        // — under the lever LOGITS is device-resident, so `read_handoff` would only
+        // see this rank's un-gathered shard.
+        if self.pp <= 1 && std::env::var_os("SKEIN_DEVICE_LOGITS").is_some() {
+            if let Some(tok) = self.collective.take_device_token() {
+                self.device_token.set(Some(tok));
+                prefill.runner_mut().clear_intermediates();
+                self.prefill = Some(prefill);
+                return Ok(Vec::new());
             }
         }
         let logits = prefill.runner().read_handoff(LOGITS);

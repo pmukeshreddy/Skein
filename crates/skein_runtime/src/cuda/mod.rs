@@ -2,6 +2,8 @@
 //! `#[cfg(feature = "cuda")]`; the non-feature build sees an empty module.
 
 #[cfg(feature = "cuda")]
+pub mod argmax;
+#[cfg(feature = "cuda")]
 pub mod nccl;
 #[cfg(feature = "cuda")]
 pub mod rdma;

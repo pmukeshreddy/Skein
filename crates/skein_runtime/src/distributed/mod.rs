@@ -182,6 +182,84 @@ pub trait RankCollective {
         None
     }
 
+    /// SKEIN_DEVICE_LOGITS: all-gather this rank's bf16 logit shard at device
+    /// pointer `local_ptr` (`local_elems` bf16) across the TP group into a device
+    /// buffer, then argmax it on the GPU; returns the next-token index. No
+    /// full-vocab host read — only the 4-byte token crosses the bus. Default:
+    /// unsupported (CPU backend); the NCCL backend overrides it.
+    ///
+    /// # Safety
+    /// `local_ptr` must be a valid device allocation of `local_elems` bf16
+    /// elements on this rank's device, alive for the call.
+    unsafe fn logits_argmax_device(
+        &self,
+        _local_ptr: u64,
+        _local_elems: usize,
+    ) -> Result<u32, CollectiveError> {
+        Err(CollectiveError::Nccl(
+            "device logits argmax not supported on this backend".to_string(),
+        ))
+    }
+
+    /// SKEIN_DEVICE_LOGITS (PP last stage / TP without a gather): argmax this
+    /// rank's full-vocab bf16 logits at device pointer `ptr` (`elems` bf16) on the
+    /// GPU and return the token index — read-only over the producer's own buffer,
+    /// no collective. Default: unsupported.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `elems` bf16 on this rank's
+    /// device, alive for the call.
+    unsafe fn logits_argmax_local_device(
+        &self,
+        _ptr: u64,
+        _elems: usize,
+    ) -> Result<u32, CollectiveError> {
+        Err(CollectiveError::Nccl(
+            "local device logits argmax not supported on this backend".to_string(),
+        ))
+    }
+
+    /// SKEIN_DEVICE_LOGITS: device pointer of a reusable `elems`-bf16 scratch
+    /// buffer for the on-device logits copy + argmax. `0` if unsupported.
+    fn logits_scratch_ptr(&self, _elems: usize) -> u64 {
+        0
+    }
+
+    /// Stash / take the device-computed next-token index (see
+    /// [`logits_argmax_device`](Self::logits_argmax_device)). Interior-mutable so
+    /// the executor (which holds `&self`) can hand the token to the forward.
+    fn set_device_token(&self, _tok: u32) {}
+    fn take_device_token(&self) -> Option<u32> {
+        None
+    }
+
+    /// SKEIN_DEVICE_SENDRECV: send `elems` bf16 directly from device pointer `ptr`
+    /// to `peer` (the pipeline-parallel boundary handoff), no host staging.
+    /// Default: unsupported.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device allocation of `elems` bf16 on this rank's
+    /// device, alive for the call.
+    unsafe fn send_device_bf16(
+        &self,
+        _ptr: u64,
+        _elems: usize,
+        _peer: usize,
+    ) -> Result<(), CollectiveError> {
+        Err(CollectiveError::Nccl(
+            "device bf16 send not supported on this backend".to_string(),
+        ))
+    }
+
+    /// SKEIN_DEVICE_SENDRECV: receive `elems` bf16 from `peer` into a reusable
+    /// device buffer and return its raw device pointer (the caller binds it as the
+    /// consumer segment's input). Default: unsupported.
+    fn recv_device_bf16(&self, _elems: usize, _peer: usize) -> Result<u64, CollectiveError> {
+        Err(CollectiveError::Nccl(
+            "device bf16 recv not supported on this backend".to_string(),
+        ))
+    }
+
     /// Point-to-point send of `buf` to `peer` (the pipeline-parallel stage
     /// handoff). Default: unsupported.
     fn send_f32(&self, _buf: &[f32], _peer: usize) -> Result<(), CollectiveError> {

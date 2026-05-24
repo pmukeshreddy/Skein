@@ -1343,6 +1343,43 @@ impl LocalSegments for SegmentRunner {
             .map(|h| (h.ptr, h.elems))
     }
 
+    fn set_device_handoff_by_id(&mut self, id: HandoffId, ptr: u64, n_bytes: usize) {
+        // Bind a device buffer as this handoff's device-resident value (the PP
+        // receiver's just-ncclRecv'd boundary carry). The consumer segment then
+        // binds it by pointer (HandoffKind::Device input path) — no H2D.
+        let slot = id.idx();
+        if slot < self.device_slots.len() {
+            self.device_slots[slot] = Some(DeviceTensorHandle {
+                device: 0,
+                ptr,
+                n_bytes,
+                elems: n_bytes / 2,
+                dtype: HandoffDtype::Bf16,
+            });
+            self.f32_slots[slot] = None;
+        }
+    }
+
+    fn copy_output_to_device(&self, name: &str, dest_ptr: u64, n_bytes: usize) -> bool {
+        let Some(&id) = self.name_to_id.get(name) else {
+            return false;
+        };
+        // Find the segment that produces this output and copy its *computed* value
+        // (D2D) into the caller's buffer — the same runtime path KV writes use, so
+        // it reflects the live result rather than a stale output slot.
+        for (seg, outs) in self.segment_outputs.iter().enumerate() {
+            if outs.contains(&id) {
+                unsafe {
+                    self.segments[seg]
+                        .runtime
+                        .copy_output_to_device_by_id(id, dest_ptr, n_bytes);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn device_shm_all_reduce(
         &mut self,
         data_ptr: u64,

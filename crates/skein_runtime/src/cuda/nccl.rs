@@ -59,6 +59,18 @@ pub struct NcclCollective {
     /// NCCL for small device bf16 all-reduces (decode hot path), eliminating
     /// NCCL's ~105us-per-call cold-issue cost. `None` => always use NCCL.
     shm: Option<super::shm_allreduce::ShmAllReduce>,
+    /// SKEIN_DEVICE_LOGITS: device-resident logits all-gather destination
+    /// (`world_size * vocab_local` bf16) + the on-device argmax kernel, both
+    /// lazily built once and reused every token. The gathered logits never leave
+    /// the GPU; only the 4-byte token index is read back.
+    logits_gather: std::cell::RefCell<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    device_argmax: std::cell::RefCell<Option<super::argmax::DeviceArgmax>>,
+    /// SKEIN_DEVICE_SENDRECV: reusable device recv buffer for the pipeline-parallel
+    /// boundary handoff (ncclRecv lands here; the consumer segment binds its ptr).
+    sendrecv_cache: std::cell::RefCell<Option<cudarc::driver::CudaSlice<half::bf16>>>,
+    /// The next-token index computed on-device this step (greedy argmax over the
+    /// gathered logits), stashed for the forward to read after the all-gather.
+    device_token: std::cell::Cell<Option<u32>>,
 }
 
 impl NcclCollective {
@@ -116,6 +128,10 @@ impl NcclCollective {
             world_size,
             recv_cache: std::cell::RefCell::new(None),
             shm,
+            logits_gather: std::cell::RefCell::new(None),
+            device_argmax: std::cell::RefCell::new(None),
+            device_token: std::cell::Cell::new(None),
+            sendrecv_cache: std::cell::RefCell::new(None),
         };
 
         // Cross-rank barrier so both ranks have zeroed the shm seq flags before
@@ -235,6 +251,159 @@ impl RankCollective for NcclCollective {
 
     fn shm_all_reduce_info(&self) -> Option<(u64, i32, i32, usize)> {
         self.shm.as_ref().map(|s| s.info())
+    }
+
+    unsafe fn logits_argmax_device(
+        &self,
+        local_ptr: u64,
+        local_elems: usize,
+    ) -> Result<u32, CollectiveError> {
+        use cudarc::driver::DevicePtr;
+        use std::mem::ManuallyDrop;
+        let total = local_elems * self.world_size;
+        // Lazy device-resident gather buffer (`world_size * vocab_local` bf16).
+        {
+            let mut g = self.logits_gather.borrow_mut();
+            if g.as_ref().map(|b| b.len()) != Some(total) {
+                *g = Some(self.stream.alloc_zeros::<half::bf16>(total).map_err(cuda_err)?);
+            }
+        }
+        // Lazy on-device argmax kernel (compiled once).
+        {
+            let mut a = self.device_argmax.borrow_mut();
+            if a.is_none() {
+                *a = Some(
+                    super::argmax::DeviceArgmax::new(self.stream.clone())
+                        .map_err(CollectiveError::Nccl)?,
+                );
+            }
+        }
+        // View the producer's local logit shard as bf16 WITHOUT owning it
+        // (ManuallyDrop ⇒ no free; the Luminal arena owns it). ncclAllGather lays
+        // rank r's shard at offset r*vocab_local, which matches the vocab-parallel
+        // slice ordering — so an argmax over the gathered buffer yields the global
+        // vocab index directly.
+        let send = ManuallyDrop::new(unsafe {
+            self.stream.upgrade_device_ptr::<half::bf16>(local_ptr, local_elems)
+        });
+        let mut g = self.logits_gather.borrow_mut();
+        let recv = g.as_mut().unwrap();
+        self.comm
+            .all_gather(&*send, recv)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclAllGather(bf16 logits): {e:?}")))?;
+        let (gptr, _guard) = recv.device_ptr(&self.stream);
+        let a = self.device_argmax.borrow();
+        let am = a.as_ref().unwrap();
+        unsafe { am.launch(gptr, total) }.map_err(CollectiveError::Nccl)?;
+        let tok = am.read_index().map_err(CollectiveError::Nccl)?;
+        // Only the 4-byte token crossed the bus this token (vs `vocab * 4` for the
+        // host logits read on the default path).
+        crate::perf_counters::record_d2h(std::mem::size_of::<u32>());
+        Ok(tok)
+    }
+
+    unsafe fn logits_argmax_local_device(
+        &self,
+        ptr: u64,
+        elems: usize,
+    ) -> Result<u32, CollectiveError> {
+        if ptr == 0 || elems == 0 {
+            return Err(CollectiveError::Nccl("empty logits buffer".to_string()));
+        }
+        {
+            let mut a = self.device_argmax.borrow_mut();
+            if a.is_none() {
+                *a = Some(
+                    super::argmax::DeviceArgmax::new(self.stream.clone())
+                        .map_err(CollectiveError::Nccl)?,
+                );
+            }
+        }
+        let a = self.device_argmax.borrow();
+        let am = a.as_ref().unwrap();
+        // The computed logits were D2D-copied into this buffer on the segment
+        // runtime's stream (a different stream than the argmax launches on). A
+        // context-wide sync guarantees that copy has completed before the argmax
+        // reads the buffer; syncing only the argmax stream would let it read the
+        // PREVIOUS token's logits (→ repeated tokens). The host read path got this
+        // ordering for free via its blocking D2H.
+        let ctx = self.stream.context();
+        ctx.bind_to_thread().map_err(|e| CollectiveError::Nccl(format!("bind_to_thread: {e}")))?;
+        unsafe { cudarc::driver::sys::cuCtxSynchronize() }
+            .result()
+            .map_err(|e| CollectiveError::Nccl(format!("cuCtxSynchronize: {e:?}")))?;
+        // Read-only argmax over the producer's own full-vocab logit buffer (PP
+        // last stage / TP without a gather). No all-gather, no cross-GPU binding —
+        // just the GPU argmax, then a 4-byte token read instead of the full-vocab
+        // host logits D2H.
+        unsafe { am.launch(ptr, elems) }.map_err(CollectiveError::Nccl)?;
+        let tok = am.read_index().map_err(CollectiveError::Nccl)?;
+        crate::perf_counters::record_d2h(std::mem::size_of::<u32>());
+        Ok(tok)
+    }
+
+    fn logits_scratch_ptr(&self, elems: usize) -> u64 {
+        use cudarc::driver::DevicePtr;
+        let mut g = self.logits_gather.borrow_mut();
+        if g.as_ref().map(|b| b.len()) != Some(elems) {
+            match self.stream.alloc_zeros::<half::bf16>(elems) {
+                Ok(b) => *g = Some(b),
+                Err(_) => return 0,
+            }
+        }
+        let buf = g.as_ref().unwrap();
+        let (p, _guard) = buf.device_ptr(&self.stream);
+        p
+    }
+
+    fn set_device_token(&self, tok: u32) {
+        self.device_token.set(Some(tok));
+    }
+
+    fn take_device_token(&self) -> Option<u32> {
+        self.device_token.take()
+    }
+
+    unsafe fn send_device_bf16(
+        &self,
+        ptr: u64,
+        elems: usize,
+        peer: usize,
+    ) -> Result<(), CollectiveError> {
+        use std::mem::ManuallyDrop;
+        if ptr == 0 || elems == 0 {
+            return Ok(());
+        }
+        // View the producer's boundary buffer as bf16 WITHOUT owning it
+        // (ManuallyDrop ⇒ no free; the Luminal arena owns it). ncclSend straight
+        // from the device — no D2H, no host staging.
+        // Ensure the producer stage's compute (it wrote the carry buffer) has
+        // completed before ncclSend reads it. The host path got this ordering for
+        // free via the D2H in read_by_id; the device path must sync explicitly.
+        self.stream.synchronize().map_err(cuda_err)?;
+        let send = ManuallyDrop::new(unsafe {
+            self.stream.upgrade_device_ptr::<half::bf16>(ptr, elems)
+        });
+        self.comm
+            .send(&*send, peer as i32)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclSend(bf16 dev): {e:?}")))?;
+        self.stream.synchronize().map_err(cuda_err)?;
+        Ok(())
+    }
+
+    fn recv_device_bf16(&self, elems: usize, peer: usize) -> Result<u64, CollectiveError> {
+        use cudarc::driver::DevicePtr;
+        let mut cache = self.sendrecv_cache.borrow_mut();
+        if cache.as_ref().map(|b| b.len()) != Some(elems) {
+            *cache = Some(self.stream.alloc_zeros::<half::bf16>(elems).map_err(cuda_err)?);
+        }
+        let buf = cache.as_mut().unwrap();
+        self.comm
+            .recv(buf, peer as i32)
+            .map_err(|e| CollectiveError::Nccl(format!("ncclRecv(bf16 dev): {e:?}")))?;
+        self.stream.synchronize().map_err(cuda_err)?;
+        let (p, _g) = buf.device_ptr(&self.stream);
+        Ok(p)
     }
 
     fn send_f32(&self, buf: &[f32], peer: usize) -> Result<(), CollectiveError> {

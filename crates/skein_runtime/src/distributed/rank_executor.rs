@@ -108,6 +108,21 @@ pub trait LocalSegments {
         None
     }
 
+    /// SKEIN_DEVICE_SENDRECV: bind a device buffer (`ptr`, `n_bytes`) as the
+    /// device-resident value of handoff `id` — used by the receiver of a
+    /// pipeline-parallel boundary SendRecv to make the just-`ncclRecv`'d buffer
+    /// the consumer segment's input without a host round-trip. Default: no-op.
+    fn set_device_handoff_by_id(&mut self, _id: HandoffId, _ptr: u64, _n_bytes: usize) {}
+
+    /// SKEIN_DEVICE_LOGITS: device→device copy of the *computed* value of named
+    /// output `name` into `dest_ptr` (`n_bytes`). Unlike `output_device_ptr_by_id`
+    /// (which returns a stale output slot for host-staged handoffs), this copies
+    /// the live computed result — the same path KV-cache writes use. Returns true
+    /// on success. Default: false (unsupported / name not found).
+    fn copy_output_to_device(&self, _name: &str, _dest_ptr: u64, _n_bytes: usize) -> bool {
+        false
+    }
+
     /// Launch the custom shm all-reduce on a luminal segment runtime's stream (so
     /// under SKEIN_CAPTURE it shares the capture stream with the segments).
     /// `data_ptr` is the handoff buffer; `shm_ptr` the cross-process mapped
@@ -211,6 +226,12 @@ impl<S: LocalSegments> RankExecutor<S> {
         // SKEIN_CAPTURE: route the device all-reduce through luminal (shared
         // capture stream). Checked once per forward.
         let capture = std::env::var_os("SKEIN_CAPTURE").is_some();
+        // SKEIN_DEVICE_LOGITS: compute the next-token argmax on-device from the
+        // device-resident logits all-gather (no full-vocab host read).
+        let device_logits = std::env::var_os("SKEIN_DEVICE_LOGITS").is_some();
+        // SKEIN_DEVICE_SENDRECV: device-resident pipeline-parallel boundary handoff
+        // (ncclSend/Recv across device pointers, no host round-trip).
+        let device_sendrecv = std::env::var_os("SKEIN_DEVICE_SENDRECV").is_some();
         for step in schedule {
             match step {
                 ResolvedSequenceStep::ExecuteSegment {
@@ -238,11 +259,39 @@ impl<S: LocalSegments> RankExecutor<S> {
                         let is_receiver = self.rank == receiver;
                         let runner = &mut self.runner;
                         timer.time_comm(|| -> Result<(), RankExecError> {
+                            // SKEIN_DEVICE_SENDRECV: device-resident boundary handoff
+                            // — ncclSend/Recv straight across device pointers, no host
+                            // D2H/H2D round-trip. Both ranks take this path identically
+                            // (same env + schedule), keeping the bf16 element counts in
+                            // lockstep. The sender's carry must be device-resident
+                            // (host_tensors excludes it under the flag); if it is not,
+                            // erroring here surfaces the mismatch rather than sending a
+                            // wrong-width buffer.
+                            if device_sendrecv {
+                                if is_sender {
+                                    let (ptr, e) = runner
+                                        .output_device_ptr_by_id(*tensor)
+                                        .ok_or_else(|| RankExecError::UnknownTensor(format!(
+                                            "SKEIN_DEVICE_SENDRECV: boundary tensor {tensor:?} not device-resident on sender",
+                                        )))?;
+                                    unsafe { collective.send_device_bf16(ptr, e, receiver) }?;
+                                } else if is_receiver {
+                                    let ptr = collective.recv_device_bf16(*elems, sender)?;
+                                    runner.set_device_handoff_by_id(*tensor, ptr, *elems * 2);
+                                }
+                                return Ok(());
+                            }
                             if is_sender {
                                 let buf = runner.read_by_id(*tensor)?;
+                                crate::perf_counters::record_d2h(
+                                    buf.len() * std::mem::size_of::<f32>(),
+                                );
                                 collective.send_f32(&buf, receiver)?;
                             } else if is_receiver {
                                 let buf = collective.recv_f32(sender, *elems)?;
+                                crate::perf_counters::record_h2d(
+                                    buf.len() * std::mem::size_of::<f32>(),
+                                );
                                 runner.write_by_id(*tensor, buf)?;
                             }
                             Ok(())
@@ -252,6 +301,31 @@ impl<S: LocalSegments> RankExecutor<S> {
                     if participants.iter().any(|p| *p as usize == self.rank) {
                         let runner = &mut self.runner;
                         timer.time_comm(|| -> Result<(), RankExecError> {
+                            // SKEIN_DEVICE_LOGITS: the final logits AllGather +
+                            // greedy argmax done entirely on-device. The producer's
+                            // bf16 logit shard is gathered across the TP group and
+                            // argmaxed on the GPU; the token is stashed on the
+                            // collective for the forward to read (4-byte D2H). No
+                            // full-vocab host materialization, no host write-back.
+                            if device_logits && *kind == CollectiveKind::AllGather {
+                                let dev = runner.output_device_ptr_by_id(*tensor);
+                                if std::env::var_os("SKEIN_FI_LOG").is_some() {
+                                    use std::sync::atomic::{AtomicBool, Ordering};
+                                    static ONCE: AtomicBool = AtomicBool::new(false);
+                                    if !ONCE.swap(true, Ordering::Relaxed) {
+                                        eprintln!(
+                                            "SKEIN_DEVICE_LOGITS: AllGather tensor device_ptr={:?}",
+                                            dev.map(|(_, e)| e)
+                                        );
+                                    }
+                                }
+                                if let Some((ptr, e)) = dev {
+                                    let tok =
+                                        unsafe { collective.logits_argmax_device(ptr, e) }?;
+                                    collective.set_device_token(tok);
+                                    return Ok(());
+                                }
+                            }
                             // Device-resident steady-state path: a RingAllReduce of
                             // a bf16 activation kept on-device is all-reduced IN
                             // PLACE by device pointer — no host Vec, no D2H/H2D. The

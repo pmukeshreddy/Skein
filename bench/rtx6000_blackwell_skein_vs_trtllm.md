@@ -165,3 +165,55 @@ Two findings, both real:
   (host-mediated collective, ~414 s for the demo batch). The fast path for real
   throughput is continuous batching in the multi-process NCCL `--gpus` loop,
   which is the remaining work — that loop is currently single-request lockstep.
+
+## Single-stream perf after device-logits + PP-pipelining (2026-05-24)
+
+All rows: `artifacts/LATEST` (the `2323e83e…` candidate artifact), prompt
+"The capital of France is", `--max-new-tokens 32`, greedy, CUDA 12.8 runtime.
+Every row's generated text contains a coherent "Paris".
+
+**Important:** this artifact is compiled **pp=2, tp=1** (pipeline-parallel:
+layers 0–15 on GPU0, 16–31 on GPU1, one `SendRecv` of `carry_pre_block_16` per
+token). The decode schedule is 3 steps; there is **no logits AllGather and no
+per-layer RingAllReduce**. So the TP-oriented levers do **not** engage here:
+`SKEIN_CAPTURE` (full-step capture) has empty windows on both stages, and
+`SKEIN_SHM_ALLREDUCE` has no all-reduce to accelerate. Decode is still
+graph-accelerated by luminal's internal per-segment graphs
+(`cuda_graph_instantiations=49`, `cuda_graph_replays=1764`).
+
+`decode_tokens_per_s = 1000/tpot_p50` is the per-stage GPU forward rate;
+`true_tokens_per_s` is the end-to-end single-stream rate (incl. sample/broadcast).
+The ~2.8× gap between them is the **PP serial-pipeline bubble** (one GPU idle
+while the other computes), not the logits read.
+
+| scenario | TPOT p50 (ms) | decode tok/s | true / aggregate tok/s | note |
+|---|---|---|---|---|
+| baseline (sparse+fp8+notrack+shm+capture+LL) | 10.41 | 96.7 | 34.4 (single) | shm/capture flags are no-ops on PP |
+| + `SKEIN_DEVICE_LOGITS=1` (on-device argmax) | 10.34 | 96.7 | 33.5 (single) | **correct, perf-neutral** — logits read isn't the bottleneck |
+| `SKEIN_PIPELINE_STREAMS=2` (1F1B overlap) | — | — | **90.6 aggregate** (~45/stream) | the real PP lever: both GPUs concurrent |
+| `SKEIN_PIPELINE_STREAMS=4` | — | — | 91.8 aggregate | plateaus (2 µbatches already fill 2 stages) |
+| TRT-LLM 1.2.1 (reference) | 11.22 | 89.1 | — | single-stream `1000/TPOT` |
+| Luminal DeepSeek-R1 8×H200 (reference) | 10.7 | 93.3 | — | single-stream `1000/ITL` |
+
+### Lever findings (honest)
+
+- **Lever #1 (device-resident logits + on-device argmax).** Implemented + the
+  bf16 argmax kernel is unit-tested (`cuda::argmax`). The TP all-gather form
+  doesn't exist on a PP artifact, so it was adapted to argmax the last stage's
+  full-vocab logits on-device. Correct (coherent Paris) but **perf-neutral**:
+  reading the *computed* logits requires a per-token context sync (the host read
+  path got that sync for free), which offsets the ~64 KB host-read it removes —
+  and the logits read isn't on the PP critical path anyway. Gated behind
+  `SKEIN_DEVICE_LOGITS`; default path unchanged.
+- **Lever #2 (multi-block shm all-reduce).** N/A — PP has no RingAllReduce.
+- **Device-resident PP `SendRecv`** (`SKEIN_DEVICE_SENDRECV`): wiring engages
+  (d2h→0) but the precompiled boundary segment expects a host-staged carry, so
+  binding a device buffer feeds wrong data (garbage). Making it correct needs a
+  **compile-time** change (emit the carry as a device output), out of scope here.
+- **STEP E calibrate:** fails (`missing cuBLASLt A input buffer`); skipped,
+  zero-impact on tok/s.
+
+**Takeaway:** single-stream decode is already competitive with the references
+(96.7 per-stage / 34.4 end-to-end). The real throughput win on this PP=2 box is
+**pipelining the two stages** (`SKEIN_PIPELINE_STREAMS`), giving **~91 aggregate
+tok/s** (2.6× the single-stream rate) by filling the pipeline bubble.
