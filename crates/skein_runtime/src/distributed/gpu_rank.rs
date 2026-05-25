@@ -1676,6 +1676,14 @@ impl RankServer {
         let mut decode_tokens_total = 0usize; // real emitted tokens (excludes padded rows)
         let mut max_active = 0usize;
         let mut tick = 0u64;
+        // Per-forward breakdown (SKEIN_PERF_CONTINUOUS_PP_MB_FINAL): where each
+        // 1F1B job's wall time goes. t_setup = host KV/input prep; t_launch =
+        // executor.run() (async kernel launch); t_wait = the D2H read that BLOCKS
+        // on GPU completion (read_by_id carry on stage0 / read LOGITS on stage1) —
+        // this captures the real GPU compute time; t_coll = collective send/recv.
+        let (mut t_setup_s, mut t_launch_s, mut t_wait_s, mut t_coll_s) =
+            (0f64, 0f64, 0f64, 0f64);
+        let mut job_count = 0u64;
         let wall_start = Instant::now();
 
         while completed < n_total {
@@ -1746,6 +1754,7 @@ impl RankServer {
                         } else {
                             res[(i - n_mb) * stage_mb..(i - n_mb + 1) * stage_mb].to_vec()
                         };
+                        let t0 = Instant::now();
                         {
                             let r = self.executor.runner_mut();
                             r.activate_request(kv_key, pos)?;
@@ -1753,14 +1762,17 @@ impl RankServer {
                             r.set_input_tokens(INPUT_TOKENS, input.iter().map(|&t| t as i32).collect());
                             r.set_position(pos);
                         }
+                        let t1 = Instant::now();
                         self.executor
                             .run(&compute, &self.collective)
                             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let t2 = Instant::now();
                         let buf = self
                             .executor
                             .runner()
                             .read_by_id(carry_id)
                             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let t3 = Instant::now();
                         if i == 0 {
                             if mb_log {
                                 eprintln!("MB_DBG rank={} stage0 job0 carry_buf_len={} (carry_elems={carry_elems})", self.layout.rank, buf.len());
@@ -1775,6 +1787,12 @@ impl RankServer {
                                 res[(i - 1) * stage_mb + r] = toks[r] as u32;
                             }
                         }
+                        let t4 = Instant::now();
+                        t_setup_s += (t1 - t0).as_secs_f64();
+                        t_launch_s += (t2 - t1).as_secs_f64();
+                        t_wait_s += (t3 - t2).as_secs_f64();
+                        t_coll_s += (t4 - t3).as_secs_f64();
+                        job_count += 1;
                     }
                     let toks = self.collective.recv_f32(receiver, stage_mb).map_err(to_rt)?;
                     for r in 0..stage_mb {
@@ -1800,6 +1818,7 @@ impl RankServer {
                         let k = i / n_mb;
                         let pos = active[m].pos + k;
                         let kv_key = active[m].kv_key;
+                        let tc0 = Instant::now();
                         let buf = if i == 0 {
                             self.collective.recv_f32(sender, carry_elems).map_err(to_rt)?
                         } else {
@@ -1808,6 +1827,7 @@ impl RankServer {
                                 .send_recv_f32(&send, sender, sender, carry_elems)
                                 .map_err(to_rt)?
                         };
+                        let tc1 = Instant::now();
                         {
                             let r = self.executor.runner_mut();
                             r.write_by_id(carry_id, buf)
@@ -1816,14 +1836,22 @@ impl RankServer {
                             r.advance_kv()?;
                             r.set_position(pos);
                         }
+                        let tc2 = Instant::now();
                         self.executor
                             .run(&compute, &self.collective)
                             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let tc3 = Instant::now();
                         let logits = self
                             .executor
                             .runner()
                             .read(LOGITS)
                             .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let tc4 = Instant::now();
+                        t_coll_s += (tc1 - tc0).as_secs_f64();
+                        t_setup_s += (tc2 - tc1).as_secs_f64();
+                        t_launch_s += (tc3 - tc2).as_secs_f64();
+                        t_wait_s += (tc4 - tc3).as_secs_f64();
+                        job_count += 1;
                         let next: Vec<u32> = (0..stage_mb)
                             .map(|r| {
                                 let lo = r * vocab;
@@ -1886,6 +1914,16 @@ impl RankServer {
                  prefill_bubble_s={prefill_s:.4} end_to_end_burst_s={end_to_end:.4} end_to_end_burst_tps={e2e:.2} \
                  per_user_avg_tps={:.2}",
                 if n_total > 0 { agg / n_total as f64 } else { 0.0 }
+            );
+            let jc = job_count.max(1) as f64;
+            let per = |s: f64| s / jc * 1000.0;
+            eprintln!(
+                "SKEIN_PERF_CONTINUOUS_PP_MB_BREAKDOWN jobs={job_count} \
+                 per_forward_ms={:.3} setup_ms={:.3} launch_ms={:.3} \
+                 gpu_compute_wait_ms={:.3} collective_ms={:.3} \
+                 (setup_s={t_setup_s:.3} launch_s={t_launch_s:.3} wait_s={t_wait_s:.3} coll_s={t_coll_s:.3})",
+                per(t_setup_s + t_launch_s + t_wait_s + t_coll_s),
+                per(t_setup_s), per(t_launch_s), per(t_wait_s), per(t_coll_s)
             );
         }
         let mut out = Vec::with_capacity(n_total);

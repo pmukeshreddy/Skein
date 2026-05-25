@@ -2721,6 +2721,7 @@ name = "skein_emit"
 version = "0.1.0"
 dependencies = [
  "luminal",
+ "luminal_cuda_lite",
  "safetensors 0.4.5",
  "serde",
  "serde_json",

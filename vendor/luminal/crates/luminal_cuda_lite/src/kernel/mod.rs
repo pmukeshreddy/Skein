@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub mod conv2d;
 pub mod cuda_graph;
+pub mod decode_attention;
 pub mod fusion;
 pub mod hlir;
 pub mod matmul2d;
@@ -19,6 +20,7 @@ pub mod rope;
 
 pub use conv2d::KernelConv2D;
 pub use cuda_graph::*;
+pub use decode_attention::{FusedDecodeAttnCustom, FusedDecodeAttnKernel, fused_decode_attention};
 pub use matmul2d::{
     Matmul2DCustom, Matmul2DKernel, linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t,
     matmul_3d, matmul_3d_t,

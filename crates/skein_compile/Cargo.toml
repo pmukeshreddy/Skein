@@ -13,7 +13,7 @@ default = []
 # Production CUDA build. Pulls in `luminal_cuda_lite` so `CudaComputeRuntime`
 # becomes available; without this feature the CPU `NativeComputeRuntime` is
 # the only `ComputeRuntime` impl (used by CI and GPU-less development).
-cuda = ["dep:luminal_cuda_lite"]
+cuda = ["dep:luminal_cuda_lite", "skein_emit/cuda"]
 
 [lib]
 path = "src/lib.rs"

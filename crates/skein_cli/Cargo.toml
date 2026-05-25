@@ -13,7 +13,7 @@ license      = { workspace = true }
 # development) — the library crates default to empty features, so the toggle
 # disables CUDA everywhere.
 default = ["cuda"]
-cuda = ["skein_compile/cuda", "skein_runtime/cuda", "skein_parity/cuda"]
+cuda = ["skein_compile/cuda", "skein_runtime/cuda", "skein_parity/cuda", "skein_emit/cuda"]
 
 # Hybrid layout: integration tests need to call into the command runners
 # directly. Both the library and the binary live in this crate.

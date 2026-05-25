@@ -8,6 +8,14 @@ license      = { workspace = true }
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Empty by default so the CPU build stays backend-free. `cuda` pulls in
+# `luminal_cuda_lite` so op_wiring can inject the fused decode-attention custom
+# op (gated by SKEIN_ATTENTION_BACKEND at compile time). Forwarded from
+# `skein_compile/cuda`.
+default = []
+cuda = ["dep:luminal_cuda_lite"]
+
 [dependencies]
 skein_ir    = { workspace = true }
 skein_cost  = { workspace = true }
@@ -18,3 +26,10 @@ toml        = { workspace = true }
 thiserror   = { workspace = true }
 safetensors = { workspace = true }
 tracing     = { workspace = true }
+
+# Optional CUDA backend (vendored via the workspace [patch]). Only needed for
+# the fused decode-attention custom op; gated behind the `cuda` feature.
+[dependencies.luminal_cuda_lite]
+git      = "https://github.com/luminal-ai/luminal"
+rev      = "e558ce68498df842107ccb32e316efff4801ccc1"
+optional = true

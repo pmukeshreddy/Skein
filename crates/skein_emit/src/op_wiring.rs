@@ -2312,24 +2312,50 @@ pub fn attention_fixed_cache(
     let v_full = v_cache * keep + v_new_b * is_cur_b;
 
     // GQA attention over the fixed cache, masking slots > position.
-    let k_full_hs = k_full.split_dims(2, head_dim); // [b, C, n_kv, d]
-    let v_full_hs = v_full.split_dims(2, head_dim);
-    let q5 = q_hs.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4)); // [b,n_kv,groups,1,d]
-    let k5 = k_full_hs.permute((0, 2, 3, 1)).expand_dim(2, kv_groups); // [b,n_kv,groups,d,C]
-    let v5 = v_full_hs.permute((0, 2, 1, 3)).expand_dim(2, kv_groups); // [b,n_kv,groups,C,d]
-    let scores = q5.matmul(k5) * scale; // [b,n_kv,groups,1,C]
-    let allowed = slots.le(pos_c).cast(DType::F32);
-    let bias = ((allowed - 1.0) * 1.0e9)
-        .expand_dim(0, batch)
-        .expand_dim(1, n_kv_heads)
-        .expand_dim(2, kv_groups)
-        .cast(scores.dtype); // [b,n_kv,groups,1,C]
-    let weights = (scores + bias).softmax(4);
-    let attn = weights.matmul(v5); // [b,n_kv,groups,1,d]
-    let attn = attn
-        .permute((0, 3, 1, 2, 4))
-        .merge_dims(3, 4)
-        .merge_dims(2, 3); // [b, 1, n_heads*d]
+    //
+    // Default lowering: broadcasted `Mul` + `SumReduce` over the FULL static
+    // cache (KV_CACHE_CAP slots) — materializes a `[b, n_heads, CAP, d]`
+    // intermediate and does work for every cache slot regardless of the real
+    // context length. SKEIN_ATTENTION_BACKEND=fused_decode swaps in a single
+    // fused NVRTC kernel (read the cache in place, early-exit at `position`),
+    // built only under the `cuda` feature.
+    #[cfg(feature = "cuda")]
+    let use_fused =
+        std::env::var("SKEIN_ATTENTION_BACKEND").ok().as_deref() == Some("fused_decode");
+    #[cfg(not(feature = "cuda"))]
+    let use_fused = false;
+
+    let attn = if use_fused {
+        #[cfg(feature = "cuda")]
+        {
+            let bsz = batch
+                .to_usize()
+                .expect("fused decode attention requires a static batch dim");
+            luminal_cuda_lite::kernel::fused_decode_attention(
+                q_hs, k_full, v_full, position, n_heads, n_kv_heads, head_dim, max_cache, bsz,
+            )
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            unreachable!("fused decode attention requires the `cuda` feature")
+        }
+    } else {
+        let k_full_hs = k_full.split_dims(2, head_dim); // [b, C, n_kv, d]
+        let v_full_hs = v_full.split_dims(2, head_dim);
+        let q5 = q_hs.split_dims(2, kv_groups).permute((0, 2, 3, 1, 4)); // [b,n_kv,groups,1,d]
+        let k5 = k_full_hs.permute((0, 2, 3, 1)).expand_dim(2, kv_groups); // [b,n_kv,groups,d,C]
+        let v5 = v_full_hs.permute((0, 2, 1, 3)).expand_dim(2, kv_groups); // [b,n_kv,groups,C,d]
+        let scores = q5.matmul(k5) * scale; // [b,n_kv,groups,1,C]
+        let allowed = slots.le(pos_c).cast(DType::F32);
+        let bias = ((allowed - 1.0) * 1.0e9)
+            .expand_dim(0, batch)
+            .expand_dim(1, n_kv_heads)
+            .expand_dim(2, kv_groups)
+            .cast(scores.dtype); // [b,n_kv,groups,1,C]
+        let weights = (scores + bias).softmax(4);
+        let attn = weights.matmul(v5); // [b,n_kv,groups,1,d]
+        attn.permute((0, 3, 1, 2, 4)).merge_dims(3, 4).merge_dims(2, 3) // [b, 1, n_heads*d]
+    };
 
     (attn, k_store, v_store)
 }
