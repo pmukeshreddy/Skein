@@ -349,6 +349,30 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
     let continuous_queue = std::env::var("SKEIN_CONTINUOUS_QUEUE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
+    // SKEIN_CONTINUOUS_PP_MICROBATCH=M (M>=2): each PP stage processes a batched
+    // microbatch of M requests per 1F1B tick (stage 1 emits M tokens/tick).
+    let continuous_mb = std::env::var("SKEIN_CONTINUOUS_PP_MICROBATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    // Distinct prompts for the continuous queue (each rank reads the same file →
+    // identical queue). Falls back to replicating the single `--prompt`.
+    let continuous_prompts: Vec<String> = if continuous_pp.is_some() {
+        match std::env::var_os("SKEIN_PROMPTS_FILE") {
+            Some(path) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| CliError::BadArgument(format!("read SKEIN_PROMPTS_FILE: {e}")))?;
+                let v: Vec<String> = serde_json::from_slice(&bytes).map_err(|e| {
+                    CliError::BadArgument(format!("parse SKEIN_PROMPTS_FILE: {e}"))
+                })?;
+                v.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
 
     // SKEIN_BATCHED_GEN + SKEIN_PROMPTS_FILE: batched decode of many prompts in
     // one captured forward per token (batch>1 graph + full-step CUDA-graph
@@ -400,14 +424,27 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
         }
         if let Some(slots) = continuous_pp {
             let qlen = continuous_queue.unwrap_or(slots * 2);
+            // Build the request queue, tokenized identically on every rank.
+            let enc = |p: &str| -> Vec<u32> {
+                match tokenizer.as_ref() {
+                    Some(t) => t.encode(p).unwrap_or_default(),
+                    None => Vec::new(),
+                }
+            };
+            let prompts: Vec<Vec<u32>> = if !continuous_prompts.is_empty() {
+                continuous_prompts.iter().map(|p| enc(p)).filter(|v| !v.is_empty()).collect()
+            } else {
+                let pt = enc(&prompt);
+                vec![pt; qlen.max(slots).max(1)]
+            };
             return gpu_rank::run_generation_continuous_pp(
                 &artifact_dir,
                 layout,
                 &rendezvous,
-                &prompt,
+                &prompts,
                 max_new,
                 slots,
-                qlen,
+                continuous_mb,
                 tokenizer.as_ref(),
             );
         }

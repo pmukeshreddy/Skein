@@ -1385,6 +1385,11 @@ impl RankServer {
         let mut completed = 0usize;
 
         self.executor.runner_mut().reset_kv_cache();
+        // Per-request paged KV device buffers: each in-flight request gets its OWN
+        // KV buffer (keyed by RequestId via req_kv_buffer). WITHOUT this the runner
+        // binds a single shared KV buffer, so concurrent slots clobber each other's
+        // KV (the first slot in a wave ends up decoding the last slot's KV).
+        self.executor.runner_mut().set_paged_device_kv(true);
         let wall_start = Instant::now();
         let mut prefill_s = 0.0f64; // lockstep-prefill (admit) wall — the continuous-batching bubble
         let mut decode_s = 0.0f64; // steady-state 1F1B decode wall (apples-to-apples throughput metric)
@@ -1558,6 +1563,329 @@ impl RankServer {
                  decode_s={decode_s:.4} aggregate_decode_tokens_per_s={agg:.2} \
                  prefill_bubble_s={prefill_s:.4} end_to_end_s={end_to_end:.4} end_to_end_tokens_per_s={e2e_tps:.2} \
                  max_slots={max_slots}"
+            );
+        }
+        let mut out = Vec::with_capacity(n_total);
+        for (_idx, toks) in results {
+            out.push(GenResult { tokens: toks, decode_tokens_per_s: agg, ..Default::default() });
+        }
+        Ok(out)
+    }
+
+    /// Argmax `stage_mb` rows of a [`stage_mb`, vocab] PP last-stage logits buffer
+    /// (TP=1 → no rank interleave) and broadcast the chosen tokens from the last
+    /// stage to the earlier stage (which needs them for its next embed). Collective.
+    fn sample_batched_pp(&self, logits: &[f32], stage_mb: usize) -> Result<Vec<u32>, RuntimeError> {
+        let vocab = self.vocab as usize;
+        let next: Vec<u32> = if self.is_last_stage {
+            (0..stage_mb)
+                .map(|r| {
+                    let lo = r * vocab;
+                    let hi = ((r + 1) * vocab).min(logits.len());
+                    if lo < hi { argmax(&logits[lo..hi]) } else { 0 }
+                })
+                .collect()
+        } else {
+            vec![0u32; stage_mb]
+        };
+        let mut buf: Vec<f32> = next.iter().map(|&t| t as f32).collect();
+        self.collective.broadcast(&mut buf, self.last_stage_root).map_err(to_rt)?;
+        Ok(buf.iter().map(|&f| f as u32).collect())
+    }
+
+    /// PP=2 dynamic continuous batching with STAGE MICROBATCH = `stage_mb`: each
+    /// 1F1B job is a BATCHED forward of `stage_mb` requests, so stage 1 emits
+    /// `stage_mb` real tokens per pipeline tick (vs 1 in run_continuous_pipelined).
+    /// Goal: break the 1-token/tick per-stage ceiling — if a batched tick costs
+    /// < `stage_mb`× a single tick, aggregate decode throughput exceeds the
+    /// microbatch=1 ~93. Requires a FORCE_BATCH=`stage_mb` graph (the kvcache +
+    /// PP carry tensors are batch-sized).
+    ///
+    /// KV isolation: each in-flight microbatch gets its OWN batched KV via a
+    /// per-microbatch key (`kv_key`) + `set_decode_batch(stage_mb)`; req_kv_buffer
+    /// allocates a per-key batch buffer, so concurrent microbatches don't clobber.
+    /// Rows in one microbatch share the scalar position (same-length assumed).
+    /// PP=2 only (falls back to sequential generate).
+    pub fn run_continuous_pipelined_mb(
+        &mut self,
+        prompts: &[Vec<u32>],
+        max_new_tokens: usize,
+        max_microbatches: usize,
+        stage_mb: usize,
+    ) -> Result<Vec<GenResult>, RuntimeError> {
+        let n_total = prompts.len();
+        let vocab = self.vocab as usize;
+        let compute: Vec<ResolvedSequenceStep> = self
+            .schedule_resolved
+            .iter()
+            .filter(|s| {
+                !matches!(
+                    s,
+                    ResolvedSequenceStep::Collective { collective: CollectiveKind::SendRecv, .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let carry = self.schedule_resolved.iter().find_map(|s| match s {
+            ResolvedSequenceStep::Collective {
+                collective: CollectiveKind::SendRecv,
+                participants,
+                tensor,
+                elems,
+            } => Some((*tensor, *elems, participants[0] as usize, participants[1] as usize)),
+            _ => None,
+        });
+        let needs_fallback = self.pp != 2 || carry.is_none() || stage_mb < 1 || n_total == 0;
+        if needs_fallback {
+            let mut out = Vec::with_capacity(n_total);
+            for p in prompts {
+                out.push(self.generate(p, max_new_tokens)?);
+            }
+            return Ok(out);
+        }
+        let (carry_id, carry_elems, sender, receiver) = carry.unwrap();
+        let is_first = self.layout.rank == sender;
+        let is_last = self.layout.rank == receiver;
+        let mb_log = std::env::var_os("SKEIN_CONTINUOUS_PP_MB_LOG").is_some();
+        if mb_log {
+            eprintln!(
+                "MB_DBG rank={} carry_elems={carry_elems} stage_mb={stage_mb} is_first={is_first} is_last={is_last}",
+                self.layout.rank
+            );
+        }
+
+        self.executor.runner_mut().reset_kv_cache();
+        self.executor.runner_mut().set_decode_batch(stage_mb);
+        // Per-microbatch paged KV: each microbatch gets its OWN batched KV buffer
+        // (keyed by kv_key) so concurrent microbatches don't clobber each other.
+        self.executor.runner_mut().set_paged_device_kv(true);
+
+        struct Mb {
+            idxs: Vec<usize>,        // original prompt indices (real rows only)
+            kv_key: crate::types::RequestId,
+            pos: usize,              // shared position of all rows
+            last: Vec<u32>,          // last token per row (len stage_mb)
+            generated: Vec<Vec<u32>>, // generated tokens per row (len stage_mb)
+        }
+        let mut active: Vec<Mb> = Vec::new();
+        let mut next_idx = 0usize;
+        let mut results: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut completed = 0usize; // real requests retired
+        let mut prefill_s = 0.0f64;
+        let mut decode_s = 0.0f64;
+        let mut decode_tokens_total = 0usize; // real emitted tokens (excludes padded rows)
+        let mut max_active = 0usize;
+        let mut tick = 0u64;
+        let wall_start = Instant::now();
+
+        while completed < n_total {
+            // (1) ADMIT: form microbatches of stage_mb prompts; lockstep batched prefill.
+            let admit_t = Instant::now();
+            while active.len() < max_microbatches && next_idx < n_total {
+                let mut idxs: Vec<usize> = Vec::new();
+                let mut mbp: Vec<Vec<u32>> = Vec::new();
+                while mbp.len() < stage_mb && next_idx < n_total {
+                    if !prompts[next_idx].is_empty() {
+                        idxs.push(next_idx);
+                        mbp.push(prompts[next_idx].clone());
+                    }
+                    next_idx += 1;
+                }
+                if mbp.is_empty() {
+                    continue;
+                }
+                // Pad to stage_mb rows (repeat last) so the batch graph always gets
+                // stage_mb rows; padded rows are never emitted/retired.
+                while mbp.len() < stage_mb {
+                    mbp.push(mbp[mbp.len() - 1].clone());
+                }
+                let kv_key = crate::types::RequestId::next();
+                let matched = self.executor.runner_mut().admit_request(kv_key, &mbp[0])?;
+                self.executor.runner_mut().activate_request(kv_key, matched)?;
+                let lmax = mbp.iter().map(|p| p.len()).max().unwrap();
+                let mut logits = Vec::new();
+                for pos in 0..lmax {
+                    let toks: Vec<u32> =
+                        (0..stage_mb).map(|r| mbp[r].get(pos).copied().unwrap_or(0)).collect();
+                    logits = self.forward_step_tokens(&toks, pos)?;
+                }
+                let first = self.sample_batched_pp(&logits, stage_mb)?;
+                let generated: Vec<Vec<u32>> = (0..stage_mb).map(|r| vec![first[r]]).collect();
+                active.push(Mb { idxs, kv_key, pos: lmax, last: first, generated });
+            }
+            prefill_s += admit_t.elapsed().as_secs_f64();
+            if mb_log {
+                eprintln!("MB_DBG rank={} PREFILL_DONE active_microbatches={}", self.layout.rank, active.len());
+            }
+            if active.is_empty() {
+                break;
+            }
+            max_active = max_active.max(active.len());
+
+            // (2) DECODE WAVE: 1F1B over the active microbatches; `steps` rounds.
+            let n_mb = active.len();
+            let steps = active
+                .iter()
+                .map(|mb| max_new_tokens.saturating_sub(mb.generated[0].len()))
+                .filter(|&r| r > 0)
+                .min()
+                .unwrap_or(0);
+            let dec_t = Instant::now();
+            if steps > 0 {
+                let njobs = steps * n_mb;
+                if is_first {
+                    // res[job*stage_mb + r] = token for microbatch job's row r.
+                    let mut res: Vec<u32> = vec![0u32; njobs * stage_mb];
+                    for i in 0..njobs {
+                        let m = i % n_mb;
+                        let k = i / n_mb;
+                        let pos = active[m].pos + k;
+                        let kv_key = active[m].kv_key;
+                        let input: Vec<u32> = if k == 0 {
+                            active[m].last.clone()
+                        } else {
+                            res[(i - n_mb) * stage_mb..(i - n_mb + 1) * stage_mb].to_vec()
+                        };
+                        {
+                            let r = self.executor.runner_mut();
+                            r.activate_request(kv_key, pos)?;
+                            r.advance_kv()?;
+                            r.set_input_tokens(INPUT_TOKENS, input.iter().map(|&t| t as i32).collect());
+                            r.set_position(pos);
+                        }
+                        self.executor
+                            .run(&compute, &self.collective)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let buf = self
+                            .executor
+                            .runner()
+                            .read_by_id(carry_id)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        if i == 0 {
+                            if mb_log {
+                                eprintln!("MB_DBG rank={} stage0 job0 carry_buf_len={} (carry_elems={carry_elems})", self.layout.rank, buf.len());
+                            }
+                            self.collective.send_f32(&buf, receiver).map_err(to_rt)?;
+                        } else {
+                            let toks = self
+                                .collective
+                                .send_recv_f32(&buf, receiver, receiver, stage_mb)
+                                .map_err(to_rt)?;
+                            for r in 0..stage_mb {
+                                res[(i - 1) * stage_mb + r] = toks[r] as u32;
+                            }
+                        }
+                    }
+                    let toks = self.collective.recv_f32(receiver, stage_mb).map_err(to_rt)?;
+                    for r in 0..stage_mb {
+                        res[(njobs - 1) * stage_mb + r] = toks[r] as u32;
+                    }
+                    for k in 0..steps {
+                        for m in 0..n_mb {
+                            let job = k * n_mb + m;
+                            for r in 0..stage_mb {
+                                let t = res[job * stage_mb + r];
+                                active[m].generated[r].push(t);
+                                active[m].last[r] = t;
+                            }
+                        }
+                    }
+                    for mb in active.iter_mut() {
+                        mb.pos += steps;
+                    }
+                } else if is_last {
+                    let mut last_tokens = vec![0u32; stage_mb];
+                    for i in 0..njobs {
+                        let m = i % n_mb;
+                        let k = i / n_mb;
+                        let pos = active[m].pos + k;
+                        let kv_key = active[m].kv_key;
+                        let buf = if i == 0 {
+                            self.collective.recv_f32(sender, carry_elems).map_err(to_rt)?
+                        } else {
+                            let send: Vec<f32> = last_tokens.iter().map(|&t| t as f32).collect();
+                            self.collective
+                                .send_recv_f32(&send, sender, sender, carry_elems)
+                                .map_err(to_rt)?
+                        };
+                        {
+                            let r = self.executor.runner_mut();
+                            r.write_by_id(carry_id, buf)
+                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                            r.activate_request(kv_key, pos)?;
+                            r.advance_kv()?;
+                            r.set_position(pos);
+                        }
+                        self.executor
+                            .run(&compute, &self.collective)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let logits = self
+                            .executor
+                            .runner()
+                            .read(LOGITS)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let next: Vec<u32> = (0..stage_mb)
+                            .map(|r| {
+                                let lo = r * vocab;
+                                let hi = ((r + 1) * vocab).min(logits.len());
+                                if lo < hi { argmax(&logits[lo..hi]) } else { 0 }
+                            })
+                            .collect();
+                        for r in 0..stage_mb {
+                            active[m].generated[r].push(next[r]);
+                            active[m].last[r] = next[r];
+                        }
+                        last_tokens = next;
+                    }
+                    let send: Vec<f32> = last_tokens.iter().map(|&t| t as f32).collect();
+                    self.collective.send_f32(&send, sender).map_err(to_rt)?;
+                    for mb in active.iter_mut() {
+                        mb.pos += steps;
+                    }
+                }
+                // Real emitted tokens this wave = steps × (real rows across microbatches).
+                let real_rows: usize = active.iter().map(|mb| mb.idxs.len()).sum();
+                decode_tokens_total += steps * real_rows;
+                tick += njobs as u64;
+            }
+            decode_s += dec_t.elapsed().as_secs_f64();
+
+            if self.layout.is_leader() && std::env::var_os("SKEIN_CONTINUOUS_PP_MB_LOG").is_some() {
+                let s0: Vec<&Vec<usize>> = active.iter().map(|mb| &mb.idxs).collect();
+                eprintln!(
+                    "SKEIN_PERF_CONTINUOUS_PP_MB tick={tick} stage_microbatch={stage_mb} \
+                     active_microbatches={n_mb} stage0_mb={s0:?} stage1_mb={s0:?} emitted_tokens_per_tick={stage_mb}"
+                );
+            }
+
+            // (3) RETIRE finished microbatches (all real rows hit max_new).
+            let mut still: Vec<Mb> = Vec::with_capacity(active.len());
+            for mb in active.drain(..) {
+                if mb.generated[0].len() >= max_new_tokens {
+                    for (r, &idx) in mb.idxs.iter().enumerate() {
+                        results.push((idx, mb.generated[r].clone()));
+                        completed += 1;
+                    }
+                    let _ = self.executor.runner_mut().release_request(mb.kv_key);
+                } else {
+                    still.push(mb);
+                }
+            }
+            active = still;
+        }
+
+        results.sort_by_key(|(idx, _)| *idx);
+        let agg = if decode_s > 0.0 { decode_tokens_total as f64 / decode_s } else { 0.0 };
+        let end_to_end = wall_start.elapsed().as_secs_f64();
+        let e2e = if end_to_end > 0.0 { decode_tokens_total as f64 / end_to_end } else { 0.0 };
+        if self.layout.is_leader() {
+            eprintln!(
+                "SKEIN_PERF_CONTINUOUS_PP_MB_FINAL stage_microbatch={stage_mb} total_prompts={n_total} \
+                 completed_reqs={completed} max_active_microbatches={max_active} decode_tokens={decode_tokens_total} \
+                 decode_s={decode_s:.4} decode_only_aggregate_tps={agg:.2} \
+                 prefill_bubble_s={prefill_s:.4} end_to_end_burst_s={end_to_end:.4} end_to_end_burst_tps={e2e:.2} \
+                 per_user_avg_tps={:.2}",
+                if n_total > 0 { agg / n_total as f64 } else { 0.0 }
             );
         }
         let mut out = Vec::with_capacity(n_total);
@@ -1817,41 +2145,34 @@ pub fn run_generation_continuous_pp(
     artifact_dir: &Path,
     layout: WorldLayout,
     rendezvous_path: &Path,
-    prompt: &str,
+    prompts: &[Vec<u32>],
     max_new_tokens: usize,
     max_slots: usize,
-    queue_len: usize,
+    stage_mb: usize,
     tokenizer: Option<&SkeinTokenizer>,
 ) -> Result<Option<String>, RuntimeError> {
     let mut server = RankServer::bootstrap(artifact_dir, layout, rendezvous_path)?;
-    let prompt_tokens: Vec<u32> = if layout.is_leader() {
-        match tokenizer {
-            Some(tok) => tok.encode(prompt)?,
-            None => {
-                let vocab = server.vocab().max(1);
-                prompt.bytes().map(|b| (b as u32) % vocab).collect()
-            }
-        }
+    // `prompts` is already tokenized identically on every rank (caller reads the
+    // same SKEIN_PROMPTS_FILE / replicates the same prompt), so both PP stages
+    // build the same queue and stay matched.
+    let results = if stage_mb >= 2 {
+        server.run_continuous_pipelined_mb(prompts, max_new_tokens, max_slots, stage_mb)?
     } else {
-        Vec::new()
+        server.run_continuous_pipelined(prompts, max_new_tokens, max_slots)?
     };
-    let prompt_tokens = server.broadcast_prompt(if layout.is_leader() {
-        Some(&prompt_tokens)
-    } else {
-        None
-    })?;
-    // Queue of independent requests (>= max_slots so join/leave actually happens).
-    let qlen = queue_len.max(max_slots).max(1);
-    let prompts: Vec<Vec<u32>> = vec![prompt_tokens; qlen];
-    let results = server.run_continuous_pipelined(&prompts, max_new_tokens, max_slots)?;
 
     if layout.is_leader() {
-        let tokens = results.first().map(|r| r.tokens.as_slice()).unwrap_or(&[]);
-        let text = match tokenizer {
-            Some(tok) => tok.decode(tokens)?,
-            None => format!("{tokens:?}"),
-        };
-        Ok(Some(text))
+        let mut s = String::new();
+        for (i, r) in results.iter().enumerate() {
+            let first = r.tokens.first().copied().unwrap_or(0);
+            let text = match tokenizer {
+                Some(tok) => tok.decode(&r.tokens).unwrap_or_default(),
+                None => format!("{:?}", &r.tokens),
+            };
+            let head: String = text.chars().take(80).collect();
+            s.push_str(&format!("prompt{i} first_token={first} text={head:?}\n"));
+        }
+        Ok(Some(s))
     } else {
         Ok(None)
     }
