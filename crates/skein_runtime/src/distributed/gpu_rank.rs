@@ -962,11 +962,23 @@ impl RankServer {
         // so it is a clean steady-state batched-decode measurement at full context.
         let mut decode_start = Instant::now();
         let total_steps = (lmax - 1) + max_new_tokens;
+        // STEP-6 proof counters. ONE `forward_step_tokens` call == ONE batched
+        // graph step that advances ALL `n` rows together; it is NOT a loop of
+        // `n` single-row forwards. `forward_steps` counts graph steps (not
+        // per-request forwards); `decode_tokens_emitted` counts generated tokens.
+        // Invariant proven in the leader log below: decode_tokens_emitted ≈
+        // active_decode_batch_size × decode_forward_steps — each steady-state
+        // graph step yields N decode tokens, not N steps yielding one each.
+        let mut forward_steps = 0usize;
+        let mut decode_forward_steps = 0usize;
+        let mut decode_tokens_emitted = 0usize;
+        let batch_log = std::env::var_os("SKEIN_BATCH_LOG").is_some() && self.layout.is_leader();
         for pos in 0..total_steps {
             if pos == lmax - 1 {
                 decode_start = Instant::now();
             }
             let logits = self.forward_step_tokens(&cur, pos)?;
+            forward_steps += 1;
             // De-interleave the rank-major all-gathered logits per row and argmax
             // over the full vocab. (Every TP rank holds the same gathered logits,
             // so all ranks pick identical next tokens → stays in lockstep.)
@@ -989,19 +1001,51 @@ impl RankServer {
             // Per-row update: still in this row's prompt → feed its next prompt
             // token (no emit); otherwise this output is one of its generated
             // tokens → record (until it has max_new) and feed it back.
+            let mut active_decode = 0usize; // rows that emitted a decode token THIS step
             for r in 0..n {
                 if pos + 1 < plen[r] {
                     cur[r] = prompts[r][pos + 1];
                 } else {
                     if genr[r].len() < max_new_tokens {
                         genr[r].push(next[r]);
+                        active_decode += 1;
                     }
                     cur[r] = next[r];
                 }
             }
+            decode_tokens_emitted += active_decode;
+            if pos >= lmax - 1 {
+                decode_forward_steps += 1;
+            }
+            if batch_log {
+                eprintln!(
+                    "SKEIN_BATCH_LOG step pos={pos} forward_steps=1 \
+                     active_decode_batch_size={active_decode} decode_tokens_this_step={active_decode}"
+                );
+            }
         }
         let decode_s = decode_start.elapsed().as_secs_f64();
         self.executor.runner_mut().set_decode_batch(1);
+        if self.layout.is_leader() {
+            // PROOF that batching is real: `forward_steps` graph steps produced
+            // `decode_tokens_emitted` tokens with up to N rows advancing PER step
+            // — not one graph step per request-token. In the steady-state window
+            // (pos >= lmax-1) every step's active_decode_batch_size == N.
+            let tps = if decode_s > 0.0 {
+                decode_tokens_emitted as f64 / decode_s
+            } else {
+                0.0
+            };
+            tracing::info!(
+                active_decode_batch_size = n,
+                forward_steps,
+                decode_forward_steps,
+                decode_tokens_emitted,
+                decode_s,
+                aggregate_decode_tokens_per_s = tps,
+                "SKEIN_PERF_BATCHED: ONE forward_step_tokens per step drives all N rows (batched decode)"
+            );
+        }
         Ok((genr, decode_s))
     }
 
@@ -1271,6 +1315,257 @@ impl RankServer {
         }
         Ok(out)
     }
+
+    /// Dynamic PP=2 continuous batching. Keeps up to `max_slots` requests in
+    /// flight, 1F1B-overlapped so stage 0 (GPU0) computes one request's first half
+    /// while stage 1 (GPU1) finishes the previous request's second half. New
+    /// requests are admitted from `prompts` (a queue) as slots free up; finished
+    /// requests are retired. Unlike [`generate_pipelined`] (a *fixed* set decoded
+    /// together), the active set changes over time — requests join/leave.
+    ///
+    /// Per-request positions ARE supported (each 1F1B job is a single-request
+    /// forward at that request's own position via `activate_request`), so slots at
+    /// different absolute positions co-exist — no same-position limitation.
+    ///
+    /// Determinism (why both ranks stay matched without extra coordination): both
+    /// read the same `prompts` queue and both observe every sampled token (stage 1
+    /// samples; stage 0 receives it back over the 1F1B exchange), so admit/retire
+    /// decisions are byte-identical on both ranks — same trick as
+    /// [`run_generation_batched`]. Each admit does a lockstep prefill (a brief
+    /// pipeline bubble). pp==2 only; falls back to sequential [`generate`].
+    pub fn run_continuous_pipelined(
+        &mut self,
+        prompts: &[Vec<u32>],
+        max_new_tokens: usize,
+        max_slots: usize,
+    ) -> Result<Vec<GenResult>, RuntimeError> {
+        let n_total = prompts.len();
+        let compute: Vec<ResolvedSequenceStep> = self
+            .schedule_resolved
+            .iter()
+            .filter(|s| {
+                !matches!(
+                    s,
+                    ResolvedSequenceStep::Collective { collective: CollectiveKind::SendRecv, .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let carry = self.schedule_resolved.iter().find_map(|s| match s {
+            ResolvedSequenceStep::Collective {
+                collective: CollectiveKind::SendRecv,
+                participants,
+                tensor,
+                elems,
+            } => Some((*tensor, *elems, participants[0] as usize, participants[1] as usize)),
+            _ => None,
+        });
+        let needs_fallback = self.pp != 2 || carry.is_none() || max_slots < 2 || n_total == 0;
+        if needs_fallback {
+            let mut out = Vec::with_capacity(n_total);
+            for p in prompts {
+                out.push(self.generate(p, max_new_tokens)?);
+            }
+            return Ok(out);
+        }
+        let (carry_id, carry_elems, sender, receiver) = carry.unwrap();
+        let is_first = self.layout.rank == sender;
+        let is_last = self.layout.rank == receiver;
+
+        struct Slot {
+            idx: usize,
+            id: crate::types::RequestId,
+            pos: usize,
+            last_token: u32,
+            generated: Vec<u32>,
+        }
+        let mut active: Vec<Slot> = Vec::new();
+        let mut next_prompt = 0usize;
+        let mut results: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut completed = 0usize;
+
+        self.executor.runner_mut().reset_kv_cache();
+        let wall_start = Instant::now();
+        let mut prefill_s = 0.0f64; // lockstep-prefill (admit) wall — the continuous-batching bubble
+        let mut decode_s = 0.0f64; // steady-state 1F1B decode wall (apples-to-apples throughput metric)
+        let mut decode_tokens_total = 0usize; // steady-state decode tokens (excludes the prefill first token)
+
+        while completed < n_total {
+            // (1) ADMIT: fill free slots from the queue, lockstep-prefilling each.
+            let admit_t = Instant::now();
+            while active.len() < max_slots && next_prompt < n_total {
+                let p = &prompts[next_prompt];
+                if p.is_empty() {
+                    next_prompt += 1;
+                    continue;
+                }
+                let id = crate::types::RequestId::next();
+                let matched = self.executor.runner_mut().admit_request(id, p)?;
+                self.executor.runner_mut().activate_request(id, matched)?;
+                let start = matched.min(p.len().saturating_sub(1));
+                let mut pos = start;
+                let mut logits = Vec::new();
+                for &tok in &p[start..] {
+                    logits = self.forward_step(tok, pos)?;
+                    pos += 1;
+                }
+                let first = self.sample_and_sync(&logits)?;
+                active.push(Slot { idx: next_prompt, id, pos, last_token: first, generated: vec![first] });
+                next_prompt += 1;
+            }
+            prefill_s += admit_t.elapsed().as_secs_f64();
+            if active.is_empty() {
+                break;
+            }
+
+            // (2) DECODE WAVE: run `steps` 1F1B rounds over the active slots, where
+            // `steps` = tokens until the soonest slot reaches max_new (so a slot
+            // frees promptly for a new admit). Round-robin job order m + k*n keeps
+            // stage0/stage1 in lockstep; both ranks update slots identically.
+            let n = active.len();
+            let steps = active
+                .iter()
+                .map(|s| max_new_tokens.saturating_sub(s.generated.len()))
+                .filter(|&r| r > 0)
+                .min()
+                .unwrap_or(0);
+            let dec_t = Instant::now();
+            if steps > 0 {
+                let njobs = steps * n;
+                if is_first {
+                    let mut res: Vec<u32> = vec![0u32; njobs];
+                    for i in 0..njobs {
+                        let m = i % n;
+                        let k = i / n;
+                        let input = if k == 0 { active[m].last_token } else { res[i - n] };
+                        let pos = active[m].pos + k;
+                        let id = active[m].id;
+                        {
+                            let r = self.executor.runner_mut();
+                            r.activate_request(id, pos)?;
+                            r.advance_kv()?;
+                            r.set_input_tokens(INPUT_TOKENS, vec![input as i32]);
+                            r.set_position(pos);
+                        }
+                        self.executor
+                            .run(&compute, &self.collective)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let buf = self
+                            .executor
+                            .runner()
+                            .read_by_id(carry_id)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        if i == 0 {
+                            self.collective.send_f32(&buf, receiver).map_err(to_rt)?;
+                        } else {
+                            let tok = self
+                                .collective
+                                .send_recv_f32(&buf, receiver, receiver, 1)
+                                .map_err(to_rt)?;
+                            res[i - 1] = tok[0] as u32;
+                        }
+                    }
+                    let tok = self.collective.recv_f32(receiver, 1).map_err(to_rt)?;
+                    res[njobs - 1] = tok[0] as u32;
+                    for k in 0..steps {
+                        for m in 0..n {
+                            let t = res[k * n + m];
+                            active[m].generated.push(t);
+                            active[m].last_token = t;
+                        }
+                    }
+                    for s in active.iter_mut() {
+                        s.pos += steps;
+                    }
+                } else if is_last {
+                    let mut last_token: u32 = 0;
+                    for i in 0..njobs {
+                        let m = i % n;
+                        let k = i / n;
+                        let pos = active[m].pos + k;
+                        let id = active[m].id;
+                        let buf = if i == 0 {
+                            self.collective.recv_f32(sender, carry_elems).map_err(to_rt)?
+                        } else {
+                            self.collective
+                                .send_recv_f32(&[last_token as f32], sender, sender, carry_elems)
+                                .map_err(to_rt)?
+                        };
+                        {
+                            let r = self.executor.runner_mut();
+                            r.write_by_id(carry_id, buf)
+                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                            r.activate_request(id, pos)?;
+                            r.advance_kv()?;
+                            r.set_position(pos);
+                        }
+                        self.executor
+                            .run(&compute, &self.collective)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let logits = self
+                            .executor
+                            .runner()
+                            .read(LOGITS)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
+                        let next = argmax(&logits);
+                        active[m].generated.push(next);
+                        active[m].last_token = next;
+                        last_token = next;
+                    }
+                    self.collective.send_f32(&[last_token as f32], sender).map_err(to_rt)?;
+                    for s in active.iter_mut() {
+                        s.pos += steps;
+                    }
+                }
+                decode_tokens_total += steps * n;
+            }
+            decode_s += dec_t.elapsed().as_secs_f64();
+
+            // (3) RETIRE finished slots; free their pages for a later admit.
+            let mut still: Vec<Slot> = Vec::with_capacity(active.len());
+            for s in active.drain(..) {
+                if s.generated.len() >= max_new_tokens {
+                    results.push((s.idx, s.generated.clone()));
+                    completed += 1;
+                    let _ = self.executor.runner_mut().release_request(s.id);
+                } else {
+                    still.push(s);
+                }
+            }
+            active = still;
+
+            if self.layout.is_leader() {
+                // Headline = decode-only (excludes the lockstep-prefill bubble), the
+                // apples-to-apples match to the fixed SKEIN_PIPELINE_STREAMS metric.
+                let agg = if decode_s > 0.0 { decode_tokens_total as f64 / decode_s } else { 0.0 };
+                let inflight: Vec<usize> = active.iter().map(|s| s.idx).collect();
+                eprintln!(
+                    "SKEIN_PERF_CONTINUOUS_PP active_streams={n} \
+                     aggregate_decode_tokens_per_s={agg:.2} per_user_tokens_per_s={:.2} \
+                     stage0_req={inflight:?} stage1_req={inflight:?} completed_reqs={completed}",
+                    agg / (n as f64).max(1.0),
+                );
+            }
+        }
+
+        results.sort_by_key(|(idx, _)| *idx);
+        let agg = if decode_s > 0.0 { decode_tokens_total as f64 / decode_s } else { 0.0 };
+        let end_to_end = wall_start.elapsed().as_secs_f64();
+        let e2e_tps = if end_to_end > 0.0 { decode_tokens_total as f64 / end_to_end } else { 0.0 };
+        if self.layout.is_leader() {
+            eprintln!(
+                "SKEIN_PERF_CONTINUOUS_PP FINAL completed_reqs={completed} total_decode_tokens={decode_tokens_total} \
+                 decode_s={decode_s:.4} aggregate_decode_tokens_per_s={agg:.2} \
+                 prefill_bubble_s={prefill_s:.4} end_to_end_s={end_to_end:.4} end_to_end_tokens_per_s={e2e_tps:.2} \
+                 max_slots={max_slots}"
+            );
+        }
+        let mut out = Vec::with_capacity(n_total);
+        for (_idx, toks) in results {
+            out.push(GenResult { tokens: toks, decode_tokens_per_s: agg, ..Default::default() });
+        }
+        Ok(out)
+    }
 }
 
 /// One generation's tokens plus paged-KV / timing telemetry.
@@ -1499,6 +1794,56 @@ pub fn run_generation_pipelined(
     // pages + decode trajectory) so the aggregate reflects real concurrent work.
     let prompts: Vec<Vec<u32>> = vec![prompt_tokens; n_streams.max(1)];
     let results = server.generate_pipelined(&prompts, max_new_tokens)?;
+
+    if layout.is_leader() {
+        let tokens = results.first().map(|r| r.tokens.as_slice()).unwrap_or(&[]);
+        let text = match tokenizer {
+            Some(tok) => tok.decode(tokens)?,
+            None => format!("{tokens:?}"),
+        };
+        Ok(Some(text))
+    } else {
+        Ok(None)
+    }
+}
+
+/// DYNAMIC PP=2 continuous-batching generation (SKEIN_CONTINUOUS_PP=N). Drives a
+/// queue of `queue_len` requests through up to `max_slots` 1F1B-overlapped slots:
+/// requests join as slots free, finished ones retire — a real continuous-serving
+/// loop, not the fixed-stream `generate_pipelined`. Every rank builds the same
+/// queue (the prompt is broadcast then replicated), so both stages stay matched.
+/// Rank 0 returns the first request's decoded text + logs SKEIN_PERF_CONTINUOUS_PP.
+pub fn run_generation_continuous_pp(
+    artifact_dir: &Path,
+    layout: WorldLayout,
+    rendezvous_path: &Path,
+    prompt: &str,
+    max_new_tokens: usize,
+    max_slots: usize,
+    queue_len: usize,
+    tokenizer: Option<&SkeinTokenizer>,
+) -> Result<Option<String>, RuntimeError> {
+    let mut server = RankServer::bootstrap(artifact_dir, layout, rendezvous_path)?;
+    let prompt_tokens: Vec<u32> = if layout.is_leader() {
+        match tokenizer {
+            Some(tok) => tok.encode(prompt)?,
+            None => {
+                let vocab = server.vocab().max(1);
+                prompt.bytes().map(|b| (b as u32) % vocab).collect()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let prompt_tokens = server.broadcast_prompt(if layout.is_leader() {
+        Some(&prompt_tokens)
+    } else {
+        None
+    })?;
+    // Queue of independent requests (>= max_slots so join/leave actually happens).
+    let qlen = queue_len.max(max_slots).max(1);
+    let prompts: Vec<Vec<u32>> = vec![prompt_tokens; qlen];
+    let results = server.run_continuous_pipelined(&prompts, max_new_tokens, max_slots)?;
 
     if layout.is_leader() {
         let tokens = results.first().map(|r| r.tokens.as_slice()).unwrap_or(&[]);

@@ -62,6 +62,16 @@ struct ReqState {
     generated: Vec<u32>,
 }
 
+/// One batched decode step's inputs: N decode requests advanced together in a
+/// SINGLE forward. `tokens[i]`/`ids[i]` belong to the same row `i`; `position`
+/// is shared by every row (the decode graph's `position` is a scalar — see the
+/// same-position limitation in [`ContinuousBatchDriver::run_decode_microbatch`]).
+struct DecodeMicroBatch {
+    ids: Vec<RequestId>,
+    tokens: Vec<i32>,
+    position: usize,
+}
+
 /// Result for one completed request.
 #[derive(Debug, Clone)]
 pub struct BatchOutput {
@@ -309,6 +319,27 @@ impl ContinuousBatchDriver {
     /// Drive until every in-flight request has finished. Returns per-request
     /// outputs in submission order.
     pub fn run_to_completion(&mut self, now_ms: u64) -> Result<Vec<BatchOutput>, RuntimeError> {
+        // Decode-microbatch dispatch. The real batched-decode primitive uses a
+        // single contiguous `[batch, cap, kv_dim]` KV with a SHARED scalar
+        // position (segment_runner: `set_decode_batch` + the batched
+        // `copy_output_to_kv_slot_batched_by_id` write). That is incompatible
+        // with the serial path's per-request *paged* KV (which binds only the
+        // active request). So a row-wise batched decode is correct only when
+        // every in-flight request advances together from position 0 (same-position
+        // regime: no prefix-cache reuse, contiguous batch KV). When that holds for
+        // >=2 requests, run ONE batched forward per step instead of looping
+        // `run_one_request_step` per request. Otherwise fall back to the serial
+        // path. `SKEIN_NO_MICROBATCH` forces the serial path for A/B comparison.
+        let mut all_ids: Vec<RequestId> = self.state.keys().copied().collect();
+        all_ids.sort_by_key(|id| self.state[id].order);
+        let microbatch_ok = all_ids.len() >= 2
+            && std::env::var_os("SKEIN_NO_MICROBATCH").is_none()
+            && all_ids
+                .iter()
+                .all(|id| self.state[id].position == 0 && self.state[id].matched_prefix == 0);
+        if microbatch_ok {
+            return self.run_microbatched(&all_ids);
+        }
         loop {
             self.batcher.promote_ready(now_ms);
             let step = self.batcher.next_step_batch();
@@ -418,6 +449,167 @@ impl ContinuousBatchDriver {
             }
         }
         Ok(())
+    }
+
+    /// Run ONE batched decode forward for the N requests in `mb` (one row each)
+    /// and return the argmaxed next token per row. THIS is the core fix: a single
+    /// `topo.run_step()` advances ALL rows at once — not the serial
+    /// `run_one_request_step` loop. Logits come back rank-major
+    /// `[ranks, N, vocab_local]` (the TP logits AllGather); de-interleaved per row
+    /// here so row `i`'s token comes only from row `i`'s logits.
+    ///
+    /// LIMITATION (same-position only): every row shares `mb.position` because the
+    /// decode graph's `position` is a scalar (`set_position`) and the batched KV
+    /// write (`copy_output_to_kv_slot_batched_by_id`) lands all rows at that one
+    /// slot. Rows must therefore be at the same absolute position — true per-row
+    /// positions are not supported by this graph.
+    fn run_decode_microbatch(&mut self, mb: &DecodeMicroBatch) -> Result<Vec<u32>, RuntimeError> {
+        let n = mb.ids.len();
+        for runner in self.topo.runners_mut() {
+            runner.set_input_tokens(INPUT_TOKENS, mb.tokens.clone());
+            runner.set_position(mb.position);
+        }
+        let started = Instant::now();
+        let g0 = if self.track_graphs { cuda_graph_exec_stats() } else { (0, 0) };
+        self.topo.run_step().map_err(rt)?; // ONE forward for all N rows
+        if self.track_graphs {
+            let g1 = cuda_graph_exec_stats();
+            self.metrics.graph_captures += g1.0.saturating_sub(g0.0);
+            self.metrics.graph_replays += g1.1.saturating_sub(g0.1);
+        }
+        self.metrics.total_compute_us += started.elapsed().as_secs_f64() * 1e6;
+        self.metrics.forward_steps += 1;
+        // Rank-major all-gathered logits: [ranks, N, vocab_local]. De-interleave
+        // per row and argmax over the full vocab (mirrors run_batched_lockstep).
+        let logits = self.topo.runner(0).read(LOGITS).map_err(rt)?;
+        let ranks = self.topo.num_devices().max(1);
+        let vocab = self.vocab as usize;
+        let vl = (vocab / ranks).max(1);
+        let mut next = vec![0u32; n];
+        for (r, slot) in next.iter_mut().enumerate() {
+            let mut best_i = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for rk in 0..ranks {
+                let base = (rk * n + r) * vl;
+                for j in 0..vl {
+                    let v = logits[(base + j).min(logits.len().saturating_sub(1))];
+                    if v > best_v {
+                        best_v = v;
+                        best_i = rk * vl + j;
+                    }
+                }
+            }
+            *slot = best_i as u32;
+        }
+        Ok(next)
+    }
+
+    /// Drive the whole homogeneous batch (`ids`, all starting at position 0) to
+    /// completion with ONE batched forward per step. Each step every row feeds one
+    /// token — its own prompt token while prefilling, then its own generated token
+    /// once decoding — at the shared `position` (= step index), so the scalar
+    /// position is correct for every row (full-context mixed-length batching). The
+    /// proof logs show `active_decode_batch_size=N` with `forward_steps=1` per
+    /// step: ONE graph step produces N tokens, not N steps of one each.
+    fn run_microbatched(&mut self, ids: &[RequestId]) -> Result<Vec<BatchOutput>, RuntimeError> {
+        let n = ids.len();
+        // Contiguous batched-KV regime (NOT per-request paged KV).
+        for runner in self.topo.runners_mut() {
+            runner.set_paged_device_kv(false);
+            runner.set_decode_batch(n);
+        }
+        let prompts: Vec<Vec<u32>> = ids.iter().map(|id| self.state[id].prompt.clone()).collect();
+        let plen: Vec<usize> = prompts.iter().map(|p| p.len().max(1)).collect();
+        let max_new: Vec<usize> = ids.iter().map(|id| self.state[id].max_new).collect();
+        let lmax = *plen.iter().max().unwrap();
+        let new_max = *max_new.iter().max().unwrap();
+        let mut cur: Vec<i32> = prompts.iter().map(|p| p.first().copied().unwrap_or(0) as i32).collect();
+        let total_steps = (lmax - 1) + new_max;
+
+        self.metrics.max_concurrent_inflight = self.metrics.max_concurrent_inflight.max(n);
+        let log = std::env::var_os("SKEIN_MICROBATCH_LOG").is_some();
+        let decode_wall = Instant::now();
+        let mut decode_forward_steps = 0usize;
+        let mut decode_tokens_emitted = 0usize;
+
+        for pos in 0..total_steps {
+            let mb = DecodeMicroBatch { ids: ids.to_vec(), tokens: cur.clone(), position: pos };
+            let next = self.run_decode_microbatch(&mb)?; // ONE batched forward -> N logit rows
+            self.metrics.batch_steps += 1;
+            self.metrics.decode_forward_steps += 1;
+            // Per-row update; count rows that actually emitted a decode token.
+            let mut active_decode = 0usize;
+            for r in 0..n {
+                if pos + 1 < plen[r] {
+                    cur[r] = prompts[r][pos + 1] as i32; // still prefilling this row
+                } else {
+                    let emit = {
+                        let st = self
+                            .state
+                            .get_mut(&ids[r])
+                            .ok_or(RuntimeError::UnknownRequest(ids[r].0))?;
+                        if st.generated.len() < st.max_new {
+                            st.generated.push(next[r]);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if emit {
+                        let _ = self.batcher.accept_token(ids[r], next[r]);
+                        active_decode += 1;
+                    }
+                    cur[r] = next[r] as i32;
+                }
+            }
+            decode_tokens_emitted += active_decode;
+            if active_decode > 0 {
+                decode_forward_steps += 1;
+            }
+            if log {
+                eprintln!(
+                    "SKEIN_PERF_MICROBATCH step pos={pos} active_decode_batch_size={active_decode} \
+                     forward_steps=1 produced_tokens={active_decode}"
+                );
+            }
+        }
+
+        let decode_s = decode_wall.elapsed().as_secs_f64();
+        // Restore the per-request paged regime in case the driver is reused.
+        for runner in self.topo.runners_mut() {
+            runner.set_decode_batch(1);
+            runner.set_paged_device_kv(true);
+        }
+        let agg = if decode_s > 0.0 { decode_tokens_emitted as f64 / decode_s } else { 0.0 };
+        eprintln!(
+            "SKEIN_PERF_MICROBATCH active_decode_batch_size={n} forward_steps={decode_forward_steps} \
+             produced_tokens={decode_tokens_emitted} decode_s={decode_s:.4} \
+             aggregate_decode_tokens_per_s={agg:.2} per_user_tokens_per_s={:.2} same_position_only=true",
+            agg / (n as f64).max(1.0)
+        );
+
+        // Emit outputs + retire in submission order.
+        for r in 0..n {
+            let st = self
+                .state
+                .get(&ids[r])
+                .ok_or(RuntimeError::UnknownRequest(ids[r].0))?;
+            self.outputs.push(BatchOutput {
+                order: st.order,
+                request_id: ids[r].0,
+                tokens: st.generated.clone(),
+                prefix_hit_tokens: st.matched_prefix,
+                prefill_steps: st.prefill_steps,
+                prompt_len: st.prompt.len(),
+            });
+            let _ = self.batcher.retire(ids[r]);
+            for runner in self.topo.runners_mut() {
+                let _ = runner.release_request(ids[r]);
+            }
+            self.state.remove(&ids[r]);
+        }
+        self.outputs.sort_by_key(|o| o.order);
+        Ok(std::mem::take(&mut self.outputs))
     }
 }
 

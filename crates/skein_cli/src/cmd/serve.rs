@@ -339,6 +339,17 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 2);
 
+    // SKEIN_CONTINUOUS_PP=N (N>=2): DYNAMIC PP=2 continuous batching — up to N
+    // 1F1B-overlapped slots, requests join/leave from a queue. SKEIN_CONTINUOUS_QUEUE
+    // sets the queue length (default 2N, so join/leave actually happens).
+    let continuous_pp = std::env::var("SKEIN_CONTINUOUS_PP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 2);
+    let continuous_queue = std::env::var("SKEIN_CONTINUOUS_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+
     // SKEIN_BATCHED_GEN + SKEIN_PROMPTS_FILE: batched decode of many prompts in
     // one captured forward per token (batch>1 graph + full-step CUDA-graph
     // capture). Every rank reads the same file → identical lockstep batches.
@@ -384,6 +395,19 @@ async fn run_rank(args: ServeArgs, layout: WorldLayout) -> Result<(), CliError> 
                 &rendezvous,
                 &prompts,
                 max_new,
+                tokenizer.as_ref(),
+            );
+        }
+        if let Some(slots) = continuous_pp {
+            let qlen = continuous_queue.unwrap_or(slots * 2);
+            return gpu_rank::run_generation_continuous_pp(
+                &artifact_dir,
+                layout,
+                &rendezvous,
+                &prompt,
+                max_new,
+                slots,
+                qlen,
                 tokenizer.as_ref(),
             );
         }
