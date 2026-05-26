@@ -214,6 +214,20 @@ pub trait ComputeRuntime: Sized {
         false
     }
 
+    /// Keyed multi-graph capture for MB decode (one graph per microbatch slot).
+    fn end_stream_capture_keyed(&self, _key: u64) {}
+    fn replay_captured_keyed(&self, _key: u64) -> bool {
+        false
+    }
+    fn has_captured_graph_keyed(&self, _key: u64) -> bool {
+        false
+    }
+
+    /// MB capture: refresh every host op's per-step device state (e.g.
+    /// `CudaGraphOp` `dyn_dims_buffer`) from `dyn_map` so the next graph
+    /// replay sees fresh values at the captured kernels' baked pointers.
+    fn refresh_capture_dyn_dims(&self, _dyn_map: &std::collections::HashMap<char, usize>) {}
+
     /// Free this runtime's intermediate-buffer arena (re-allocated lazily on the
     /// next execute). Persistent inputs/weights are untouched. Called after
     /// load/search and between the prefill and decode graphs so two graphs'
@@ -612,6 +626,24 @@ mod cuda_impl {
         }
         fn has_captured_graph(&self) -> bool {
             self.inner.has_captured_graph()
+        }
+        fn end_stream_capture_keyed(&self, key: u64) {
+            self.inner
+                .end_stream_capture_keyed(key)
+                .expect("end_stream_capture_keyed");
+        }
+        fn replay_captured_keyed(&self, key: u64) -> bool {
+            self.inner.replay_captured_keyed(key)
+        }
+        fn has_captured_graph_keyed(&self, key: u64) -> bool {
+            self.inner.has_captured_graph_keyed(key)
+        }
+        fn refresh_capture_dyn_dims(&self, dyn_map: &std::collections::HashMap<char, usize>) {
+            // Convert from std HashMap (cross-crate boundary) to luminal FxHashMap
+            // for the inner CudaRuntime — keeps the trait surface std-only.
+            let fx: luminal::prelude::FxHashMap<char, usize> =
+                dyn_map.iter().map(|(&k, &v)| (k, v)).collect();
+            self.inner.refresh_capture_dyn_dims(&fx);
         }
 
         unsafe fn read_device_bf16(&self, ptr: u64, elems: usize) -> Vec<f32> {

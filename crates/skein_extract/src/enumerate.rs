@@ -99,8 +99,24 @@ pub fn enumerate_batch_policies() -> Vec<BatchPolicy> {
     // TODO(chunk-size-search): reintroduce them once the cost model accounts
     // for prefill/mixed-batch scheduling. `Static` is dropped: decoder
     // serving uses continuous batching as the default.
+    let mut ladder: Vec<u32> = vec![1, 2, 4, 8, 16, 32, 64];
+    // SKEIN_FORCE_BATCH pins the compiled decode batch width (used to build
+    // batched-throughput / continuous-PP microbatch artifacts). The forced
+    // value may sit off the power-of-two ladder — e.g. a stage_microbatch of 5
+    // — so inject it here. Without this the outer `SKEIN_FORCE_BATCH` filter in
+    // `extract_plan` has no matching candidate and rejects every plan ("no
+    // feasible plan found"). This only widens the search space when explicitly
+    // requested; the default ladder is unchanged.
+    if let Some(fb) = std::env::var("SKEIN_FORCE_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        && fb >= 1
+        && !ladder.contains(&fb)
+    {
+        ladder.push(fb);
+    }
     let mut out = Vec::new();
-    for m in [1u32, 2, 4, 8, 16, 32, 64] {
+    for m in ladder {
         out.push(BatchPolicy::Continuous { max_batch: m });
         out.push(BatchPolicy::ContinuousChunked {
             max_batch: m,

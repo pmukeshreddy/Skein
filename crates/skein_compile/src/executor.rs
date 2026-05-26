@@ -674,10 +674,21 @@ fn load_weights_into_segments(
     path: &Path,
     segments: &mut [RuntimeSegment],
 ) -> Result<(), CompileError> {
-    let bytes = std::fs::read(path).map_err(|source| CompileError::Io {
+    // Memory-map the shard rather than reading it into an anonymous Vec: a
+    // 46.7 GB `std::fs::read` is ~47 GB of anon heap per rank, and two PP ranks
+    // loading concurrently on one node overran host RAM (OOM-killer, signal 9).
+    // The mmap is file-backed (page cache, reclaimable under pressure) and read
+    // by SafeTensors as a plain &[u8] slice. Read-only, so no flush needed.
+    let file = std::fs::File::open(path).map_err(|source| CompileError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    let bytes = unsafe {
+        memmap2::Mmap::map(&file).map_err(|source| CompileError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+    };
     let tensors = SafeTensors::deserialize(&bytes).map_err(|source| CompileError::Safetensors {
         path: path.to_path_buf(),
         source,

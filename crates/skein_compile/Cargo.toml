@@ -31,6 +31,10 @@ safetensors = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 half       = { version = "2.7.1", features = ["num-traits"] }
+# Memory-map weight shards instead of std::fs::read so the ~47 GB/shard stays
+# file-backed (evictable) rather than anonymous heap — avoids host OOM when two
+# PP ranks load their shards concurrently on a single node.
+memmap2    = "0.9"
 
 # `luminal_cuda_lite` is a sibling crate inside the Luminal repo (at
 # `crates/luminal_cuda_lite`). Cargo resolves it from the same git rev as

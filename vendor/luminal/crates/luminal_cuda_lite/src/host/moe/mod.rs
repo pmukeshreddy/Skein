@@ -90,6 +90,8 @@ pub struct GLUMoE {
         CudaFunction, // moe_down_combine_fp8_binned
         CudaFunction, // moe_down_gemv_fp8 (v1 two-kernel: per-expert GEMV)
         CudaFunction, // moe_sum_fp8 (v1 two-kernel: weighted reduction)
+        CudaFunction, // moe_down_gemv_fp8_hopper (warp-per-output, hd in shared)
+        CudaFunction, // moe_gate_up_act_fp8_hopper (warp-per-output, ROWS rows/warp)
     )>,
     /// fp8 (E4M3) weight cache (SKEIN_MOE_FP8): raw device pointers to the
     /// quantized resident expert weights + per-row scales. Computed once on the
@@ -216,6 +218,8 @@ impl GLUMoE {
         CudaFunction,
         CudaFunction, // moe_down_gemv_fp8
         CudaFunction, // moe_sum_fp8
+        CudaFunction, // moe_down_gemv_fp8_hopper
+        CudaFunction, // moe_gate_up_act_fp8_hopper
     ) {
         self.module.get_or_init(|| {
             let src = r#"
@@ -920,6 +924,118 @@ extern "C" __global__ void moe_down_combine_fp8_binned(
         __syncthreads();
     }
 }
+
+// ---- Hopper-tuned down GEMV (SKEIN_MOE_DN_HOPPER): warp-per-output-row.
+// Block = 8 warps; blockIdx.y = token-slot (tj); each warp computes ONE h row.
+// hd[tj] is staged once into 28KB shared (reused by all 8 warps); D is streamed
+// from HBM at 28 uint4/thread (high memory-level parallelism); reduction is
+// warp-shuffle only (no cross-warp shared reduce / __syncthreads in the hot
+// loop). Same partials format as moe_down_gemv_fp8 -> moe_sum_fp8 reused.
+extern "C" __global__ void moe_down_gemv_fp8_hopper(
+    unsigned long long hid_ptr, unsigned long long topk_idx_ptr,
+    unsigned long long down_ptr, unsigned long long down_scale_ptr,
+    unsigned long long partials_ptr,
+    int hidden, int intermediate, int top_k, int idx_stride, int seq
+) {
+    extern __shared__ __nv_bfloat16 s_hd[];
+    int tj = blockIdx.y;
+    int t = tj / top_k, jx = tj % top_k;
+    if (t >= seq) return;
+    int warps = blockDim.x >> 5;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const __nv_bfloat16* hd = (const __nv_bfloat16*)hid_ptr + (long long)(t * top_k + jx) * intermediate;
+    for (int j = threadIdx.x; j < intermediate; j += blockDim.x) s_hd[j] = hd[j];
+    __syncthreads();
+    const int DROWS = 4;                       // output h-rows per warp -> more in-flight D streams, amortized s_hd
+    int h0 = (blockIdx.x * warps + warp) * DROWS;
+    int expert = ((const int*)topk_idx_ptr)[(long long)t * idx_stride + jx];
+    int n16 = intermediate >> 4;
+    const float4* hp4 = (const float4*)s_hd;
+    #pragma unroll
+    for (int r = 0; r < DROWS; r++) {
+        int h = h0 + r;
+        if (h >= hidden) break;
+        const unsigned char* D = (const unsigned char*)down_ptr + (long long)expert * hidden * intermediate + (long long)h * intermediate;
+        const uint4* dp4 = (const uint4*)D;
+        float dscale = ((const float*)down_scale_ptr)[(long long)expert * hidden + h];
+        float dot = 0.f;
+        #pragma unroll 4
+        for (int j = lane; j < n16; j += 32) {
+            uint4 dw = dp4[j];
+            const __nv_fp8_e4m3* dh = (const __nv_fp8_e4m3*)&dw;
+            int q = j << 1;
+            float4 ha = hp4[q], hb = hp4[q + 1];
+            const __nv_bfloat16* hha = (const __nv_bfloat16*)&ha;
+            const __nv_bfloat16* hhb = (const __nv_bfloat16*)&hb;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) dot += (float)dh[e] * __bfloat162float(hha[e]);
+            #pragma unroll
+            for (int e = 0; e < 8; e++) dot += (float)dh[8 + e] * __bfloat162float(hhb[e]);
+        }
+        for (int j = (n16 << 4) + lane; j < intermediate; j += 32) {
+            __nv_fp8_e4m3 dq; dq.__x = D[j];
+            dot += (float)dq * __bfloat162float(s_hd[j]);
+        }
+        for (int s = 16; s > 0; s >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, s);
+        if (lane == 0) ((float*)partials_ptr)[(long long)(t * top_k + jx) * hidden + h] = dscale * dot;
+    }
+}
+
+// ---- Hopper-tuned gate_up GEMV+SwiGLU (SKEIN_MOE_GU_HOPPER): warp-per-output
+// with ROWS output rows per warp. x[t] staged once in 8KB shared (reused by all
+// warps); each warp streams ROWS gate-rows + ROWS up-rows from HBM (high
+// memory-level parallelism — the short hidden=4096 reduction otherwise starves
+// the pipeline); warp-shuffle reduce only. Mirrors the down_hopper design.
+extern "C" __global__ void moe_gate_up_act_fp8_hopper(
+    unsigned long long x_bf16_ptr, unsigned long long topk_idx_ptr,
+    unsigned long long gate_up_ptr, unsigned long long gate_up_scale_ptr, unsigned long long hid_ptr,
+    int hidden, int intermediate, int gate_up_dim, int top_k, int idx_stride, int seq, int act_mode
+) {
+    extern __shared__ __nv_bfloat16 s_x[];   // [hidden]
+    const int ROWS = 4;
+    int tj = blockIdx.y;
+    int t = tj / top_k, slot = tj % top_k;
+    if (t >= seq) return;
+    int warps = blockDim.x >> 5;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const __nv_bfloat16* x = (const __nv_bfloat16*)x_bf16_ptr + (long long)t * hidden;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) s_x[j] = x[j];
+    __syncthreads();
+    int expert = ((const int*)topk_idx_ptr)[(long long)t * idx_stride + slot];
+    const unsigned char* W = (const unsigned char*)gate_up_ptr + (long long)expert * gate_up_dim * hidden;
+    const float* sc = (const float*)gate_up_scale_ptr + (long long)expert * gate_up_dim;
+    int o0 = (blockIdx.x * warps + warp) * ROWS;
+    int n16 = hidden >> 4;
+    const float4* xp4 = (const float4*)s_x;
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        int o = o0 + r;
+        if (o >= intermediate) break;
+        const uint4* gp4 = (const uint4*)(W + (long long)o * hidden);
+        const uint4* up4 = (const uint4*)(W + (long long)(o + intermediate) * hidden);
+        float g = 0.f, u = 0.f;
+        for (int j = lane; j < n16; j += 32) {
+            uint4 gw = gp4[j], uw = up4[j];
+            const __nv_fp8_e4m3* gh = (const __nv_fp8_e4m3*)&gw;
+            const __nv_fp8_e4m3* uh = (const __nv_fp8_e4m3*)&uw;
+            int q = j << 1;
+            float4 xa = xp4[q], xb = xp4[q + 1];
+            const __nv_bfloat16* xha = (const __nv_bfloat16*)&xa;
+            const __nv_bfloat16* xhb = (const __nv_bfloat16*)&xb;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) { float xf = __bfloat162float(xha[e]); g += (float)gh[e]*xf; u += (float)uh[e]*xf; }
+            #pragma unroll
+            for (int e = 0; e < 8; e++) { float xf = __bfloat162float(xhb[e]); g += (float)gh[8+e]*xf; u += (float)uh[8+e]*xf; }
+        }
+        for (int s = 16; s > 0; s >>= 1) { g += __shfl_down_sync(0xffffffffu, g, s); u += __shfl_down_sync(0xffffffffu, u, s); }
+        if (lane == 0) {
+            float gate = g * sc[o], up = u * sc[o + intermediate], act;
+            if (act_mode == 0) { act = gate / (1.0f + expf(-gate)); }
+            else { float scx = 1.5957691216f * gate * (1.0f + 0.044715f * gate * gate); act = gate / (1.0f + expf(-scx)); }
+            ((__nv_bfloat16*)hid_ptr)[(long long)tj * intermediate + o] = __float2bfloat16(act * up);
+        }
+    }
+}
 "#;
             let ptx = compile_module_image_for_current_device(stream.context(), src).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
@@ -939,6 +1055,8 @@ extern "C" __global__ void moe_down_combine_fp8_binned(
             let down_combine_fp8_binned = module.load_function("moe_down_combine_fp8_binned").unwrap();
             let down_gemv_fp8 = module.load_function("moe_down_gemv_fp8").unwrap();
             let sum_fp8 = module.load_function("moe_sum_fp8").unwrap();
+            let down_gemv_fp8_hopper = module.load_function("moe_down_gemv_fp8_hopper").unwrap();
+            let gate_up_act_fp8_hopper = module.load_function("moe_gate_up_act_fp8_hopper").unwrap();
             (
                 module,
                 f32_to_bf16,
@@ -957,6 +1075,8 @@ extern "C" __global__ void moe_down_combine_fp8_binned(
                 down_combine_fp8_binned,
                 down_gemv_fp8,
                 sum_fp8,
+                down_gemv_fp8_hopper,
+                gate_up_act_fp8_hopper,
             )
         })
     }
@@ -1427,6 +1547,19 @@ impl HostOp for GLUMoE {
         // apples-to-apples end-to-end delta.
         static DOWN_MONO: OnceLock<bool> = OnceLock::new();
         let down_mono = *DOWN_MONO.get_or_init(|| std::env::var_os("SKEIN_MOE_DOWN_MONO").is_some());
+        // Hopper experiment: use the v2 warp-per-row gate_up kernel ONLY (keep the
+        // safe default v1 two-kernel down, which avoids v2-down's 57KB shared
+        // limit). Isolates the gate_up rewrite for A/B on H100.
+        static GU_V2: OnceLock<bool> = OnceLock::new();
+        let use_gu_v2 = *GU_V2.get_or_init(|| std::env::var_os("SKEIN_MOE_GU_V2").is_some());
+        // Hopper-tuned warp-per-output down GEMV (replaces kernels.15 in the v1
+        // two-kernel split; moe_sum_fp8 reused). Default v1 down stays unless set.
+        static DN_HOPPER: OnceLock<bool> = OnceLock::new();
+        let use_dn_hopper = *DN_HOPPER.get_or_init(|| std::env::var_os("SKEIN_MOE_DN_HOPPER").is_some());
+        // Hopper-tuned warp-per-output gate_up (ROWS rows/warp, x staged). Replaces
+        // the v1/v2 gate_up when set; same args/output as gate_up_act_fp8.
+        static GU_HOPPER: OnceLock<bool> = OnceLock::new();
+        let use_gu_hopper = *GU_HOPPER.get_or_init(|| std::env::var_os("SKEIN_MOE_GU_HOPPER").is_some());
         let kt_events = if ktime {
             // CU_EVENT_DEFAULT (=0) keeps timing enabled; None would default to
             // CU_EVENT_DISABLE_TIMING and elapsed_ms would fail.
@@ -1450,6 +1583,20 @@ impl HostOp for GLUMoE {
         // L2-cached, while grouped also pays for unused experts). Grouped wins at
         // larger batch where per-token's linear HBM growth dominates L2.
         let grouped = seq > 1 && std::env::var_os("SKEIN_MOE_GROUPED").is_some();
+        {
+            use std::sync::Once;
+            static MOE_PATH: Once = Once::new();
+            MOE_PATH.call_once(|| {
+                eprintln!(
+                    "SKEIN_MOE_PATH gate_up={} down={} grouped={} permuted={} seq={} (use_v2={} use_gu_v2={} use_gu_hopper={} use_dn_hopper={})",
+                    if use_gu_hopper { "hopper" } else if use_v2 || use_gu_v2 { "v2" } else { "v1" },
+                    if use_dn_hopper { "hopper" } else if down_mono { "mono" } else { "split2" },
+                    grouped,
+                    std::env::var_os("SKEIN_MOE_PERMUTED").is_some(),
+                    seq, use_v2, use_gu_v2, use_gu_hopper, use_dn_hopper
+                );
+            });
+        }
         let grid_gu_grouped = LaunchConfig {
             grid_dim: (intermediate as u32, num_experts as u32, 1),
             block_dim: (256, 1, 1),
@@ -1467,6 +1614,12 @@ impl HostOp for GLUMoE {
         // v2 (SKEIN_MOE_V2, fp8 only): warp-per-row, 8 rows/block, x staged in shared.
         let grid_gu_v2 = LaunchConfig {
             grid_dim: ((intermediate as u32).div_ceil(8), (seq * top_k) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (hidden * 2) as u32,
+        };
+        // hopper gate_up: 8 warps/block * ROWS(8) rows/warp = 64 output rows/block.
+        let grid_gu_hopper = LaunchConfig {
+            grid_dim: ((intermediate as u32).div_ceil(32), (seq * top_k) as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: (hidden * 2) as u32,
         };
@@ -1494,7 +1647,9 @@ impl HostOp for GLUMoE {
                         .arg(&idx_stride_i).arg(&seq_i).arg(&act_mode).arg(&num_experts_i)
                         .launch(grid_gu_grouped)?;
                 } else {
-                let (gu_fn, gu_cfg) = if use_v2 {
+                let (gu_fn, gu_cfg) = if use_gu_hopper {
+                    (&kernels.18, grid_gu_hopper)
+                } else if use_v2 || use_gu_v2 {
                     (&kernels.8, grid_gu_v2)
                 } else {
                     (&kernels.6, grid_gu)
@@ -1616,11 +1771,23 @@ impl HostOp for GLUMoE {
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     };
+                    let (dn_fn, dn_cfg) = if use_dn_hopper {
+                        (
+                            &kernels.17,
+                            LaunchConfig {
+                                grid_dim: ((hidden as u32).div_ceil(32), (seq * top_k) as u32, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: (intermediate * 2) as u32,
+                            },
+                        )
+                    } else {
+                        (&kernels.15, grid_gemv)
+                    };
                     stream
-                        .launch_builder(&kernels.15)
+                        .launch_builder(dn_fn)
                         .arg(&hid_ptr).arg(&topk_idx_ptr).arg(&dn_w).arg(&dn_s).arg(&partials_ptr)
                         .arg(&hidden_i).arg(&intermediate_i).arg(&top_k_i).arg(&idx_stride_i).arg(&seq_i)
-                        .launch(grid_gemv)?;
+                        .launch(dn_cfg)?;
                     let grid_sum = LaunchConfig {
                         grid_dim: ((hidden as u32).div_ceil(128), seq as u32, 1),
                         block_dim: (128, 1, 1),

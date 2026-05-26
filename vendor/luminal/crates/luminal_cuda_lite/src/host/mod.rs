@@ -7,7 +7,29 @@ mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
 
+/// Thread-local "outer stream capture currently active" flag. Set by
+/// `begin_stream_capture` (any flavor) and cleared by `end_stream_capture`,
+/// so capture-aware code paths (e.g. `CudaGraphOp::execute_internal`) can skip
+/// host-side stream ops (sync memcpy, alloc, graph rebuild) that would fail
+/// with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`. Necessary because the
+/// `THREAD_LOCAL` capture mode makes illegal ops fail thread-wide regardless
+/// of which stream `cuStreamGetCaptureInfo` reports as `ACTIVE`.
+pub fn capture_active() -> bool {
+    CAPTURE_ACTIVE.with(|c| c.get())
+}
+pub fn set_capture_active(on: bool) {
+    CAPTURE_ACTIVE.with(|c| c.set(on));
+}
+thread_local! {
+    static CAPTURE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// True iff SKEIN_CAPTURE is set (full-step CUDA-graph capture). Cached.
+/// The MB capture (SKEIN_MB_CAPTURE) layer must export SKEIN_CAPTURE=1 alongside
+/// (with SKEIN_NO_SPLIT=1 to suppress the single-stream prefill capture) — that
+/// way the persistent-input + no-free behaviors only activate when actually
+/// needed, leaving plain `SKEIN_MB_CAPTURE` runs (capture_at very high, no actual
+/// recording) on the exact baseline path so capitals stay correct.
 pub fn is_capture() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var_os("SKEIN_CAPTURE").is_some())
@@ -391,5 +413,19 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// Returns the name of this host op for stats reporting, or None if not reportable.
     fn stats_name(&self) -> Option<&'static str> {
         None
+    }
+
+    /// MB CUDA-graph capture: refresh THIS op's per-step device state (e.g.
+    /// `CudaGraphOp`'s `dyn_dims_buffer`) from the current `dyn_map`, OUTSIDE
+    /// any active stream capture, so the next `cuGraphLaunch` of the recorded
+    /// outer graph sees fresh values at the stable device pointer the captured
+    /// kernels read. Default no-op — only ops that hold per-step device state
+    /// override (e.g. `CudaGraphOp`).
+    fn refresh_capture_dyn_dims(
+        &self,
+        _stream: &Arc<CudaStream>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }

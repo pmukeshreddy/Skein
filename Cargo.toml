@@ -103,3 +103,11 @@ codegen-units = 1
 luminal          = { path = "vendor/luminal" }
 luminal_cuda_lite = { path = "vendor/luminal/crates/luminal_cuda_lite" }
 luminal_tracing  = { path = "vendor/luminal/crates/luminal_tracing" }
+
+# Vendored cudarc 0.19.7 patched ONLY for scoped capture-window safety of
+# `LaunchArgs::launch`. Outside `cudarc::driver::set_capture_active(true)` the
+# upstream code path runs verbatim. See vendor/cudarc/src/driver/safe/launch.rs
+# (SKEIN_CAPTURE_*, capture_safe_params).
+[patch.crates-io]
+cudarc = { path = "vendor/cudarc" }
+

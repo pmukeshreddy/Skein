@@ -175,6 +175,12 @@ pub struct SegmentRunner {
     /// their persistent device buffers every step, outside the capture window, by
     /// [`flush_step_device_inputs`](Self::flush_step_device_inputs).
     capturing: bool,
+    /// MB CUDA-graph capture: the specific HostCollective OUTPUT ids (boundary
+    /// carry, final logits) to keep DEVICE-RESIDENT under capture instead of
+    /// D2H-ing into the captured graph. Targeted on purpose — other HostCollective
+    /// outputs (e.g. MoE router logits read host-side for top-k) must NOT be
+    /// diverted. The MB loop D2H-reads these outside the captured region.
+    capture_passthrough_outputs: HashSet<HandoffId>,
     /// Pre-resolved id of the `input_tokens` i32 input, so `run_segment` (skip
     /// path) and `flush_step_device_inputs` (write path) agree on which input is
     /// the per-token token id.
@@ -264,6 +270,87 @@ fn top_k_softmax(logits: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
 }
 
 impl SegmentRunner {
+    /// SKEIN_DEBUG_STATE only: resolve a handoff `id` to the persistent INPUT
+    /// device buffer the matching segment binds it to.
+    pub fn dbg_input_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
+        for segment_idx in 0..self.segments.len() {
+            if self.segment_inputs[segment_idx].iter().any(|i| *i == id) {
+                return self.segments[segment_idx]
+                    .runtime
+                    .dbg_input_device_ptr_by_id(id);
+            }
+        }
+        None
+    }
+
+    /// SKEIN_DEBUG_STATE only: dump (sync + checksum + first-4-bytes) of every
+    /// segment's outputs. Call AFTER warmup execute or AFTER replay completes.
+    /// Useful to find the FIRST segment whose output differs between modes.
+    pub fn dbg_dump_segment_outputs(&self, tag: &str) {
+        // Also dump kv_device_base buffers for KV-cache slots — these are the
+        // ACTUAL per-request cache buffers that the captured graph reads from
+        // (different from segment-output arena slots).
+        for (slot, base_opt) in self.kv_device_base.iter().enumerate() {
+            if let Some(base) = base_opt {
+                let name = self.id_name(HandoffId(slot as u32));
+                if !name.starts_with("kvcache_") {
+                    continue;
+                }
+                let n_read = 16usize;
+                let mut buf = vec![0u8; n_read];
+                unsafe {
+                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut _,
+                        *base,
+                        n_read,
+                    );
+                }
+                let first4 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let first8 = u64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                eprintln!(
+                    "KV_BASE {tag} slot={} name={:?} base=0x{:x} first4=0x{:08x} first8=0x{:016x}",
+                    slot, name, base, first4, first8
+                );
+            }
+        }
+        for seg_idx in 0..self.segments.len() {
+            for &out_id in &self.segment_outputs[seg_idx] {
+                if let Some((ptr, n_bytes)) = self.segments[seg_idx]
+                    .runtime
+                    .output_device_ptr_by_id(out_id)
+                {
+                    // Sync and read a small prefix to checksum / first-bytes.
+                    let n_read = n_bytes.min(4096);
+                    let mut buf = vec![0u8; n_read];
+                    unsafe {
+                        let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            ptr,
+                            n_read,
+                        );
+                    }
+                    let mut h: u32 = 0x811c9dc5;
+                    for &b in &buf {
+                        h ^= b as u32;
+                        h = h.wrapping_mul(0x01000193);
+                    }
+                    let first4 = if buf.len() >= 4 {
+                        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+                    } else {
+                        0
+                    };
+                    let name = self.id_name(out_id);
+                    eprintln!(
+                        "DBG_SEG_OUT {tag} seg={seg_idx} out_id={} name={:?} ptr=0x{:x} n_bytes={} chk=0x{:08x} first4=0x{:08x}",
+                        out_id.0, name, ptr, n_bytes, h, first4
+                    );
+                }
+            }
+        }
+    }
+
     pub fn new(segments: Vec<RuntimeSegment>) -> Self {
         // Page geometry is overridable from the environment so a run can pick a
         // smaller page (finer-grained prefix reuse) without a recompile.
@@ -357,6 +444,7 @@ impl SegmentRunner {
             position: 0,
             prefill_capture: false,
             capturing: false,
+            capture_passthrough_outputs: HashSet::new(),
             input_tokens_id: None,
             position_id: None,
             #[cfg(feature = "cuda")]
@@ -595,6 +683,24 @@ impl SegmentRunner {
         self.capturing = on;
     }
 
+    /// MB capture: register the boundary-output ids (carry, logits) to keep
+    /// device-resident under capture (see [`capture_passthrough_outputs`]). Looked
+    /// up by name; unknown names are ignored.
+    pub fn set_capture_passthrough_by_names(&mut self, names: &[&str]) {
+        self.capture_passthrough_outputs.clear();
+        for n in names {
+            if let Some(id) = self.name_to_id.get(*n) {
+                self.capture_passthrough_outputs.insert(*id);
+            }
+        }
+    }
+
+    /// MB capture: register a boundary-output id directly (the carry tensor id
+    /// comes from the schedule, not a stable name).
+    pub fn add_capture_passthrough_id(&mut self, id: HandoffId) {
+        self.capture_passthrough_outputs.insert(id);
+    }
+
     /// SKEIN_CAPTURE: write this step's per-token device inputs — the decode
     /// `position` (read by every captured `kv_slot_write` kernel) and the
     /// `input_tokens` id (read by the captured embedding) — directly into their
@@ -654,6 +760,18 @@ impl SegmentRunner {
                 }
             }
         }
+        // MB capture: also refresh each host op's per-step device state
+        // (e.g. CudaGraphOp's dyn_dims_buffer) from a dyn_map seeded with the
+        // current decode 'p' = position. Without this, every captured graph
+        // replay sees the warmup-step `p` value baked into dyn_dims_buffer
+        // and attention/MoE kernels reading dyn_dims read stale `p`.
+        let mut dyn_map: HashMap<char, usize> = HashMap::new();
+        dyn_map.insert('p', position);
+        for segment_idx in 0..self.segments.len() {
+            self.segments[segment_idx]
+                .runtime
+                .refresh_capture_dyn_dims(&dyn_map);
+        }
         if log {
             eprintln!(
                 "SKEIN_FLUSH pos={position} ntok={} tok0={:?} fed: kv={n_kv} tok={n_tok} pos={n_pos} err={n_err} (segs={})",
@@ -688,6 +806,26 @@ impl SegmentRunner {
             .unwrap_or(false)
     }
 
+    /// Keyed multi-graph capture (MB decode): one graph per microbatch slot
+    /// `key`. `begin_capture` is shared (stream-level); end/replay/has are keyed.
+    pub fn end_capture_keyed(&self, key: u64) {
+        if let Some(seg) = self.segments.first() {
+            seg.runtime.end_stream_capture_keyed(key);
+        }
+    }
+    pub fn replay_captured_keyed(&self, key: u64) -> bool {
+        self.segments
+            .first()
+            .map(|seg| seg.runtime.replay_captured_keyed(key))
+            .unwrap_or(false)
+    }
+    pub fn has_captured_keyed(&self, key: u64) -> bool {
+        self.segments
+            .first()
+            .map(|seg| seg.runtime.has_captured_graph_keyed(key))
+            .unwrap_or(false)
+    }
+
     /// Host-stage one side of a cross-GPU all-reduce: D2H-read the device-resident
     /// handoff `id` (bf16 -> f32) from this runner's GPU. `None` if the handoff is
     /// not device-resident (then the caller falls back to the host `f32_slots`
@@ -698,6 +836,31 @@ impl SegmentRunner {
         let (ptr, elems) = self.output_device_ptr_by_id(id)?;
         let rt = &self.segments.first()?.runtime;
         Some(unsafe { rt.read_device_bf16(ptr, elems) })
+    }
+
+    /// D2H-read a device-resident handoff by NAME (bf16 -> f32). Used by the MB
+    /// capture loop to read the boundary carry / logits OUTSIDE the captured
+    /// region (they are kept device-resident under capture). `None` if not bound.
+    pub fn read_device_handoff_by_name(&self, name: &str) -> Option<Vec<f32>> {
+        let id = *self.name_to_id.get(name)?;
+        self.read_device_handoff(id)
+    }
+
+    /// MB capture: feed the boundary carry (stage 1's HostCollective input) into
+    /// its persistent device buffer IMMEDIATELY, outside the captured region.
+    /// Leaves `f32_slots[id]` untouched (`None`) so `run_segment`'s input feed
+    /// records no host->device copy into the graph; the captured kernels read the
+    /// resident buffer this writes. Returns true if the carry input was found.
+    pub fn feed_capture_input_f32(&mut self, id: HandoffId, data: Vec<f32>) -> bool {
+        for segment_idx in 0..self.segments.len() {
+            if self.segment_inputs[segment_idx].iter().any(|i| *i == id) {
+                return self.segments[segment_idx]
+                    .runtime
+                    .set_input_f32_immediate_by_id(id, data)
+                    .is_ok();
+            }
+        }
+        false
     }
 
     /// Write the reduced result back into the device-resident handoff `id`
@@ -1243,6 +1406,15 @@ impl LocalSegments for SegmentRunner {
                         }
                     }
                     // Host path: batched-prefill capture, or CPU fallback.
+                    if std::env::var_os("SKEIN_DEBUG_STATE").is_some() && layer == 16 {
+                        eprintln!(
+                            "KV_DEBUG layer=16 pos={} HOST_FALLBACK kv_device_base_set={} capturing={} prefill_capture={}",
+                            self.position,
+                            self.kv_device_base[slot].is_some() as u32,
+                            self.capturing as u32,
+                            self.prefill_capture as u32
+                        );
+                    }
                     let data = self.segments[segment_idx]
                         .runtime
                         .get_tensor_by_id(id)
@@ -1256,6 +1428,28 @@ impl LocalSegments for SegmentRunner {
                     self.device_slots[slot] = None;
                 }
                 HandoffKind::HostCollective => {
+                    // MB CUDA-graph capture: the boundary carry / logits are
+                    // HostCollective outputs. A D2H here would be RECORDED into the
+                    // captured graph with a host dest Vec freed right after, so
+                    // replays would scribble freed memory. Under capture keep them
+                    // device-resident (stable buffer); the MB loop D2H-reads them
+                    // OUTSIDE the captured region via `read_device_handoff`.
+                    if self.capturing && self.capture_passthrough_outputs.contains(&id) {
+                        if let Some((ptr, n_bytes)) = self.segments[segment_idx]
+                            .runtime
+                            .output_device_ptr_by_id(id)
+                        {
+                            self.device_slots[slot] = Some(DeviceTensorHandle {
+                                device: 0,
+                                ptr,
+                                n_bytes,
+                                elems: n_bytes / 2,
+                                dtype: HandoffDtype::Bf16,
+                            });
+                            self.f32_slots[slot] = None;
+                            continue;
+                        }
+                    }
                     // Collective tensors and the sparse-MoE router logits stay host
                     // (read host-side: the collective read/write path, and the
                     // MoeRoute top-k pick over the router logits).

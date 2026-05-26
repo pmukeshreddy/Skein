@@ -2324,6 +2324,21 @@ pub fn attention_fixed_cache(
         std::env::var("SKEIN_ATTENTION_BACKEND").ok().as_deref() == Some("fused_decode");
     #[cfg(not(feature = "cuda"))]
     let use_fused = false;
+    // Audit proof: announce the decode-attention backend chosen at lowering time.
+    // This lowering runs again at serve (rebuild_graphs), so the serve log shows
+    // the LIVE choice for that process — primitive unless SKEIN_ATTENTION_BACKEND
+    // =fused_decode is set in the serve environment.
+    {
+        use std::sync::Once;
+        static ATTN_BACKEND_ANNOUNCE: Once = Once::new();
+        ATTN_BACKEND_ANNOUNCE.call_once(|| {
+            eprintln!(
+                "SKEIN_ATTN_BACKEND_ACTIVE={} (SKEIN_ATTENTION_BACKEND={:?})",
+                if use_fused { "fused_decode" } else { "primitive" },
+                std::env::var("SKEIN_ATTENTION_BACKEND").ok()
+            );
+        });
+    }
 
     let attn = if use_fused {
         #[cfg(feature = "cuda")]

@@ -155,6 +155,18 @@ struct CudaGraphOpState {
     node_to_graph_node: FxHashMap<NodeIndex, CUgraphNode>,
     /// Kernel params for each kernel
     kernel_params: Vec<UnifiedKernelParams>,
+    /// Append-only pool of kernel params recorded into outer-capture graphs
+    /// (the raw_launch / `host::capture_active` path). A captured graph stores
+    /// `cuLaunchKernel`'s `kernelParams` BY POINTER, so the pointed-to buffer
+    /// must remain valid for every replay. Reusing `kernel_params[idx]` across
+    /// captures of different keys would drop the previous capture's params and
+    /// free their heap allocations — the older captured graph would then read
+    /// freed memory on replay (correct first token, then degenerate tokens
+    /// forever). This pool is never cleared during the run: each capture
+    /// pushes its own num_kernels entries, and inner-Vec heap data is stable
+    /// across outer-Vec reallocations (Vec move = (ptr,len,cap) bitcopy; the
+    /// heap pointer doesn't change).
+    captured_kernel_params: Vec<UnifiedKernelParams>,
     /// Last dynamic dimension values (for change detection)
     last_dyn_values: FxHashMap<char, usize>,
     /// Last buffer pointers (for change detection)
@@ -183,6 +195,7 @@ impl CudaGraphOpState {
             cuda_graph_exec: None,
             node_to_graph_node: FxHashMap::default(),
             kernel_params: Vec::new(),
+            captured_kernel_params: Vec::new(),
             last_dyn_values: FxHashMap::default(),
             last_buffer_ptrs: FxHashMap::default(),
             last_applied: Vec::new(),
@@ -366,6 +379,47 @@ impl HostOp for CudaGraphOp {
     fn stats_name(&self) -> Option<&'static str> {
         Some("CudaGraph")
     }
+
+    /// MB capture: write the current `dyn_map` values into this op's
+    /// `dyn_dims_buffer` (device, stable pointer). Called BEFORE every
+    /// `cuGraphLaunch` of the outer captured graph so the recorded raw kernel
+    /// launches — which read from this buffer's stable address at execution
+    /// time — see fresh `p` / other dyn dims instead of frozen capture-step
+    /// values. Skipped when there are no dyn dims, or when the buffer hasn't
+    /// been allocated yet (no warmup pass to allocate it). Must NOT run while
+    /// the stream itself is currently capturing — the MB loop calls this
+    /// outside its begin/end_stream_capture window.
+    fn refresh_capture_dyn_dims(
+        &self,
+        stream: &Arc<CudaStream>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        if self.dyn_dims_order.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.borrow_mut();
+        // Merge: start with the warmup-step snapshot of ALL dims (static + dynamic
+        // captured by `execute_internal`'s last `dyn_map.clone()`), then override
+        // with the caller's per-step values (typically just `'p'`). Without this
+        // merge, dims the MB loop doesn't know about (`s`, batch, etc.) collapse
+        // to 0 in `dyn_dims_buffer` and decoder kernels read zero sizes.
+        let values: Vec<i32> = self
+            .dyn_dims_order
+            .iter()
+            .map(|d| {
+                dyn_map
+                    .get(d)
+                    .copied()
+                    .or_else(|| state.last_dyn_values.get(d).copied())
+                    .unwrap_or(0) as i32
+            })
+            .collect();
+        let Some(buf) = state.dyn_dims_buffer.as_mut() else {
+            return Ok(());
+        };
+        stream.memcpy_htod(&values, buf)?;
+        Ok(())
+    }
 }
 
 impl CudaGraphOp {
@@ -422,6 +476,20 @@ impl CudaGraphOp {
         Ok(())
     }
 
+    /// True if `stream` is currently recording into a CUDA graph (an outer
+    /// full-step capture is active). While capturing, host-side stream ops — a
+    /// synchronous dyn_dims memcpy, an internal-buffer realloc, a graph rebuild —
+    /// are illegal (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED). They were all done on
+    /// the warmup step(s) before capture, so this lets `execute_internal` skip them
+    /// and record only raw kernel launches.
+    fn stream_is_capturing(_stream: &CudaStream) -> bool {
+        // Authoritative for THREAD_LOCAL mode: cuStreamGetCaptureInfo reports
+        // ACTIVE only for the stream the capture begun on, but illegal ops fail
+        // thread-wide. The flag is set by `begin_stream_capture(_keyed)` and
+        // cleared by `end_stream_capture(_keyed)`.
+        crate::host::capture_active()
+    }
+
     /// Execute the CUDA graph with the given buffers and dynamic dimensions.
     fn execute_internal(
         &self,
@@ -431,6 +499,9 @@ impl CudaGraphOp {
     ) -> anyhow::Result<()> {
         let mut state = self.state.borrow_mut();
         let _span = span!(Level::TRACE, "cuda_graph", kernels = state.kernels.len()).entered();
+        // Outer full-step capture active? Then skip per-step host stream ops (done
+        // at warmup); only raw kernel launches may be recorded.
+        let capturing = Self::stream_is_capturing(stream);
 
         // Check if dyn_map changed
         let dyn_map_changed = dyn_map.len() != state.last_dyn_values.len()
@@ -451,8 +522,9 @@ impl CudaGraphOp {
             }
         }
 
-        // Reallocate internal buffers if needed
-        if needs_internal_realloc {
+        // Reallocate internal buffers if needed (never mid-capture — an alloc is
+        // illegal there; for fixed-shape decode this is false after warmup anyway).
+        if needs_internal_realloc && !capturing {
             for kernel in state.kernels.iter_mut() {
                 kernel.internal_bufs = kernel.kernel_op.allocate_internal_buffers(stream, dyn_map);
             }
@@ -460,7 +532,7 @@ impl CudaGraphOp {
         // Only force full rebuild when internal buffer sizes change.
         // Dim-only changes (e.g. position offset `p` incrementing each decode step) are
         // handled by updating the dyn_dims device buffer + kernel node params in-place.
-        if needs_internal_realloc {
+        if needs_internal_realloc && !capturing {
             state.cuda_graph = None;
             state.cuda_graph_exec = None;
             state.node_to_graph_node.clear();
@@ -476,8 +548,11 @@ impl CudaGraphOp {
             );
         }
 
-        // Update shared dyn_dims buffer if dyn_map changed
-        if dyn_map_changed && !self.dyn_dims_order.is_empty() {
+        // Update shared dyn_dims buffer if dyn_map changed. Skipped mid-capture: a
+        // sync memcpy is illegal there, and on replay execute_internal never runs —
+        // decode kernels read position from the device buffers refreshed outside the
+        // captured region, not from dyn_dims, so the warmup-step value suffices.
+        if dyn_map_changed && !self.dyn_dims_order.is_empty() && !capturing {
             let values: Vec<i32> = self
                 .dyn_dims_order
                 .iter()
@@ -488,8 +563,10 @@ impl CudaGraphOp {
             }
         }
 
-        // Build CUDA graph if needed
-        if state.cuda_graph.is_none() {
+        // Build CUDA graph if needed (never mid-capture: build_graph allocs +
+        // pre_executes; raw-launch capture doesn't use the inner graph anyway, and
+        // warmup already built/allocated everything before capture began).
+        if state.cuda_graph.is_none() && !capturing {
             self.build_graph(&mut state, stream, buffers, dyn_map)?;
             // Fresh graph nodes: invalidate the per-node dirty cache so every
             // node is set at least once before the first replay.
@@ -532,14 +609,42 @@ impl CudaGraphOp {
         // graph. Same result (kernels serialize in-order on the stream), but the
         // launches are recordable by an outer cuStreamBeginCapture — cuGraphLaunch
         // is not. Prerequisite for capturing the whole forward into one graph.
-        static RAW_LAUNCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let raw_launch = *RAW_LAUNCH.get_or_init(|| std::env::var_os("SKEIN_RAW_LAUNCH").is_some());
+        // Capture mode REQUIRES raw launches: an outer cuStreamBeginCapture can
+        // record cuLaunchKernel but NOT cuGraphLaunch of this op's own inner graph.
+        // BUT raw launches outside capture skip the per-step inner-graph node-param
+        // updates that the inner-graph path performs (the inner graph's host-side
+        // book-keeping ties decode kernels to the current dyn_map + buffer pointers).
+        // So switch to raw launches ONLY while a capture is actively recording
+        // (host::capture_active set between begin/end_stream_capture). At all other
+        // times — warmups under MB_CAPTURE, baseline decode — replay the inner graph
+        // exactly as the non-capture path does. SKEIN_RAW_LAUNCH forces it everywhere
+        // for the standalone single-stream capture diagnostic.
+        let raw_launch =
+            std::env::var_os("SKEIN_RAW_LAUNCH").is_some() || crate::host::capture_active();
         if raw_launch {
             let dyn_dims_ptr = state
                 .dyn_dims_buffer
                 .as_ref()
                 .map(|buf| buf.device_ptr(stream).0)
                 .unwrap_or(0);
+            // Dump dyn_dims_buffer contents one-shot to compare against the
+            // warmup path's values for this same op.
+            static RAW_DYN_DUMPED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if std::env::var_os("SKEIN_DEBUG_STATE").is_some()
+                && dyn_dims_ptr != 0
+                && RAW_DYN_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+            {
+                let n = self.dyn_dims_order.len();
+                let mut vals = vec![0i32; n];
+                if let Some(buf) = state.dyn_dims_buffer.as_ref() {
+                    let _ = stream.memcpy_dtoh(buf, &mut vals);
+                }
+                eprintln!(
+                    "DBG raw_launch DYN_DIMS dyn_dims_ptr=0x{:x} order={:?} values={:?}",
+                    dyn_dims_ptr, self.dyn_dims_order, vals
+                );
+            }
             let cu_stream = stream.cu_stream();
             let num_kernels = state.kernels.len();
             // SKEIN_KERNEL_TIMING (non-captured): record a CUDA event between every
@@ -556,41 +661,101 @@ impl CudaGraphOp {
             let kt_ctx = stream.context();
             let mut kt_ev: Vec<cudarc::driver::sys::CUevent> = Vec::new();
             let mut kt_names: Vec<&'static str> = Vec::new();
+            // The captured stream-graph stores cuLaunchKernel's `kernelParams`
+            // BY POINTER, not by value — the pointed-to buffer must stay alive
+            // through every replay. A local `params` here drops at iteration end,
+            // leaving the graph reading freed memory (the classic "model emits one
+            // repeated token forever" signature). The inner-graph path's
+            // `kernel_params[idx]` SLOT is also unsuitable here: each capture of a
+            // different key overwrites the previous capture's slot and frees its
+            // heap allocations, so the older captured graph then reads freed memory
+            // (correct first replay's-worth of state but degenerate from the
+            // following key's capture onward). Instead, push into an append-only
+            // pool — the new entry's internal-Vec heap allocations never move and
+            // are never freed, so every captured graph keeps a valid kernelParams
+            // pointer for the run.
+            let pool_base = state.captured_kernel_params.len();
+            state.captured_kernel_params.reserve(num_kernels);
+            // One-shot per process per CudaGraphOp: log first 3 kernels of the
+            // FIRST raw_launch for this op (i.e. first capture-step invocation
+            // of this segment's CudaGraphOp).
+            static RAW_LAUNCH_DUMPED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let dbg_state = std::env::var_os("SKEIN_DEBUG_STATE").is_some()
+                && RAW_LAUNCH_DUMPED.load(std::sync::atomic::Ordering::Relaxed) < 3;
+            if dbg_state {
+                RAW_LAUNCH_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             for idx in 0..num_kernels {
-                let kernel = &state.kernels[idx];
-                let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
-                let input_ptrs: Vec<u64> = kernel
-                    .inputs
-                    .iter()
-                    .map(|i| current_buffer_ptrs.get(i).copied().unwrap_or(0))
-                    .collect();
-                let grid = (
-                    kernel.grid.0.exec(dyn_map).unwrap() as u32,
-                    kernel.grid.1.exec(dyn_map).unwrap() as u32,
-                    kernel.grid.2.exec(dyn_map).unwrap() as u32,
-                );
-                let block = (
-                    kernel.block.0.exec(dyn_map).unwrap() as u32,
-                    kernel.block.1.exec(dyn_map).unwrap() as u32,
-                    kernel.block.2.exec(dyn_map).unwrap() as u32,
-                );
-                let shared = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
-                let kdp = if kernel.has_dyn_dims_param {
-                    dyn_dims_ptr
-                } else {
-                    0
+                // Extract everything we need from the immutable kernel borrow
+                // FIRST, then drop it so we can mutate state.kernel_params below.
+                let (output_ptr, input_ptrs, grid, block, shared, kdp, pv, cu_func, kernel_name): (
+                    u64,
+                    Vec<u64>,
+                    (u32, u32, u32),
+                    (u32, u32, u32),
+                    u32,
+                    u64,
+                    Vec<u64>,
+                    cudarc::driver::sys::CUfunction,
+                    &'static str,
+                ) = {
+                    let kernel = &state.kernels[idx];
+                    let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
+                    let input_ptrs: Vec<u64> = kernel
+                        .inputs
+                        .iter()
+                        .map(|i| current_buffer_ptrs.get(i).copied().unwrap_or(0))
+                        .collect();
+                    let grid = (
+                        kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                        kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                        kernel.grid.2.exec(dyn_map).unwrap() as u32,
+                    );
+                    let block = (
+                        kernel.block.0.exec(dyn_map).unwrap() as u32,
+                        kernel.block.1.exec(dyn_map).unwrap() as u32,
+                        kernel.block.2.exec(dyn_map).unwrap() as u32,
+                    );
+                    let shared = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
+                    let kdp = if kernel.has_dyn_dims_param {
+                        dyn_dims_ptr
+                    } else {
+                        0
+                    };
+                    Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
+                    let pv = kernel.kernel_op.build_params(
+                        stream,
+                        output_ptr,
+                        &input_ptrs,
+                        &kernel.internal_bufs,
+                        kdp,
+                    );
+                    let cu_func = unsafe { kernel.function.raw_function() };
+                    (output_ptr, input_ptrs, grid, block, shared, kdp, pv, cu_func, kernel.kernel_name)
                 };
-                Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
-                let pv = kernel.kernel_op.build_params(
-                    stream,
-                    output_ptr,
-                    &input_ptrs,
-                    &kernel.internal_bufs,
-                    kdp,
-                );
-                let mut params = UnifiedKernelParams::new(pv);
-                let params_ptr = params.as_cuda_params();
-                let cu_func = unsafe { kernel.function.raw_function() };
+                if dbg_state && idx < 3 {
+                    eprintln!(
+                        "DBG raw_launch idx={} name={} out=0x{:x} in0=0x{:x} in1=0x{:x} grid=({},{},{}) block=({},{},{}) kdp=0x{:x} pv_first=0x{:x}",
+                        idx,
+                        kernel_name,
+                        output_ptr,
+                        input_ptrs.first().copied().unwrap_or(0),
+                        input_ptrs.get(1).copied().unwrap_or(0),
+                        grid.0, grid.1, grid.2,
+                        block.0, block.1, block.2,
+                        kdp,
+                        pv.first().copied().unwrap_or(0),
+                    );
+                }
+                let _ = (output_ptr, input_ptrs, kdp); // params packed in pv already
+                state.captured_kernel_params.push(UnifiedKernelParams::new(pv));
+                let params_ptr = state
+                    .captured_kernel_params
+                    .last_mut()
+                    .unwrap()
+                    .as_cuda_params();
+                let _ = pool_base;
                 // SKEIN_KERNEL_TIMING (uncaptured): event BEFORE this kernel so
                 // consecutive events bracket it. SKEIN_GRAPH_KERNEL_TIMING (captured):
                 // same, but the cuEventRecord is captured as a graph node and read
@@ -599,9 +764,9 @@ impl CudaGraphOp {
                     let e = create_cuda_event(&kt_ctx)?;
                     record_event_on_stream(&kt_ctx, e, stream)?;
                     kt_ev.push(e);
-                    kt_names.push(kernel.kernel_name);
+                    kt_names.push(kernel_name);
                 }
-                crate::host::graph_kt_before(stream, kernel.kernel_name);
+                crate::host::graph_kt_before(stream, kernel_name);
                 unsafe {
                     cudarc::driver::sys::cuLaunchKernel(
                         cu_func, grid.0, grid.1, grid.2, block.0, block.1, block.2, shared,
@@ -679,6 +844,23 @@ impl CudaGraphOp {
                 .as_ref()
                 .map(|buf| buf.device_ptr(stream).0)
                 .unwrap_or(0);
+            // Dump dyn_dims_buffer contents one-shot — compare vs raw_launch.
+            static INNER_DYN_DUMPED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if std::env::var_os("SKEIN_DEBUG_STATE").is_some()
+                && dyn_dims_ptr != 0
+                && INNER_DYN_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+            {
+                let n = self.dyn_dims_order.len();
+                let mut vals = vec![0i32; n];
+                if let Some(buf) = state.dyn_dims_buffer.as_ref() {
+                    let _ = stream.memcpy_dtoh(buf, &mut vals);
+                }
+                eprintln!(
+                    "DBG inner_graph DYN_DIMS dyn_dims_ptr=0x{:x} order={:?} values={:?} dyn_map={:?}",
+                    dyn_dims_ptr, self.dyn_dims_order, vals, dyn_map
+                );
+            }
 
             let num_kernels = state.kernels.len();
             if state.last_applied.len() != num_kernels {
@@ -760,6 +942,26 @@ impl CudaGraphOp {
                         &kernel.internal_bufs,
                         kernel_dyn_dims_ptr,
                     );
+                    static INNER_DUMPED: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if std::env::var_os("SKEIN_DEBUG_STATE").is_some()
+                        && idx < 3
+                        && INNER_DUMPED.load(std::sync::atomic::Ordering::Relaxed) < 3
+                    {
+                        INNER_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!(
+                            "DBG inner_graph idx={} name={} out=0x{:x} in0=0x{:x} in1=0x{:x} grid=({},{},{}) block=({},{},{}) kdp=0x{:x} pv_first=0x{:x}",
+                            idx,
+                            kernel.kernel_name,
+                            output_ptr,
+                            input_ptrs.first().copied().unwrap_or(0),
+                            input_ptrs.get(1).copied().unwrap_or(0),
+                            grid_dim.0, grid_dim.1, grid_dim.2,
+                            block_dim.0, block_dim.1, block_dim.2,
+                            kernel_dyn_dims_ptr,
+                            param_values.first().copied().unwrap_or(0),
+                        );
+                    }
                     state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
                 }
 

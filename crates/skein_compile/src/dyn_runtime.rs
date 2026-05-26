@@ -231,6 +231,12 @@ pub trait DynRuntime {
         None
     }
 
+    /// SKEIN_DEBUG_STATE: device pointer of an INPUT buffer for handoff `id`
+    /// (the one that immediate setters write into). Default `None`.
+    fn dbg_input_device_ptr_by_id(&self, _id: HandoffId) -> Option<u64> {
+        None
+    }
+
     /// Ensure a named KV-cache **input** is backed by a persistent on-GPU buffer
     /// of `n_bytes`, by id, returning its device pointer. CUDA only; `None`.
     /// See [`DynRuntime::ensure_kv_input_device_by_name`].
@@ -349,6 +355,20 @@ pub trait DynRuntime {
     fn has_captured_graph(&self) -> bool {
         false
     }
+
+    /// Keyed multi-graph capture for MB decode: one graph per microbatch slot.
+    /// CUDA only; defaults no-op / `false`.
+    fn end_stream_capture_keyed(&self, _key: u64) {}
+    fn replay_captured_keyed(&self, _key: u64) -> bool {
+        false
+    }
+    fn has_captured_graph_keyed(&self, _key: u64) -> bool {
+        false
+    }
+
+    /// MB capture: refresh every host op's per-step device state from
+    /// `dyn_map` so the next captured-graph replay sees fresh values.
+    fn refresh_capture_dyn_dims(&self, _dyn_map: &std::collections::HashMap<char, usize>) {}
 
     /// Set a dynamic-shape dimension (e.g. the cached-decode `past` length `'p'`)
     /// on the segment's graph before the next [`execute_segment`]. The default
@@ -800,6 +820,7 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
             .get(&node)
             .map(|(_, dt)| *dt)
             .unwrap_or(DType::F32);
+        let _ = data.first().copied().unwrap_or(0.0);
         // In-place upload to the input's resident (persistent under capture)
         // device buffer — now, not at the next execute().
         self.inner.set_data_f32_as(node, data, dtype);
@@ -836,6 +857,11 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
 
     fn weight_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
         let node = self.node_for_output_id(id)?;
+        self.inner.input_device_ptr(node)
+    }
+
+    fn dbg_input_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
+        let node = self.node_for_input_id(id)?;
         self.inner.input_device_ptr(node)
     }
 
@@ -939,5 +965,17 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
     }
     fn has_captured_graph(&self) -> bool {
         self.inner.has_captured_graph()
+    }
+    fn end_stream_capture_keyed(&self, key: u64) {
+        self.inner.end_stream_capture_keyed(key);
+    }
+    fn replay_captured_keyed(&self, key: u64) -> bool {
+        self.inner.replay_captured_keyed(key)
+    }
+    fn has_captured_graph_keyed(&self, key: u64) -> bool {
+        self.inner.has_captured_graph_keyed(key)
+    }
+    fn refresh_capture_dyn_dims(&self, dyn_map: &std::collections::HashMap<char, usize>) {
+        self.inner.refresh_capture_dyn_dims(dyn_map);
     }
 }

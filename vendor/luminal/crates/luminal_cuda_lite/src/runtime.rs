@@ -1,6 +1,6 @@
 use crate::{
     host::{DeviceBuffer, HostOp},
-    kernel::{CudaGraphTiming, KernelOp, record_cuda_graph_timings},
+    kernel::{CudaGraphTiming, KernelOp, cuda_graph::CudaFunctionExt, record_cuda_graph_timings},
 };
 use cudarc::driver::{
     CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, result,
@@ -204,6 +204,59 @@ pub struct CudaRuntime {
     /// whole pre-all-gather decode forward recorded once, replayed per token with
     /// one `cuGraphLaunch` instead of ~12k host CUDA calls.
     captured_graph_exec: std::cell::RefCell<Option<cudarc::driver::sys::CUgraphExec>>,
+    /// Multi-graph capture (MB decode): one captured full-step graph per
+    /// microbatch slot (each has its own paged-KV buffer), replayed round-robin
+    /// by the 1F1B loop so kernels run back-to-back with no per-segment host gaps.
+    captured_graph_execs:
+        std::cell::RefCell<std::collections::HashMap<u64, cudarc::driver::sys::CUgraphExec>>,
+
+    /// Append-only stable storage for kernel launch parameters recorded into
+    /// captured graphs by this runtime's helper launches (kv_slot_write,
+    /// kv_slot_write_batched, device_shm_all_reduce). cudarc's `launch_builder`
+    /// stashes `&local_value` into `cuLaunchKernel`'s `kernelParams` array; when
+    /// the launch is recorded into an outer captured graph, the graph stores
+    /// those pointers BY ADDRESS and re-reads them on every replay. The local
+    /// values (and the `args: Vec` inside `LaunchArgs`) die when the helper
+    /// function returns, so the captured graph then reads freed stack memory
+    /// (correct first replay, then `argmax` on NaN/Inf logits → token 31999
+    /// forever). This pool keeps each captured launch's params alive — entries
+    /// are pushed in order, never removed, and inner-`Vec` heap data is stable
+    /// across outer-`Vec` reallocations (move = `(ptr,len,cap)` bitcopy; heap
+    /// pointer doesn't change).
+    captured_launch_params: std::cell::RefCell<Vec<CapturedLaunchParams>>,
+}
+
+/// Stable kernel-params storage for [`CudaRuntime::captured_launch_params`].
+/// Mirrors `UnifiedKernelParams` in `kernel/to_host.rs` but lives here so the
+/// runtime's helper launches can be made capture-safe without re-exporting
+/// that private type. `values` holds the packed u64 slots (smaller args are
+/// zero-extended; the kernel reads only the bytes it needs — little-endian).
+/// `ptrs` holds `&values[i]` for each slot, and `as_cuda_params` returns
+/// `ptrs.as_mut_ptr()` — exactly what `cuLaunchKernel`'s `kernelParams`
+/// expects, and stable for the lifetime of the entry.
+struct CapturedLaunchParams {
+    values: Vec<u64>,
+    ptrs: Vec<*mut std::ffi::c_void>,
+}
+
+impl CapturedLaunchParams {
+    fn new(values: Vec<u64>) -> Self {
+        let ptrs = values
+            .iter()
+            .map(|v| v as *const u64 as *mut std::ffi::c_void)
+            .collect();
+        Self { values, ptrs }
+    }
+
+    fn as_cuda_params(&mut self) -> *mut *mut std::ffi::c_void {
+        // Re-derive in case the struct moved (Vec realloc copies the struct's
+        // bits but the inner Vec's heap data doesn't move, so `&values[i]`
+        // remains the same address — refresh defensively, matching to_host.rs).
+        for (i, v) in self.values.iter().enumerate() {
+            self.ptrs[i] = v as *const u64 as *mut std::ffi::c_void;
+        }
+        self.ptrs.as_mut_ptr()
+    }
 }
 
 /// Process-wide shared **non-default** CUDA stream for the `SKEIN_CAPTURE` path.
@@ -263,9 +316,11 @@ impl CudaRuntime {
         if std::env::var_os("SKEIN_NO_EVENT_TRACKING").is_some() {
             unsafe { ctx.disable_event_tracking() };
         }
-        // SKEIN_CAPTURE: share one non-default stream (capture can't run on the
-        // legacy default stream); see `capture_stream`.
-        let stream = if std::env::var_os("SKEIN_CAPTURE").is_some() {
+        // SKEIN_CAPTURE / SKEIN_MB_CAPTURE: share one non-default stream (capture
+        // can't run on the legacy default stream); see `capture_stream`.
+        let stream = if std::env::var_os("SKEIN_CAPTURE").is_some()
+            || std::env::var_os("SKEIN_MB_CAPTURE").is_some()
+        {
             capture_stream(&ctx)
         } else {
             ctx.default_stream()
@@ -412,8 +467,9 @@ impl CudaRuntime {
             self.hlir_buffers.get(&id),
             Some(CudaInput::Buffer(buf)) if buf.len() == data.as_host_bytes().len()
         );
-        let dbg_small = std::env::var_os("SKEIN_FI_LOG").is_some()
-            && data.as_host_bytes().len() <= 8;
+        let dbg_small = (std::env::var_os("SKEIN_FI_LOG").is_some()
+            && data.as_host_bytes().len() <= 8)
+            || std::env::var_os("SKEIN_SETDATA_TRACE").is_some();
         if same_size {
             let stream = self.cuda_stream.clone();
             let mut p = 0u64;
@@ -447,8 +503,7 @@ impl CudaRuntime {
         // of correct warmup but garbage replays). Persisting it keeps the address
         // stable so the in-place branch above handles all subsequent steps and the
         // captured graph always reads the current data.
-        static CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *CAP.get_or_init(|| std::env::var_os("SKEIN_CAPTURE").is_some()) {
+        if crate::host::is_capture() {
             self.persistent_hlir_inputs.insert(id);
         }
     }
@@ -711,6 +766,131 @@ impl CudaRuntime {
             .expect("memcpy_htod decode_position");
     }
 
+    /// Debug helper for the SKEIN_DEBUG_STATE table: return the current
+    /// decode_position device pointer + readback value (if allocated).
+    pub fn dbg_decode_position(&self) -> Option<(u64, i32)> {
+        let slot = self.decode_position.borrow();
+        let buf = slot.as_ref()?;
+        let ptr = buf.device_ptr(&self.cuda_stream).0;
+        let mut rb = [0i32; 1];
+        self.cuda_stream.memcpy_dtoh(buf, &mut rb).ok()?;
+        Some((ptr, rb[0]))
+    }
+
+    /// Debug helper: read 8 bytes at `dev_ptr` to host as u64 (sync). Used
+    /// only by SKEIN_DEBUG_STATE to inspect small device buffers like
+    /// `input_tokens` and the dyn_dims buffer without exposing CudaSlice.
+    pub fn dbg_read_u64(&self, dev_ptr: u64) -> u64 {
+        let mut out = [0u8; 8];
+        unsafe {
+            let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                out.as_mut_ptr() as *mut _,
+                dev_ptr,
+                8,
+            );
+        }
+        u64::from_le_bytes(out)
+    }
+
+    /// Debug helper: read `n_bytes` at `dev_ptr` and return a tiny FNV-1a
+    /// checksum (32-bit). Synchronous D2H — debugging only.
+    pub fn dbg_checksum(&self, dev_ptr: u64, n_bytes: usize) -> u32 {
+        let n = n_bytes.min(1 << 20);
+        let mut buf = vec![0u8; n];
+        unsafe {
+            let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut _,
+                dev_ptr,
+                n,
+            );
+        }
+        let mut h: u32 = 0x811c9dc5;
+        for &b in &buf {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        h
+    }
+
+    /// Capture-safe kernel launch. `packed_args` holds one u64 slot per kernel
+    /// argument, in declaration order: pointer args occupy the full 8 bytes;
+    /// scalar args narrower than 8 bytes are zero-extended (the kernel reads
+    /// only the bytes it expects from each slot — CUDA host is little-endian,
+    /// so the lower bytes of the u64 are the value). Outside capture, points
+    /// into a transient on-stack pointer vector (same as `launch_builder`).
+    /// Inside capture, pushes the slots into `captured_launch_params` and
+    /// passes the pool entry's stable `*mut *mut c_void` to `cuLaunchKernel`,
+    /// so the recorded `kernelParams` stays valid for every replay.
+    ///
+    /// # Safety
+    /// `packed_args` must match the kernel's signature byte-by-byte (size and
+    /// order). The function pointer must outlive every replay of any captured
+    /// graph that records this launch.
+    unsafe fn launch_with_packed_args(
+        &self,
+        func: &CudaFunction,
+        cfg: LaunchConfig,
+        packed_args: Vec<u64>,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        use cudarc::driver::sys;
+        let cu_func = unsafe { func.raw_function() };
+        let cu_stream = self.cuda_stream.cu_stream();
+        if crate::host::capture_active() {
+            // Stable storage: the captured graph records `kernelParams` by
+            // pointer and reads it on every replay; stack-local pointers from
+            // `launch_builder` would be freed by the time the first replay
+            // runs and CUDA would dereference garbage.
+            let mut pool = self.captured_launch_params.borrow_mut();
+            pool.push(CapturedLaunchParams::new(packed_args));
+            let params_ptr = pool.last_mut().unwrap().as_cuda_params();
+            unsafe {
+                sys::cuLaunchKernel(
+                    cu_func,
+                    cfg.grid_dim.0,
+                    cfg.grid_dim.1,
+                    cfg.grid_dim.2,
+                    cfg.block_dim.0,
+                    cfg.block_dim.1,
+                    cfg.block_dim.2,
+                    cfg.shared_mem_bytes,
+                    cu_stream,
+                    params_ptr,
+                    std::ptr::null_mut(),
+                )
+                .result()?;
+            }
+            Ok(())
+        } else {
+            // Fast path: values live until the call returns, which is enough
+            // for cuLaunchKernel to read them (no graph capture in flight).
+            let mut ptrs: Vec<*mut std::ffi::c_void> = packed_args
+                .iter()
+                .map(|v| v as *const u64 as *mut std::ffi::c_void)
+                .collect();
+            unsafe {
+                sys::cuLaunchKernel(
+                    cu_func,
+                    cfg.grid_dim.0,
+                    cfg.grid_dim.1,
+                    cfg.grid_dim.2,
+                    cfg.block_dim.0,
+                    cfg.block_dim.1,
+                    cfg.block_dim.2,
+                    cfg.shared_mem_bytes,
+                    cu_stream,
+                    ptrs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+                .result()?;
+            }
+            // Hold packed_args alive across the launch (kept by being on the
+            // stack here). The launch is async, but the driver dereferences
+            // kernelParams before returning — no further reach.
+            drop(packed_args);
+            Ok(())
+        }
+    }
+
     fn kv_write_fn(&self) -> &CudaFunction {
         let (_, func) = self.kv_write_kernel.get_or_init(|| {
             // dst = base + position * (n_words*4) bytes; copy n_words u32 words.
@@ -774,15 +954,13 @@ extern "C" __global__ void kv_slot_write(
             shared_mem_bytes: 0,
         };
         unsafe {
-            self.cuda_stream
-                .launch_builder(&func)
-                .arg(&src_ptr)
-                .arg(&base_ptr)
-                .arg(&pos_ptr)
-                .arg(&n_words)
-                .launch(cfg)
-                .expect("launch kv_slot_write");
+            self.launch_with_packed_args(
+                &func,
+                cfg,
+                vec![src_ptr, base_ptr, pos_ptr, n_words as u32 as u64],
+            )
         }
+        .expect("launch kv_slot_write");
     }
 
     /// Batched KV append: write the new token's K/V for every batch row into a
@@ -826,17 +1004,20 @@ extern "C" __global__ void kv_slot_write(
         let batch_i = batch as i32;
         let cap_i = cap as i32;
         unsafe {
-            self.cuda_stream
-                .launch_builder(&func)
-                .arg(&src_ptr)
-                .arg(&base_ptr)
-                .arg(&pos_ptr)
-                .arg(&row_words)
-                .arg(&batch_i)
-                .arg(&cap_i)
-                .launch(cfg)
-                .expect("launch kv_slot_write_batched");
+            self.launch_with_packed_args(
+                &func,
+                cfg,
+                vec![
+                    src_ptr,
+                    base_ptr,
+                    pos_ptr,
+                    row_words as u32 as u64,
+                    batch_i as u32 as u64,
+                    cap_i as u32 as u64,
+                ],
+            )
         }
+        .expect("launch kv_slot_write_batched");
     }
 
     fn kv_write_batched_fn(&self) -> &CudaFunction {
@@ -953,16 +1134,19 @@ extern "C" __global__ void shm_allreduce2(
         };
         let elems_i = elems as i32;
         unsafe {
-            self.cuda_stream
-                .launch_builder(&func)
-                .arg(&data_ptr)
-                .arg(&shm_ptr)
-                .arg(&rank)
-                .arg(&elems_i)
-                .arg(&slot_bytes)
-                .launch(cfg)
-                .expect("launch shm_allreduce2");
+            self.launch_with_packed_args(
+                &func,
+                cfg,
+                vec![
+                    data_ptr,
+                    shm_ptr,
+                    rank as u32 as u64,
+                    elems_i as u32 as u64,
+                    slot_bytes as u32 as u64,
+                ],
+            )
         }
+        .expect("launch shm_allreduce2");
     }
 
     /// Allocate a zeroed device buffer of `n_bytes` and return its raw pointer.
@@ -1022,6 +1206,22 @@ extern "C" __global__ void shm_allreduce2(
     // Any segment runtime can drive these: they all share the one capture stream,
     // so a capture begun here records every kernel any runtime launches on it.
 
+    /// MB capture: walk every host op in the active bucket's exec_graph and ask
+    /// each to refresh its per-step device state (e.g. `CudaGraphOp`'s
+    /// `dyn_dims_buffer`) from `dyn_map`. Called by the MB loop BEFORE every
+    /// `cuGraphLaunch` of the outer captured graph, OUTSIDE the begin/end
+    /// stream capture window — the recorded raw kernel launches read the
+    /// refreshed buffers at their stable device addresses.
+    pub fn refresh_capture_dyn_dims(&self, dyn_map: &FxHashMap<char, usize>) {
+        let bucket = self.active();
+        for exec_node in bucket.exec_graph.node_indices() {
+            let exec_op = &bucket.exec_graph[exec_node];
+            let _ = exec_op
+                .internal
+                .refresh_capture_dyn_dims(&self.cuda_stream, dyn_map);
+        }
+    }
+
     /// Begin recording the shared stream into a CUDA graph.
     pub fn begin_stream_capture(&self) -> Result<(), cudarc::driver::DriverError> {
         // SKEIN_GRAPH_KERNEL_TIMING: drop any prior event chain — this capture
@@ -1033,8 +1233,17 @@ extern "C" __global__ void shm_allreduce2(
                 s,
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
             )
-            .result()
+            .result()?;
         }
+        // THREAD_LOCAL capture mode makes illegal ops fail thread-wide; flip
+        // the flag the capture-aware paths consult before any host stream op.
+        crate::host::set_capture_active(true);
+        // Cudarc-side flag: makes every `launch_builder(...).arg(...).launch()`
+        // (MoE Hopper kernels, cublaslt, runtime helpers) snapshot its arg
+        // values into a thread-local stable pool so the captured `kernelParams`
+        // pointer stays valid across replays. No-op outside this window.
+        cudarc::driver::set_capture_active(true);
+        Ok(())
     }
 
     /// End recording, instantiate the executable graph, and store it for replay.
@@ -1049,6 +1258,8 @@ extern "C" __global__ void shm_allreduce2(
             cudarc::driver::sys::cuGraphDestroy(graph);
             *self.captured_graph_exec.borrow_mut() = Some(exec.assume_init());
         }
+        crate::host::set_capture_active(false);
+        cudarc::driver::set_capture_active(false);
         Ok(())
     }
 
@@ -1079,6 +1290,46 @@ extern "C" __global__ void shm_allreduce2(
 
     pub fn has_captured_graph(&self) -> bool {
         self.captured_graph_exec.borrow().is_some()
+    }
+
+    /// End capture and store the executable graph under `key` (microbatch slot).
+    pub fn end_stream_capture_keyed(&self, key: u64) -> Result<(), cudarc::driver::DriverError> {
+        let s = self.cuda_stream.cu_stream();
+        let mut graph = std::mem::MaybeUninit::uninit();
+        let mut exec = std::mem::MaybeUninit::uninit();
+        unsafe {
+            cudarc::driver::sys::cuStreamEndCapture(s, graph.as_mut_ptr()).result()?;
+            let graph = graph.assume_init();
+            cudarc::driver::sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), graph, 0).result()?;
+            cudarc::driver::sys::cuGraphDestroy(graph);
+            self.captured_graph_execs
+                .borrow_mut()
+                .insert(key, exec.assume_init());
+        }
+        crate::host::set_capture_active(false);
+        cudarc::driver::set_capture_active(false);
+        Ok(())
+    }
+
+    /// Replay the captured graph for microbatch slot `key`. False if not captured.
+    pub fn replay_captured_keyed(&self, key: u64) -> bool {
+        let exec = self.captured_graph_execs.borrow().get(&key).copied();
+        match exec {
+            Some(exec) => {
+                let s = self.cuda_stream.cu_stream();
+                unsafe {
+                    cudarc::driver::sys::cuGraphLaunch(exec, s)
+                        .result()
+                        .expect("cuGraphLaunch (keyed MB capture)");
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn has_captured_graph_keyed(&self, key: u64) -> bool {
+        self.captured_graph_execs.borrow().contains_key(&key)
     }
 
     /// Resolve pending output pointer registrations into external_output_buffers.
@@ -1335,6 +1586,11 @@ extern "C" __global__ void shm_allreduce2(
         dyn_dims: &FxHashMap<char, usize>,
     ) {
         let needs_new_plan = !Self::buffer_plan_matches(bucket, dyn_dims);
+        let prev_arena_ptr = bucket
+            .arena
+            .as_ref()
+            .map(|a| a.device_ptr(stream).0)
+            .unwrap_or(0);
         if needs_new_plan {
             if bucket.arena.is_some() {
                 stream.synchronize().unwrap();
@@ -1357,6 +1613,7 @@ extern "C" __global__ void shm_allreduce2(
         }
 
         let arena_ptr = bucket.arena.as_ref().unwrap().device_ptr(stream).0;
+        let _ = prev_arena_ptr; // (debug-only — replan tracking)
         for (logical_node, &offset) in &bucket.logical_buffer_offsets {
             if let Some(ptr) = arena_ptr.checked_add(offset as u64) {
                 bucket.cached_buffer_ptrs.insert(*logical_node, ptr);
@@ -1837,6 +2094,8 @@ impl Runtime for CudaRuntime {
             kv_write_batched_kernel: std::sync::OnceLock::new(),
             shm_allreduce_kernel: std::sync::OnceLock::new(),
             captured_graph_exec: std::cell::RefCell::new(None),
+            captured_graph_execs: std::cell::RefCell::new(std::collections::HashMap::new()),
+            captured_launch_params: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -2270,11 +2529,8 @@ impl Runtime for CudaRuntime {
         // between steps (the normal consume behavior) would leave the replayed
         // graph reading a stale/reused address — garbage. set_data overwrites the
         // same-size buffer in place, so keeping them resident does NOT accumulate.
-        {
-            static CAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *CAP.get_or_init(|| std::env::var_os("SKEIN_CAPTURE").is_some()) {
-                return;
-            }
+        if crate::host::is_capture() {
+            return;
         }
         let bucket = &self.compiled_buckets[self.active_bucket];
         let mut inputs_with_outputs = bucket.preserved_hlir_inputs.clone();
