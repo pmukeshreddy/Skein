@@ -495,9 +495,7 @@ impl RankServer {
         // window is always device-only; under TP require it to stop before the
         // host logits tail (`hi < len`).
         let window_ok = hi > lo && (self.pp > 1 || hi < len);
-        let capture = std::env::var_os("SKEIN_CAPTURE").is_some()
-            && window_ok
-            && std::env::var_os("SKEIN_NO_SPLIT").is_none();
+        let capture = std::env::var_os("SKEIN_CAPTURE").is_some() && window_ok;
         // Captured-graph mode: run_segment must skip the per-token `input_tokens`
         // feed and `set_decode_position` memcpy so they aren't recorded into the
         // full-step graph (a recorded host→device copy bakes in a now-freed host
@@ -1619,24 +1617,6 @@ impl RankServer {
         // (keyed by kv_key) so concurrent microbatches don't clobber each other.
         self.executor.runner_mut().set_paged_device_kv(true);
 
-        // SKEIN_MB_CAPTURE: CUDA-graph the device-only decode forward, one graph
-        // per microbatch request (keyed by kv_key, whose contiguous KV buffer is
-        // stable for its lifetime). Each request runs `capture_at` warmup steps on
-        // the host launch path, captures on the next step, then replays — collapsing
-        // the per-kernel host-launch gaps (the ~36% GPU idle) into one cuGraphLaunch.
-        // The boundary carry (stage0 out / stage1 in) and the logits (stage1 out)
-        // are fed/read OUTSIDE the captured region via device-resident passthrough.
-        let mb_capture = std::env::var_os("SKEIN_MB_CAPTURE").is_some();
-        let capture_at: usize = std::env::var("SKEIN_MB_CAPTURE_AT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        if mb_capture {
-            let r = self.executor.runner_mut();
-            r.set_capture_passthrough_by_names(&[LOGITS]);
-            r.add_capture_passthrough_id(carry_id);
-        }
-
         struct Mb {
             idxs: Vec<usize>,        // original prompt indices (real rows only)
             kv_key: crate::types::RequestId,
@@ -1732,13 +1712,6 @@ impl RankServer {
                             res[(i - n_mb) * stage_mb..(i - n_mb + 1) * stage_mb].to_vec()
                         };
                         let input_i32: Vec<i32> = input.iter().map(|&t| t as i32).collect();
-                        // Warmup steps (k < capture_at) run the PROVEN staged path —
-                        // set_capturing stays false, run_segment does the normal H2D
-                        // for input_tokens, and the carry is read via the f32_slots
-                        // path. Only at/after the capture step do we flip to the
-                        // immediate-feed + device-resident-passthrough path that the
-                        // captured graph requires.
-                        let do_capture_step = mb_capture && k >= capture_at;
                         let t0 = Instant::now();
                         {
                             let r = self.executor.runner_mut();
@@ -1746,51 +1719,18 @@ impl RankServer {
                             r.advance_kv()?;
                             r.set_input_tokens(INPUT_TOKENS, input_i32.clone());
                             r.set_position(pos);
-                            if do_capture_step {
-                                r.set_capturing(true);
-                                r.flush_step_device_inputs(&input_i32, pos);
-                            } else {
-                                r.set_capturing(false);
-                            }
+                            r.set_capturing(false);
                         }
                         let t1 = Instant::now();
-                        if do_capture_step {
-                            let key = kv_key.0;
-                            let has = self.executor.runner().has_captured_keyed(key);
-                            if has {
-                                self.executor.runner().replay_captured_keyed(key);
-                            } else {
-                                self.executor.runner().begin_capture();
-                                self.executor
-                                    .run(&compute, &self.collective)
-                                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-                                self.executor.runner().end_capture_keyed(key);
-                                self.executor.runner().replay_captured_keyed(key);
-                                if mb_log {
-                                    eprintln!("MB_CAPTURE rank={} stage0 CAPTURED key={key} m={m} k={k}", self.layout.rank);
-                                }
-                            }
-                        } else {
-                            self.executor
-                                .run(&compute, &self.collective)
-                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-                        }
+                        self.executor
+                            .run(&compute, &self.collective)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                         let t2 = Instant::now();
-                        // Wait: D2H the carry (blocks on GPU completion). Capture-step
-                        // keeps carry device-resident → read via the device handoff;
-                        // warmup uses the host f32_slots path the baseline does.
-                        let buf = if do_capture_step {
-                            self.executor
-                                .runner()
-                                .read_device_handoff(carry_id)
-                                .ok_or_else(|| RuntimeError::ServerInit(
-                                    "MB capture: carry not device-resident".into()))?
-                        } else {
-                            self.executor
-                                .runner()
-                                .read_by_id(carry_id)
-                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?
-                        };
+                        let buf = self
+                            .executor
+                            .runner()
+                            .read_by_id(carry_id)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                         let t3 = Instant::now();
                         if i == 0 {
                             if mb_log {
@@ -1847,62 +1787,25 @@ impl RankServer {
                                 .map_err(to_rt)?
                         };
                         let tc1 = Instant::now();
-                        // Same warmup-vs-capture split as stage0: only at/after the
-                        // capture step do we feed carry via the immediate device-buffer
-                        // path. Warmup uses the proven host f32_slots → run_segment H2D.
-                        let do_capture_step = mb_capture && k >= capture_at;
                         {
                             let r = self.executor.runner_mut();
-                            if do_capture_step {
-                                r.set_capturing(true);
-                                r.feed_capture_input_f32(carry_id, buf);
-                            } else {
-                                r.set_capturing(false);
-                                r.write_by_id(carry_id, buf)
-                                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-                            }
+                            r.set_capturing(false);
+                            r.write_by_id(carry_id, buf)
+                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                             r.activate_request(kv_key, pos)?;
                             r.advance_kv()?;
                             r.set_position(pos);
-                            if do_capture_step {
-                                r.flush_step_device_inputs(&[], pos);
-                            }
                         }
                         let tc2 = Instant::now();
-                        if do_capture_step {
-                            let key = kv_key.0;
-                            let has = self.executor.runner().has_captured_keyed(key);
-                            if has {
-                                self.executor.runner().replay_captured_keyed(key);
-                            } else {
-                                self.executor.runner().begin_capture();
-                                self.executor
-                                    .run(&compute, &self.collective)
-                                    .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-                                self.executor.runner().end_capture_keyed(key);
-                                self.executor.runner().replay_captured_keyed(key);
-                                if mb_log {
-                                    eprintln!("MB_CAPTURE rank={} stage1 CAPTURED key={key} m={m} k={k}", self.layout.rank);
-                                }
-                            }
-                        } else {
-                            self.executor
-                                .run(&compute, &self.collective)
-                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
-                        }
+                        self.executor
+                            .run(&compute, &self.collective)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                         let tc3 = Instant::now();
-                        let logits = if do_capture_step {
-                            self.executor
-                                .runner()
-                                .read_device_handoff_by_name(LOGITS)
-                                .ok_or_else(|| RuntimeError::ServerInit(
-                                    "MB capture: logits not device-resident".into()))?
-                        } else {
-                            self.executor
-                                .runner()
-                                .read(LOGITS)
-                                .map_err(|e| RuntimeError::ServerInit(e.to_string()))?
-                        };
+                        let logits = self
+                            .executor
+                            .runner()
+                            .read(LOGITS)
+                            .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
                         let tc4 = Instant::now();
                         t_coll_s += (tc1 - tc0).as_secs_f64();
                         t_setup_s += (tc2 - tc1).as_secs_f64();
@@ -1982,27 +1885,6 @@ impl RankServer {
                 per(t_setup_s + t_launch_s + t_wait_s + t_coll_s),
                 per(t_setup_s), per(t_launch_s), per(t_wait_s), per(t_coll_s)
             );
-            if mb_capture {
-                // Under replay the launch (t1->t2) is an async cuGraphLaunch (~0),
-                // and the D2H carry/logits read (t2->t3 = `wait`) blocks on the
-                // whole back-to-back graph = real GPU kernel work. idle = residual
-                // host time (setup + launch) that capture collapses toward zero.
-                let total_ms = per(t_setup_s + t_launch_s + t_wait_s + t_coll_s);
-                let gpu_ms = per(t_wait_s);
-                let idle_ms = per(t_setup_s + t_launch_s);
-                // Degenerate-output guard (the classic capture-garbage signature is
-                // a request emitting one repeated token); the rigorous check is the
-                // capitals diff against the non-capture baseline, reported separately.
-                let coherent = results.iter().any(|(_, toks)| {
-                    toks.iter().collect::<std::collections::HashSet<_>>().len() > 3
-                });
-                eprintln!(
-                    "PROFILE_RESULT variant=cuda_graph_decode per_forward_ms={total_ms:.3} \
-                     gpu_kernel_work_ms={gpu_ms:.3} idle_ms={idle_ms:.3} decode_tps={agg:.2} \
-                     correct={}",
-                    if coherent { "yes" } else { "no" }
-                );
-            }
         }
         let mut out = Vec::with_capacity(n_total);
         for (_idx, toks) in results {
@@ -2068,36 +1950,6 @@ pub fn run_generation(
 
     // Cold run (no prefix cache populated yet).
     let cold = server.generate(&prompt_tokens, max_new_tokens)?;
-
-    // Prefix-cache demonstration: re-run the same prompt. The paged allocator's
-    // radix tree now holds the cold run's pages, so the shared prompt prefix is
-    // served from cache — fewer prefill steps — and the generated tokens are
-    // byte-identical, proving paged-KV prefix reuse is correct and active.
-    // (Page-granular: a hit needs a shared prefix >= page_size tokens.)
-    if std::env::var_os("SKEIN_PREFIX_DEMO").is_some() {
-        let warm = server.generate(&prompt_tokens, max_new_tokens)?;
-        if layout.is_leader() {
-            let identical = cold.tokens == warm.tokens;
-            tracing::info!(
-                prompt_tokens = cold.prompt_tokens,
-                page_size = server.kv_page_size(),
-                cold_prefix_hit = cold.prefix_hit_tokens,
-                cold_prefill_steps = cold.prefill_steps,
-                warm_prefix_hit = warm.prefix_hit_tokens,
-                warm_prefill_steps = warm.prefill_steps,
-                warm_kv_pages = warm.kv_pages_in_use,
-                tokens_identical = identical,
-                "SKEIN_PREFIX_DEMO: cold vs warm (prefix-cache reuse)"
-            );
-            if !identical {
-                tracing::error!(
-                    cold = ?cold.tokens,
-                    warm = ?warm.tokens,
-                    "SKEIN_PREFIX_DEMO: warm tokens differ from cold — reuse INCORRECT"
-                );
-            }
-        }
-    }
 
     if layout.is_leader() {
         let text = match tokenizer {
