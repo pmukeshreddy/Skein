@@ -1,6 +1,6 @@
 # Skein
 
-A compiler for distributed LLM inference. Skein decides **what** to run across your cluster — TP/PP/EP placement, KV layout, per-layer quantization, CUDA Graphs, prefix cache, continuous batching — and compiles it down to optimized per-device kernels.
+A compiler for distributed LLM inference. Skein finds the optimal placement across your cluster — TP/PP/EP, KV layout, per-layer quantization, CUDA Graphs, prefix cache, continuous batching — and compiles it down to per-device kernels.
 
 ## Pipeline
 
@@ -30,7 +30,7 @@ flowchart LR
 ## Build
 
 ```
-make build    # CUDA by default; CPU fallback when nvcc is absent
+make build
 make test
 make lint
 ```
@@ -40,7 +40,6 @@ make lint
 ```
 cargo build --release
 
-# Plan search — no GPU needed
 ./target/release/skein extract \
     --model   configs/mixtral_8x7b_config.json \
     --cluster cluster/rtx6000_2x.toml \
@@ -49,17 +48,15 @@ cargo build --release
     --cost    cluster/cost_constants.toml \
     --out     artifacts/plan.json
 
-# Full pipeline
 ./target/release/skein compile  --model ... --cluster cluster/rtx6000_2x.toml --weights ... --out artifacts/
 ./target/release/skein verify   --artifact artifacts/LATEST
 ./target/release/skein serve    --artifact artifacts/LATEST --port 8080
 ./target/release/skein bench    --artifact artifacts/LATEST --baseline <vllm-endpoint>
 
-# Calibrate once per (hardware, model) pair
 ./target/release/skein calibrate \
     --hardware rtx_pro_6000_blackwell \
     --model    configs/mixtral_8x7b_config.json \
     --corpus   crates/skein_calibrate/corpus/mixtral_8x7b.toml
 ```
 
-See `docs/` for the detailed design of each stage.
+See `docs/` for design details.
