@@ -27,7 +27,7 @@ artifacts/<plan_hash>/
 
 ## Parity Policy
 
-Compile follows the TensorRT-LLM / NVIDIA Model Optimizer pattern: artifact
+Compile follows the NVIDIA Model Optimizer pattern: artifact
 production and accuracy gating are separate by default. Parity runs inside
 compile because Skein uses the result to refine the drift table, but a failed
 parity report does not fail the compile unless `--enforce-parity` is set.
