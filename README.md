@@ -5,39 +5,12 @@ A compiler for distributed LLM inference. Skein decides **what** to run across y
 ## Pipeline
 
 ```mermaid
-flowchart TD
-    subgraph S1["Stage 1 — Plan Search  (no GPU needed)"]
-        IN[Model Config · Cluster Spec · Workload Trace] --> PARSE
-        CAL[Calibration\ncost constants + drift table] --> COST
-        COST[5-Term Cost Model\ncompute · comm · memory · bubble · launch] --> SEARCH
-        PARSE[Parse & Validate] --> SEARCH
-        SEARCH[Enumerate TP · PP · EP placements\nDP search over per-layer dtype] --> PLAN
-        PLAN([Winning Plan])
-    end
-
-    subgraph S2["Stage 2 — Compile  (GPU required)"]
-        PLAN --> LOWER
-        LOWER[Lower Plan to per-device graphs\nshard weights across GPUs] --> KERNELS
-        KERNELS[Search for optimal kernels\nper device] --> ART
-        ART([Compiled Artifact])
-    end
-
-    subgraph S3["Stage 3 — Parity Gate"]
-        ART --> PAR
-        PAR{Run bf16 reference vs candidate\nmeasure KL drift per layer}
-        PAR -->|drift ≤ SLO| OK([Artifact Accepted])
-        PAR -->|drift > SLO — raise drift table + re-search| SEARCH
-    end
-
-    subgraph S4["Stage 4 — Serve"]
-        OK --> BATCHER
-        BATCHER[Continuous Batcher\nadmit requests · mix prefill + decode]
-        BATCHER --> KV[Paged KV Cache\nradix tree · prefix reuse]
-        KV --> DECODE[Decode Forward]
-        DECODE --> GRAPHS[CUDA Graphs\ncapture · cache · replay]
-        GRAPHS --> HOTSWAP[Hot-swap\nswap artifact without dropping server]
-        HOTSWAP --> SERVER([HTTP Inference Server])
-    end
+flowchart LR
+    A[Model Config\nCluster · Workload] --> B[Plan Search\nTP·PP·EP + dtype DP]
+    B --> C[Compile\nper-device kernels]
+    C --> D{Parity Gate\nKL drift check}
+    D -->|pass| E[Serve\nCUDA Graphs · paged KV\ncontinuous batching]
+    D -->|fail → re-search| B
 ```
 
 ## Crates
