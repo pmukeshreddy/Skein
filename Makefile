@@ -42,7 +42,7 @@ clean:
 extract-mixtral:
 	$(CARGO) run -p skein_cli $(FEATURES) -- extract \
 	    --model   configs/mixtral_8x7b_config.json \
-	    --cluster cluster/h100_2x.toml \
+	    --cluster cluster/rtx6000_2x.toml \
 	    --trace   cluster/sample_trace.jsonl \
 	    --drift   models/mixtral_8x7b_drift.toml \
 	    --cost    cluster/cost_constants.toml \
@@ -63,7 +63,7 @@ require-cuda:
 compile-mixtral: require-cuda
 	$(CARGO) run -p skein_cli -- compile \
 	    --model   configs/mixtral_8x7b_config.json \
-	    --cluster cluster/h100_2x.toml \
+	    --cluster cluster/rtx6000_2x.toml \
 	    --trace   cluster/sample_trace.jsonl \
 	    --drift   models/mixtral_8x7b_drift.toml \
 	    --cost    cluster/cost_constants.toml \

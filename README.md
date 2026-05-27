@@ -82,7 +82,7 @@ build. Build and run a search on the bundled Mixtral config:
 cargo build --release --no-default-features
 ./target/release/skein extract \
     --model   configs/mixtral_8x7b_config.json \
-    --cluster cluster/h100_2x.toml \
+    --cluster cluster/rtx6000_2x.toml \
     --trace   cluster/sample_trace.jsonl \
     --drift   models/mixtral_8x7b_drift.toml \
     --cost    cluster/cost_constants.toml \
@@ -97,7 +97,7 @@ single JSON object (suitable for `jq`):
 ./target/release/skein extract ... --output json | jq .
 ```
 
-## Full pipeline (H100)
+## Full pipeline (RTX PRO 6000 Blackwell)
 
 The default build targets CUDA:
 
@@ -114,7 +114,7 @@ Calibration (run once per `(hardware, model)` pair, reuse across compiles):
 
 ```
 ./target/release/skein calibrate \
-    --hardware h100_sxm5 \
+    --hardware rtx_pro_6000_blackwell \
     --model    configs/mixtral_8x7b_config.json \
     --corpus   crates/skein_calibrate/corpus/mixtral_8x7b.toml
 ```
