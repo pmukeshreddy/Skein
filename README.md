@@ -47,7 +47,7 @@ Mixtral 8×7B · 2× RTX PRO 6000 Blackwell · PP=2 TP=1 EP=1 · **168 tok/s** d
 | `skein_compile` | kernel search + artifact format |
 | `skein_parity` | KL/MSE parity gate (bf16 reference vs candidate) |
 | `skein_runtime` | paged KV, continuous batcher, CUDA Graphs, hot-swap, server |
-| `skein_cli` | `extract` · `compile` · `verify` · `serve` · `bench` · `calibrate` |
+| `skein_cli` | `extract` · `compile` · `verify` · `serve` · `calibrate` |
 | `skein_calibrate` | offline calibration of cost constants + drift table |
 
 ## Build
