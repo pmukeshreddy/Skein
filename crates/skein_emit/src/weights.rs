@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -408,6 +408,5 @@ pub fn write_weight_shard(
         path: dest_path.to_path_buf(),
         source,
     })?;
-    let _ = PathBuf::from(dest_path); // silence unused-import in Path
     Ok(())
 }

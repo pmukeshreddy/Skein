@@ -20,7 +20,7 @@ use skein_ir::plan::Plan;
 use skein_ir::types::Dtype;
 
 use crate::cluster::{Cluster, DeviceIdx, Placement, block_to_stage};
-use crate::compute::{activation_dtype, kv_dtype, weight_dtype};
+use crate::compute::{kv_dtype, weight_dtype};
 use crate::constants::CostConstants;
 use crate::error::CostError;
 
@@ -135,9 +135,6 @@ pub fn peak_memory_bytes(
     let w = weight_bytes_on_device(plan, ir, device);
     let k = kv_bytes_on_device(plan, ir, constants, device);
     let a = activation_bytes_on_device(plan, ir, device);
-    // Pull the unused-import lint over the line so a future tweak doesn't
-    // silently lose the `activation_dtype` import.
-    let _ = activation_dtype;
     w.saturating_add(k).saturating_add(a)
 }
 

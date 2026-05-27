@@ -388,27 +388,6 @@ impl RankServer {
             capture_hi
         };
 
-        if std::env::var_os("SKEIN_FI_LOG").is_some() {
-            eprintln!(
-                "SKEIN_SPLIT capture_lo={capture_lo} capture_hi={capture_hi} capture_split={capture_split} len={} rank={}",
-                schedule_resolved.len(),
-                layout.rank
-            );
-            for (i, s) in schedule_resolved.iter().enumerate() {
-                let desc = match s {
-                    ResolvedSequenceStep::ExecuteSegment { device_idx, segment_idx } => {
-                        format!("ExecuteSegment dev={device_idx} seg={segment_idx}")
-                    }
-                    ResolvedSequenceStep::Collective { collective, participants, tensor, elems } => {
-                        format!("Collective {collective:?} parts={participants:?} tensor={tensor:?} elems={elems}")
-                    }
-                    ResolvedSequenceStep::MoeRoute { ffn_segment_idx, block, .. } => {
-                        format!("MoeRoute ffn_seg={ffn_segment_idx} block={block}")
-                    }
-                };
-                eprintln!("SKEIN_SCHED[{i}] rank={} {desc}", layout.rank);
-            }
-        }
         Ok(Self {
             layout,
             executor,
@@ -543,19 +522,9 @@ impl RankServer {
                     .map_err(|e| RuntimeError::ServerInit(e.to_string()))?;
             }
             // Captured/replayed compute region.
-            let dbg = std::env::var_os("SKEIN_FI_LOG").is_some() && self.layout.rank == 0;
             if self.executor.runner().has_captured() {
-                if dbg && self.decode_step <= capture_at + 3 {
-                    eprintln!("SKEIN_PHASE step={} REPLAY pos={position}", self.decode_step);
-                }
-                let ok = self.executor.runner().replay_captured();
-                if dbg && !ok {
-                    eprintln!("SKEIN_PHASE step={} REPLAY-RETURNED-FALSE", self.decode_step);
-                }
+                self.executor.runner().replay_captured();
             } else if self.decode_step == capture_at {
-                if dbg {
-                    eprintln!("SKEIN_PHASE step={} CAPTURE pos={position}", self.decode_step);
-                }
                 self.executor.runner().begin_capture();
                 self.executor
                     .run(&self.schedule_resolved[lo..hi], &self.collective)
@@ -613,16 +582,6 @@ impl RankServer {
                         .executor
                         .runner()
                         .copy_output_to_device(LOGITS, dest, e * 2);
-                if std::env::var_os("SKEIN_FI_LOG").is_some() {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static ONCE: AtomicBool = AtomicBool::new(false);
-                    if !ONCE.swap(true, Ordering::Relaxed) {
-                        eprintln!(
-                            "SKEIN_DEVICE_LOGITS(PP): elems={e} vocab={} copied={copied}",
-                            self.vocab
-                        );
-                    }
-                }
                 if copied {
                     let tok = unsafe { self.collective.logits_argmax_local_device(dest, e) }
                         .map_err(to_rt)?;
@@ -1892,36 +1851,6 @@ impl RankServer {
                         // capture step do we feed carry via the immediate device-buffer
                         // path. Warmup uses the proven host f32_slots → run_segment H2D.
                         let do_capture_step = mb_capture && k >= capture_at;
-                        let dbg = std::env::var_os("SKEIN_DEBUG_STATE").is_some()
-                            && self.layout.rank == 1
-                            && k < 3
-                            && m == 0
-                            && kv_key.0 == 1;
-                        // For Test A (no capture, capture_at=9999) we still
-                        // want stage-segment-output dumps at k=1 for the diff
-                        // against Test B's capture+replay. Use a wider gate
-                        // that's true in BOTH paths whenever debug is on.
-                        let dbg_seg = std::env::var_os("SKEIN_DEBUG_STATE").is_some()
-                            && self.layout.rank == 1
-                            && k == 1
-                            && m == 0
-                            && kv_key.0 == 1;
-                        // Carry checksum on the buf BEFORE it's moved into the
-                        // feed call. Hashes the first row only (carry_elems /
-                        // stage_mb f32 values starting at index 0).
-                        let row_elems = carry_elems / stage_mb;
-                        let carry_chk_row0: u32 = if dbg {
-                            let mut h: u32 = 0x811c9dc5;
-                            for &v in buf.iter().take(row_elems) {
-                                for b in v.to_le_bytes() {
-                                    h ^= b as u32;
-                                    h = h.wrapping_mul(0x01000193);
-                                }
-                            }
-                            h
-                        } else {
-                            0
-                        };
                         {
                             let r = self.executor.runner_mut();
                             if do_capture_step {
@@ -1940,13 +1869,6 @@ impl RankServer {
                             }
                         }
                         let tc2 = Instant::now();
-                        let mode_str = if !do_capture_step {
-                            "warmup"
-                        } else if self.executor.runner().has_captured_keyed(kv_key.0) {
-                            "replay"
-                        } else {
-                            "capture"
-                        };
                         if do_capture_step {
                             let key = kv_key.0;
                             let has = self.executor.runner().has_captured_keyed(key);
@@ -1981,48 +1903,6 @@ impl RankServer {
                                 .read(LOGITS)
                                 .map_err(|e| RuntimeError::ServerInit(e.to_string()))?
                         };
-                        if dbg {
-                            let mut argmax_row0 = 0u32;
-                            let mut best = f32::NEG_INFINITY;
-                            for (i, &v) in logits.iter().take(vocab).enumerate() {
-                                if v > best { best = v; argmax_row0 = i as u32; }
-                            }
-                            let nan_count = logits.iter().take(vocab).filter(|x| x.is_nan()).count();
-                            let mut log_h: u32 = 0x811c9dc5;
-                            for &v in logits.iter().take(vocab) {
-                                for b in v.to_le_bytes() {
-                                    log_h ^= b as u32;
-                                    log_h = log_h.wrapping_mul(0x01000193);
-                                }
-                            }
-                            // Get the freshly-fed input token (for stage1 input
-                            // is the carry, not a tok id — we tag input as
-                            // 'carry' here and let stage0's TRACE_ONE carry the
-                            // input_token).
-                            let carry_ptr = self
-                                .executor
-                                .runner()
-                                .dbg_input_device_ptr_by_id(carry_id)
-                                .unwrap_or(0);
-                            eprintln!(
-                                "TRACE_ONE row=0 rank=1 stage=1 m={m} k={k} mode={} pos={pos} key={} carry_chk_row0=0x{:08x} carry_ptr=0x{:x} logits_argmax_row0={} logits_chk_row0=0x{:08x} logits_nan_row0={}",
-                                mode_str,
-                                kv_key.0,
-                                carry_chk_row0,
-                                carry_ptr,
-                                argmax_row0,
-                                log_h,
-                                nan_count
-                            );
-                        }
-                        if dbg_seg {
-                            // Per-segment output checksums at k=1 — find first
-                            // divergent segment between Test A (warmup) and
-                            // Test B (capture+replay).
-                            self.executor
-                                .runner()
-                                .dbg_dump_segment_outputs(mode_str);
-                        }
                         let tc4 = Instant::now();
                         t_coll_s += (tc1 - tc0).as_secs_f64();
                         t_setup_s += (tc2 - tc1).as_secs_f64();

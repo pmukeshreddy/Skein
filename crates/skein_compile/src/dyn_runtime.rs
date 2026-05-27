@@ -231,12 +231,6 @@ pub trait DynRuntime {
         None
     }
 
-    /// SKEIN_DEBUG_STATE: device pointer of an INPUT buffer for handoff `id`
-    /// (the one that immediate setters write into). Default `None`.
-    fn dbg_input_device_ptr_by_id(&self, _id: HandoffId) -> Option<u64> {
-        None
-    }
-
     /// Ensure a named KV-cache **input** is backed by a persistent on-GPU buffer
     /// of `n_bytes`, by id, returning its device pointer. CUDA only; `None`.
     /// See [`DynRuntime::ensure_kv_input_device_by_name`].
@@ -857,11 +851,6 @@ impl<R: ComputeRuntime> DynRuntime for DynRuntimeWrapper<R> {
 
     fn weight_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
         let node = self.node_for_output_id(id)?;
-        self.inner.input_device_ptr(node)
-    }
-
-    fn dbg_input_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
-        let node = self.node_for_input_id(id)?;
         self.inner.input_device_ptr(node)
     }
 

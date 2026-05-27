@@ -25,7 +25,6 @@ skein_compile = { workspace = true }
 skein_runtime = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
-toml          = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 

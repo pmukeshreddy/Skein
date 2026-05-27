@@ -2727,7 +2727,6 @@ dependencies = [
  "skein_cost",
  "skein_ir",
  "thiserror 1.0.69",
- "toml",
  "tracing",
 ]
 
@@ -2770,7 +2769,6 @@ dependencies = [
  "skein_runtime",
  "tempfile",
  "thiserror 1.0.69",
- "toml",
  "tracing",
 ]
 

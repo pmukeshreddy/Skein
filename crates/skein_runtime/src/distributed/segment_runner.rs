@@ -270,87 +270,6 @@ fn top_k_softmax(logits: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
 }
 
 impl SegmentRunner {
-    /// SKEIN_DEBUG_STATE only: resolve a handoff `id` to the persistent INPUT
-    /// device buffer the matching segment binds it to.
-    pub fn dbg_input_device_ptr_by_id(&self, id: HandoffId) -> Option<u64> {
-        for segment_idx in 0..self.segments.len() {
-            if self.segment_inputs[segment_idx].iter().any(|i| *i == id) {
-                return self.segments[segment_idx]
-                    .runtime
-                    .dbg_input_device_ptr_by_id(id);
-            }
-        }
-        None
-    }
-
-    /// SKEIN_DEBUG_STATE only: dump (sync + checksum + first-4-bytes) of every
-    /// segment's outputs. Call AFTER warmup execute or AFTER replay completes.
-    /// Useful to find the FIRST segment whose output differs between modes.
-    pub fn dbg_dump_segment_outputs(&self, tag: &str) {
-        // Also dump kv_device_base buffers for KV-cache slots — these are the
-        // ACTUAL per-request cache buffers that the captured graph reads from
-        // (different from segment-output arena slots).
-        for (slot, base_opt) in self.kv_device_base.iter().enumerate() {
-            if let Some(base) = base_opt {
-                let name = self.id_name(HandoffId(slot as u32));
-                if !name.starts_with("kvcache_") {
-                    continue;
-                }
-                let n_read = 16usize;
-                let mut buf = vec![0u8; n_read];
-                unsafe {
-                    let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
-                        buf.as_mut_ptr() as *mut _,
-                        *base,
-                        n_read,
-                    );
-                }
-                let first4 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let first8 = u64::from_le_bytes([
-                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ]);
-                eprintln!(
-                    "KV_BASE {tag} slot={} name={:?} base=0x{:x} first4=0x{:08x} first8=0x{:016x}",
-                    slot, name, base, first4, first8
-                );
-            }
-        }
-        for seg_idx in 0..self.segments.len() {
-            for &out_id in &self.segment_outputs[seg_idx] {
-                if let Some((ptr, n_bytes)) = self.segments[seg_idx]
-                    .runtime
-                    .output_device_ptr_by_id(out_id)
-                {
-                    // Sync and read a small prefix to checksum / first-bytes.
-                    let n_read = n_bytes.min(4096);
-                    let mut buf = vec![0u8; n_read];
-                    unsafe {
-                        let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            ptr,
-                            n_read,
-                        );
-                    }
-                    let mut h: u32 = 0x811c9dc5;
-                    for &b in &buf {
-                        h ^= b as u32;
-                        h = h.wrapping_mul(0x01000193);
-                    }
-                    let first4 = if buf.len() >= 4 {
-                        u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
-                    } else {
-                        0
-                    };
-                    let name = self.id_name(out_id);
-                    eprintln!(
-                        "DBG_SEG_OUT {tag} seg={seg_idx} out_id={} name={:?} ptr=0x{:x} n_bytes={} chk=0x{:08x} first4=0x{:08x}",
-                        out_id.0, name, ptr, n_bytes, h, first4
-                    );
-                }
-            }
-        }
-    }
-
     pub fn new(segments: Vec<RuntimeSegment>) -> Self {
         // Page geometry is overridable from the environment so a run can pick a
         // smaller page (finer-grained prefix reuse) without a recompile.
@@ -715,8 +634,6 @@ impl SegmentRunner {
         let _ = self.kv.set_position(position);
         let tok_id = self.input_tokens_id;
         let pos_id = self.position_id;
-        let log = std::env::var_os("SKEIN_FI_LOG").is_some();
-        let (mut n_kv, mut n_tok, mut n_pos, mut n_err) = (0, 0, 0, 0);
         for segment_idx in 0..self.segments.len() {
             // decode position: every segment that writes a KV slot reads its own
             // runtime's device position buffer in the captured kv_slot_write.
@@ -725,7 +642,6 @@ impl SegmentRunner {
                 .any(|id| matches!(self.kind[id.idx()], HandoffKind::KvCache { .. }));
             if writes_kv {
                 self.segments[segment_idx].runtime.set_decode_position(position);
-                n_kv += 1;
             }
             // input token: the segment(s) consuming `input_tokens` (the embedding).
             // Use the IMMEDIATE setter (not the staging `set_tensor_i32_by_id`):
@@ -736,13 +652,9 @@ impl SegmentRunner {
             // the resident device buffer now, outside the captured region.
             if let Some(tok_id) = tok_id {
                 if self.segment_inputs[segment_idx].iter().any(|id| *id == tok_id) {
-                    match self.segments[segment_idx]
+                    let _ = self.segments[segment_idx]
                         .runtime
-                        .set_input_i32_immediate_by_id(tok_id, tokens.to_vec())
-                    {
-                        Ok(()) => n_tok += 1,
-                        Err(_) => n_err += 1,
-                    }
+                        .set_input_i32_immediate_by_id(tok_id, tokens.to_vec());
                 }
             }
             // position scalar: the attention segments use it for RoPE and to derive
@@ -750,13 +662,9 @@ impl SegmentRunner {
             // reasoning as the token above.
             if let Some(pos_id) = pos_id {
                 if self.segment_inputs[segment_idx].iter().any(|id| *id == pos_id) {
-                    match self.segments[segment_idx]
+                    let _ = self.segments[segment_idx]
                         .runtime
-                        .set_input_f32_immediate_by_id(pos_id, vec![position as f32])
-                    {
-                        Ok(()) => n_pos += 1,
-                        Err(_) => n_err += 1,
-                    }
+                        .set_input_f32_immediate_by_id(pos_id, vec![position as f32]);
                 }
             }
         }
@@ -771,12 +679,6 @@ impl SegmentRunner {
             self.segments[segment_idx]
                 .runtime
                 .refresh_capture_dyn_dims(&dyn_map);
-        }
-        if log {
-            eprintln!(
-                "SKEIN_FLUSH pos={position} ntok={} tok0={:?} fed: kv={n_kv} tok={n_tok} pos={n_pos} err={n_err} (segs={})",
-                tokens.len(), tokens.first(), self.segments.len()
-            );
         }
     }
 
@@ -1136,27 +1038,6 @@ impl LocalSegments for SegmentRunner {
         // feature off this is a zero-sized no-op — no `Instant::now()` here.
         let mut t = crate::perf_timing::SegTimer::start_in();
 
-        // DEBUG (SKEIN_DUMP_CAP): one-shot dump of each segment's inputs+kinds so
-        // we can see exactly which host-fed inputs land inside the capture window.
-        if std::env::var_os("SKEIN_DUMP_CAP").is_some() {
-            for i in 0..self.segment_inputs[segment_idx].len() {
-                let id = self.segment_inputs[segment_idx][i];
-                let name = self.id_to_name.get(id.idx()).cloned().unwrap_or_default();
-                eprintln!(
-                    "SKEIN_DUMP_CAP seg={segment_idx} in='{name}' kind={:?}",
-                    self.kind[id.idx()]
-                );
-            }
-            for i in 0..self.segment_outputs[segment_idx].len() {
-                let id = self.segment_outputs[segment_idx][i];
-                let name = self.id_to_name.get(id.idx()).cloned().unwrap_or_default();
-                eprintln!(
-                    "SKEIN_DUMP_CAP seg={segment_idx} OUT='{name}' kind={:?}",
-                    self.kind[id.idx()]
-                );
-            }
-        }
-
         // Feed inputs by pre-resolved id — no `Vec<String>` clone, no per-name
         // HashMap lookup. Each id's `kind` (fixed at construction) selects the
         // same dispatch the old string-keyed loop performed.
@@ -1279,47 +1160,6 @@ impl LocalSegments for SegmentRunner {
             .map_err(&err)?;
         t.mark_out();
 
-        // DEBUG (SKEIN_BATCH_DIVERGE): for identical prompts, every per-row
-        // activation must match across rows. Read each output, split into
-        // `decode_batch` rows, and log the first segment whose row0 != row1 —
-        // that op is where batch>1 striding breaks. Gated, first few forwards.
-        if self.decode_batch > 1 && std::env::var_os("SKEIN_BATCH_DIVERGE").is_some() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static BUDGET: AtomicUsize = AtomicUsize::new(400);
-            // Only the first two positions: pos=0 is pure (no KV history) — a
-            // divergence there is a batch COMPUTE bug; a divergence appearing only
-            // at pos>=1 is a KV-history (write/read) bug.
-            let pos = self.position;
-            let batch = self.decode_batch;
-            if pos == 1 {
-                for &id in &self.segment_outputs[segment_idx] {
-                    if BUDGET.load(Ordering::Relaxed) == 0 { break; }
-                    if let Ok(v) = self.segments[segment_idx].runtime.get_tensor_by_id(id) {
-                        if v.len() % batch == 0 && v.len() >= batch * 2 {
-                            let per = v.len() / batch;
-                            // Compare EVERY row r against row 0 (catch row-pairing).
-                            let mut maxd = 0f32;
-                            let mut worst_row = 0usize;
-                            let mut first = usize::MAX;
-                            for r in 1..batch {
-                                for j in 0..per {
-                                    let d = (v[j] - v[r * per + j]).abs();
-                                    if d > maxd { maxd = d; worst_row = r;
-                                        if first == usize::MAX { first = j; } }
-                                }
-                            }
-                            if maxd > 1e-5 && BUDGET.fetch_sub(1, Ordering::Relaxed) > 0 {
-                                eprintln!(
-                                    "DIVERGE pos=1 seg={} out='{}' per_row={} max|r0-r{}|={:.6} first_idx={}",
-                                    segment_idx, self.id_name(id), per, worst_row, maxd, first
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // Capture outputs by pre-resolved id. A `kvcache_*` output is the new
         // token's K/V written into slot `position`; collective/router tensors stay
         // host; every other activation is kept DEVICE-RESIDENT (record the
@@ -1359,13 +1199,6 @@ impl LocalSegments for SegmentRunner {
                                     let full_bytes =
                                         self.kv_full_elems[slot].unwrap_or(0) * KV_DEVICE_ELEM_BYTES;
                                     let cap = if out_bytes > 0 { full_bytes / out_bytes } else { 0 };
-                                    if std::env::var_os("SKEIN_BKV_LOG").is_some() {
-                                        use std::sync::atomic::{AtomicBool, Ordering};
-                                        static D: AtomicBool = AtomicBool::new(false);
-                                        if !D.swap(true, Ordering::Relaxed) {
-                                            eprintln!("SKEIN_BKV batch={batch} out_bytes={out_bytes} row_bytes={row_bytes} full_elems={} cap={cap} pos={}", self.kv_full_elems[slot].unwrap_or(0), self.position);
-                                        }
-                                    }
                                     unsafe {
                                         rt.copy_output_to_kv_slot_batched_by_id(
                                             id, base, batch, cap, row_bytes,
@@ -1406,15 +1239,6 @@ impl LocalSegments for SegmentRunner {
                         }
                     }
                     // Host path: batched-prefill capture, or CPU fallback.
-                    if std::env::var_os("SKEIN_DEBUG_STATE").is_some() && layer == 16 {
-                        eprintln!(
-                            "KV_DEBUG layer=16 pos={} HOST_FALLBACK kv_device_base_set={} capturing={} prefill_capture={}",
-                            self.position,
-                            self.kv_device_base[slot].is_some() as u32,
-                            self.capturing as u32,
-                            self.prefill_capture as u32
-                        );
-                    }
                     let data = self.segments[segment_idx]
                         .runtime
                         .get_tensor_by_id(id)

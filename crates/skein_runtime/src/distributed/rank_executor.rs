@@ -309,16 +309,6 @@ impl<S: LocalSegments> RankExecutor<S> {
                             // full-vocab host materialization, no host write-back.
                             if device_logits && *kind == CollectiveKind::AllGather {
                                 let dev = runner.output_device_ptr_by_id(*tensor);
-                                if std::env::var_os("SKEIN_FI_LOG").is_some() {
-                                    use std::sync::atomic::{AtomicBool, Ordering};
-                                    static ONCE: AtomicBool = AtomicBool::new(false);
-                                    if !ONCE.swap(true, Ordering::Relaxed) {
-                                        eprintln!(
-                                            "SKEIN_DEVICE_LOGITS: AllGather tensor device_ptr={:?}",
-                                            dev.map(|(_, e)| e)
-                                        );
-                                    }
-                                }
                                 if let Some((ptr, e)) = dev {
                                     let tok =
                                         unsafe { collective.logits_argmax_device(ptr, e) }?;

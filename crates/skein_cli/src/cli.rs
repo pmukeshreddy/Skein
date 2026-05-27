@@ -131,9 +131,8 @@ pub struct VerifyArgs {
     #[arg(long, default_value = "bfloat16")]
     pub reference_dtype: String,
     /// Debug-only: load just the candidate artifact, run one forward over the
-    /// tokens in `--tokens-file`, and exit. Used with `SKEIN_DEBUG_TAPS=1` +
-    /// `SKEIN_DUMP_DIR=<dir>` to dump layer-0 op intermediates for HF
-    /// bisection. No HF subprocess, no reference artifact.
+    /// tokens in `--tokens-file`, and exit. Dumps final logits to
+    /// `SKEIN_DUMP_DIR` when set. No HF subprocess, no reference artifact.
     #[arg(long)]
     pub dump_only: bool,
     /// Whitespace/comma-separated token ids fed to the `--dump-only` forward.

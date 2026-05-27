@@ -58,22 +58,6 @@
 //!   capacity slots; `combine @ expert_out` gathers them back weighted by the
 //!   renormalized top-k gates. Tested via the dispatch∘combine round-trip.
 //!
-//! ## Deferred lowering (TODO)
-//!
-//! The structural lowering — segment boundaries, collective ordering,
-//! handoff naming, weight sharding — is complete and tested. The per-op math
-//! above is implemented and unit-tested on `NativeRuntime`; the remaining work
-//! is runtime *integration*, best validated against a GPU reference:
-//!
-//! - **TODO(ep-routing):** wire [`moe_dispatch_combine`] into the multi-segment
-//!   schedule — lay the dispatched buffer out as `[ep, …]` for the AllToAll,
-//!   run each rank's expert shard on its received tokens, and AllToAll the
-//!   results back. The collective schedule + handoffs already reserve the
-//!   dispatch/combine boundaries.
-//! - **TODO(kv-runtime):** drive [`attention_with_kv_cache`] from the serving
-//!   loop — allocate paged K/V via `PagedKVAllocator`, feed the per-step
-//!   `past` offset and cache pages as graph inputs, and write `k_full`/`v_full`
-//!   back after each step.
 
 use std::collections::HashMap;
 
@@ -231,12 +215,6 @@ struct DeviceWiring<'a> {
     hidden: usize,
     activation_dtype: skein_ir::types::Dtype,
 
-    // When `SKEIN_DEBUG_TAPS` is set in the environment, insert extra named
-    // `.output()` taps for layer-0 intermediates (post_input_ln, q/k proj,
-    // attn_out, post_attn_ln, router_logits, moe_out) so the parity walk can
-    // dump them op-by-op for HF bisection. Off by default: production graphs
-    // (the KL gate) are byte-identical to the untapped lowering.
-    debug_taps: bool,
     /// `SKEIN_ATTN_FP8`: lower q/k/v/o attention projections as cublasLt fp8
     /// GEMMs, with per-tensor `weight_scale`/`input_scale` loaded as runtime
     /// inputs (from an AutoFP8 checkpoint). Everything downstream stays bf16/f32.
@@ -287,26 +265,8 @@ impl<'a> DeviceWiring<'a> {
             seq,
             hidden,
             activation_dtype,
-            debug_taps: std::env::var_os("SKEIN_DEBUG_TAPS").is_some(),
             attn_fp8: std::env::var_os("SKEIN_ATTN_FP8").is_some(),
         })
-    }
-
-    /// Insert a named `.output()` tap so the parity walk can capture this
-    /// tensor by name. Only fires under `SKEIN_DEBUG_TAPS` (see field docs).
-    /// The `.output()` marks the node as a retained output, which suppresses
-    /// fusion across it — acceptable for the debug dump, never used in the
-    /// production graph.
-    fn debug_tap(&mut self, name: &str, t: GraphTensor) {
-        if !self.debug_taps {
-            return;
-        }
-        // Cast to f32 before .output(): the runtime f32 read path mis-reads some
-        // non-f32 op-output buffers (bf16 matmul output read raw → halved; f32
-        // output mis-tagged bf16 → interleaved zeros). An explicit f32 cast
-        // yields a buffer the read handles correctly, so taps are trustworthy.
-        let tapped = t.cast(DType::F32).output();
-        self.cur_op_nodes.insert(name.to_string(), tapped.id);
     }
 
     // -----------------------------------------------------------------------
@@ -806,14 +766,8 @@ impl<'a> DeviceWiring<'a> {
             .get(&carry_in)
             .expect("pre-block carry missing")
             .tensor;
-        if block == 0 {
-            self.debug_tap("dbg_l0_embed_in", hidden);
-        }
         let norm1_w = self.weight(&format!("model.layers.{block}.input_layernorm.weight"))?;
         let normed_1 = rms_norm(hidden, norm1_w, self.ir.meta.rms_norm_eps);
-        if block == 0 {
-            self.debug_tap("dbg_l0_post_input_ln", normed_1);
-        }
         let attn_out = self.wire_block_attention(block, normed_1)?;
 
         // Record attn_out as block_N_attn_out in live (the collective tensor for
@@ -839,9 +793,6 @@ impl<'a> DeviceWiring<'a> {
 
         // (4) Residual after attn (in the current segment, post-collective).
         let attn_full = self.live.get(&attn_name).expect("attn out missing").tensor;
-        if block == 0 {
-            self.debug_tap("dbg_l0_attn_out", attn_full);
-        }
         let carry_in_live = self.live.get(&carry_in).expect("carry missing").tensor;
         let after_attn = carry_in_live + attn_full;
         let carry_post = carry_post_attn(block);
@@ -859,9 +810,6 @@ impl<'a> DeviceWiring<'a> {
             "model.layers.{block}.post_attention_layernorm.weight"
         ))?;
         let normed_2 = rms_norm(after_attn, norm2_w, self.ir.meta.rms_norm_eps);
-        if block == 0 {
-            self.debug_tap("dbg_l0_post_attn_ln", normed_2);
-        }
         let ffn_out = if has_moe {
             self.wire_block_moe(block, normed_2)?
         } else if has_mlp {
@@ -929,9 +877,6 @@ impl<'a> DeviceWiring<'a> {
 
         // (8) Final residual + emit next-block carry.
         let ffn_full = self.live.get(&ffn_name).expect("ffn out missing").tensor;
-        if block == 0 {
-            self.debug_tap("dbg_l0_moe_out", ffn_full);
-        }
         let carry_post_live = self
             .live
             .get(&carry_post)
@@ -1005,12 +950,6 @@ impl<'a> DeviceWiring<'a> {
                 normed.matmul(v_w.permute((1, 0))).cast(DType::F32),
             )
         };
-        if block == 0 {
-            self.debug_tap("dbg_l0_q_proj", q);
-            self.debug_tap("dbg_l0_k_proj", k_new);
-            self.debug_tap("dbg_l0_v_proj", v_new);
-        }
-
         let (attn, k_store, v_store) = if self.seq > 1 {
             // Batched prefill: the whole prompt chunk in ONE forward. Causal
             // self-attention over the N tokens with no prior cache (past = 0);
@@ -1239,9 +1178,6 @@ impl<'a> DeviceWiring<'a> {
             "model.layers.{block}.block_sparse_moe.gate.weight"
         ))?;
         let routing_logits = normed.matmul(gate_w.permute((1, 0)));
-        if block == 0 {
-            self.debug_tap("dbg_l0_router_logits", routing_logits);
-        }
         let n = normed.dims().len();
         let top_k = self.ir.meta.top_k.unwrap_or(n_experts).clamp(1, n_experts);
         let routing_probs = top_k_route(routing_logits, top_k, n_experts, n - 1);
@@ -1288,7 +1224,7 @@ impl<'a> DeviceWiring<'a> {
         &mut self,
         block: usize,
         normed: GraphTensor,
-        n_experts: usize,
+        _n_experts: usize,
         top_k: usize,
     ) -> Result<GraphTensor, EmitError> {
         let gate_w = self.weight(&format!(
@@ -1307,12 +1243,8 @@ impl<'a> DeviceWiring<'a> {
             normed
         };
         let axis = 1usize; // [s, *]
-        let _ = n_experts;
 
         let routing_logits = x2d.matmul(gate_w.permute((1, 0))); // [s, E]
-        if block == 0 {
-            self.debug_tap("dbg_l0_router_logits", routing_logits);
-        }
         // Route in F32 so the normalized gate weights are F32 *without* a separate
         // Cast op: GLUMoE's mode-2 fusion matches `normed_topk = Mul(topk_vals,
         // Recip(Sum(topk_vals)))` directly, and a Cast wrapping that Mul (which we
@@ -1381,9 +1313,6 @@ impl<'a> DeviceWiring<'a> {
             "model.layers.{block}.block_sparse_moe.gate.weight"
         ))?;
         let routing_logits = normed.matmul(gate_w.permute((1, 0)));
-        if block == 0 {
-            self.debug_tap("dbg_l0_router_logits", routing_logits);
-        }
         let router_name = format!("router_logits_{block}");
         self.live.insert(
             router_name.clone(),

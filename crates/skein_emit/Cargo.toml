@@ -22,7 +22,6 @@ skein_cost  = { workspace = true }
 luminal     = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
-toml        = { workspace = true }
 thiserror   = { workspace = true }
 safetensors = { workspace = true }
 tracing     = { workspace = true }

@@ -34,8 +34,8 @@ pub fn run_verify_inner<R: ComputeRuntime + 'static>(
     _output: OutputFormat,
 ) -> Result<(), CliError> {
     // ── Debug-only dump path: run one Skein forward over explicit tokens and
-    // dump layer-0 op taps (with SKEIN_DEBUG_TAPS + SKEIN_DUMP_DIR). No HF, no
-    // reference artifact, so it never co-resides another 90 GB model on GPU. ──
+    // dump final logits to SKEIN_DUMP_DIR. No HF, no reference artifact, so it
+    // never co-resides another 90 GB model on GPU. ──
     if args.dump_only {
         use skein_parity::SkeinForward;
         let tokens_path = args.tokens_file.as_ref().ok_or_else(|| {
