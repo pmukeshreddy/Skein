@@ -4,13 +4,11 @@ A compiler for distributed LLM inference. Skein finds the optimal placement acro
 
 ## Pipeline
 
-```mermaid
-flowchart LR
-    A[Model Config\nCluster · Workload] --> B[Plan Search\nTP·PP·EP · dtype DP]
-    B --> C[Compile\nkernel search]
-    C --> D{Parity Gate\nKL drift}
-    D -->|pass| E[Serve\nCUDA Graphs · paged KV]
-    D -->|fail| B
+```
+Model Config    →    Plan Search    →    Compile    →    Parity Gate    ──pass──→    Serve
+Cluster·Workload    TP·PP·EP·dtype DP   kernel search     KL drift               CUDA Graphs·paged KV
+                           ↑                                   │
+                           └──────────────fail─────────────────┘
 ```
 
 ## Results
