@@ -53,9 +53,9 @@ extern "C" __global__ void shm_allreduce2(
         flags[my_rank] = g;
         __threadfence_system();
         while (flags[peer] < g) { }
-        __threadfence_system();
     }
     __syncthreads();
+    __threadfence_system();
     // 3. sum (fp32 accumulate, round-to-nearest-even back to bf16), in place
     for (int i = tid; i < elems; i += n) {
         unsigned int ua = ((unsigned int)d[i]) << 16;

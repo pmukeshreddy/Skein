@@ -1395,7 +1395,7 @@ extern \"C\" {{
             shared[0] = sum_val;
         }}
         __syncthreads();
-        float inv_sum = 1.0f / shared[0];
+        float inv_sum = (shared[0] > 0.0f) ? (1.0f / shared[0]) : 0.0f;
 
         // Pass 3: normalize
         for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
