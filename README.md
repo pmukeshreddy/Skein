@@ -5,10 +5,31 @@ A compiler for multi-GPU LLM inference. Given a model, a cluster, and a workload
 ## Pipeline
 
 ```
-Model Config    →    Plan Search    →    Compile    →    Parity Gate    ──pass──→    Serve
-Cluster·Workload    TP·PP·EP·dtype DP   kernel search     KL drift               CUDA Graphs·paged KV
-                           ↑                                   │
-                           └──────────────fail─────────────────┘
+┌─ Plan Search ─────────────────────────────────────────────────┐
+│  Model config · Cluster spec · Workload trace                 │
+│                          ↓                                    │
+│  Enumerate TP × PP × EP placements                           │
+│  DP over per-layer dtype  [cost: compute·comm·memory·launch]  │
+│                          ↓                                    │
+│                   Winning plan                                │
+└───────────────────────────────────────────────────────────────┘
+                           ↓
+┌─ Compile ─────────────────────────────────────────────────────┐
+│  Lower plan → per-device graphs · shard weights               │
+│  Search for optimal kernels per device                        │
+│                          ↓                                    │
+│                  Compiled artifact                            │
+└───────────────────────────────────────────────────────────────┘
+                           ↓
+┌─ Parity ──────────────────────────────────────────────────────┐
+│  bf16 reference vs candidate · KL drift per layer             │
+│  drift ≤ SLO → accept          drift > SLO → re-search        │
+└───────────────────────────────────────────────────────────────┘
+                           ↓
+┌─ Serve ───────────────────────────────────────────────────────┐
+│  Paged KV cache · continuous batcher · CUDA graph capture     │
+│                  HTTP inference server :8080                  │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ## Results
