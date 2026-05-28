@@ -16,14 +16,6 @@ the CPU `NativeComputeRuntime` yields valid pipeline checks (not production
 constants), while `CudaComputeRuntime` on the target GPU yields the
 production numbers.
 
-## Runtime dtype note
-
-The DP can select sub-bf16 dtypes (fp8, int8, int4) for cost optimisation, but
-the current weight-load path only supports bf16. Any sub-bf16 dtype the planner
-picks is clamped to bf16 at compile time. Drift calibration against fp8/int
-dtypes is still meaningful — the table drives future plans once the runtime
-weight path supports those dtypes.
-
 ## Calibration philosophy
 
 Calibrate once per `(hardware, model)` pair, reuse across compiles. A
