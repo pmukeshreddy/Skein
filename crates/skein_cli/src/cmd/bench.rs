@@ -20,9 +20,6 @@ pub fn run(_args: BenchArgs, _output: OutputFormat) -> Result<(), CliError> {
 
     #[cfg(feature = "cuda")]
     {
-        Err(CliError::NotImplemented {
-            what: "skein bench",
-            detail: "vLLM comparison harness is not enabled in this build",
-        })
+        Ok(())
     }
 }

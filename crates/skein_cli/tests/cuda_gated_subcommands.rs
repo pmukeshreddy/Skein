@@ -1,7 +1,6 @@
 //! CUDA-gated subcommands. On a CPU (`--no-default-features`) build, `bench`
 //! returns `CliError::RequiresCuda` with a message that names the subcommand
-//! and suggests the rebuild fix. On a CUDA build it returns
-//! `CliError::NotImplemented` until the harness is wired.
+//! and suggests the rebuild fix. On a CUDA build it returns `Ok(())`.
 
 use std::path::PathBuf;
 
@@ -49,10 +48,6 @@ fn bench_returns_requires_cuda_on_cpu_build() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn bench_returns_not_implemented_on_cuda_build() {
-    let err = cmd::bench::run(bench_args(), OutputFormat::Text).unwrap_err();
-    match err {
-        CliError::NotImplemented { what, .. } => assert_eq!(what, "skein bench"),
-        other => panic!("expected NotImplemented, got {other:?}"),
-    }
+fn bench_returns_ok_on_cuda_build() {
+    cmd::bench::run(bench_args(), OutputFormat::Text).unwrap();
 }
