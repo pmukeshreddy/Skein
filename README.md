@@ -1,29 +1,29 @@
 # Skein
 
-A compiler for multi-GPU LLM inference. Given a model, a cluster, and a workload trace, Skein searches the joint (tensor · pipeline · expert) parallelism space, selects per-layer dtypes under a KL-drift SLO, and compiles the winning plan down to per-device kernels — sharded weights, paged KV cache, CUDA Graphs, and continuous batching included.
+Skein runs LLMs across multiple GPUs. Give it a model and a cluster — it figures out how to split the work (tensor, pipeline, and expert parallelism), shards the weights, wires up the collectives, and compiles per-device kernels with paged KV cache, CUDA Graphs, and continuous batching. No manual parallelism configuration.
 
 ## Pipeline
 
 ```
-┌─ Plan Search ─────────────────────────────────────────────────┐
+┌─ Placement ───────────────────────────────────────────────────┐
 │  Model config · Cluster spec · Workload trace                 │
 │                          ↓                                    │
-│  Enumerate TP × PP × EP placements                           │
-│  DP over per-layer dtype  [cost: compute·comm·memory·launch]  │
+│  Pick TP × PP × EP split · per-layer dtype                    │
+│  Cost model: compute · comm · memory · bubble · launch        │
 │                          ↓                                    │
-│                   Winning plan                                │
+│         Placement plan + dtype map                            │
 └───────────────────────────────────────────────────────────────┘
                            ↓
 ┌─ Compile ─────────────────────────────────────────────────────┐
-│  Lower plan → per-device graphs · shard weights               │
-│  Search for optimal kernels per device                        │
+│  Shard weights across devices · wire collectives              │
+│  Compile per-device kernels                                   │
 │                          ↓                                    │
 │                  Compiled artifact                            │
 └───────────────────────────────────────────────────────────────┘
                            ↓
 ┌─ Parity ──────────────────────────────────────────────────────┐
 │  bf16 reference vs candidate · KL drift per layer             │
-│  drift ≤ SLO → accept          drift > SLO → re-search        │
+│  drift ≤ SLO → accept          drift > SLO → re-plan          │
 └───────────────────────────────────────────────────────────────┘
                            ↓
 ┌─ Serve ───────────────────────────────────────────────────────┐
