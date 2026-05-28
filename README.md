@@ -82,4 +82,3 @@ cargo build --release
     --corpus   crates/skein_calibrate/corpus/mixtral_8x7b.toml
 ```
 
-See `docs/` for design details.
