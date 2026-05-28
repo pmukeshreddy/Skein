@@ -8,6 +8,6 @@ pub mod error;
 pub mod load;
 pub mod output;
 
-pub use cli::{BenchMetric, Cli, Command, OutputFormat};
+pub use cli::{Cli, Command, OutputFormat};
 pub use error::CliError;
 pub use output::{ExtractReport, ReportParallelism};

@@ -177,7 +177,6 @@ struct ErrorPayload {
 fn err_kind(e: &CliError) -> &'static str {
     match e {
         CliError::RequiresCuda { .. } => "requires_cuda",
-        CliError::NotImplemented { .. } => "not_implemented",
         CliError::BadArgument(_) => "bad_argument",
         CliError::Io(_) => "io",
         CliError::Serde(_) => "serde",

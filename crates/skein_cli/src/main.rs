@@ -18,7 +18,6 @@ async fn main() -> ExitCode {
         Command::Verify(args) => skein_cli::cmd::verify::run(args, cli.output),
         Command::Serve(args) => skein_cli::cmd::serve::run(args, cli.output).await,
         Command::Calibrate(args) => skein_cli::cmd::calibrate::run(args, cli.output),
-        Command::Bench(args) => skein_cli::cmd::bench::run(args, cli.output),
     };
 
     match result {

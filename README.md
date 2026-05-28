@@ -74,7 +74,6 @@ cargo build --release
 ./target/release/skein compile  --model ... --cluster cluster/rtx6000_2x.toml --weights ... --out artifacts/
 ./target/release/skein verify   --artifact artifacts/LATEST
 ./target/release/skein serve    --artifact artifacts/LATEST --port 8080
-./target/release/skein bench    --artifact artifacts/LATEST --baseline <vllm-endpoint>
 
 ./target/release/skein calibrate \
     --hardware rtx_pro_6000_blackwell \

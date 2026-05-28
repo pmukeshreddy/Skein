@@ -23,13 +23,6 @@ pub enum CliError {
         suggested_fix: &'static str,
     },
 
-    /// A subcommand not available in this build configuration.
-    #[error("{what}: {detail}")]
-    NotImplemented {
-        what: &'static str,
-        detail: &'static str,
-    },
-
     /// User-visible argument-level failure.
     #[error("{0}")]
     BadArgument(String),

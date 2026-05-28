@@ -44,8 +44,6 @@ pub enum Command {
     /// Calibrate cost constants + drift table from runtime measurements.
     Calibrate(CalibrateArgs),
 
-    /// Three validation metrics vs a vLLM baseline. Requires a CUDA build.
-    Bench(BenchArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -230,35 +228,10 @@ pub struct CalibrateArgs {
     pub out_drift_dir: PathBuf,
 }
 
-#[derive(Args, Debug, Clone)]
-pub struct BenchArgs {
-    #[arg(long)]
-    pub artifact: PathBuf,
-    #[arg(long)]
-    pub workload: PathBuf,
-    /// vLLM endpoint URL (e.g. `http://localhost:8000`).
-    #[arg(long)]
-    pub baseline: String,
-    /// Which metrics to run. Comma-separated.
-    #[arg(long, value_delimiter = ',', value_enum)]
-    pub metrics: Vec<BenchMetric>,
-}
-
 #[derive(Clone, Copy, ValueEnum, Debug, PartialEq, Eq)]
 pub enum OutputFormat {
     Text,
     Json,
-}
-
-#[derive(Clone, Copy, ValueEnum, Debug, PartialEq, Eq)]
-pub enum BenchMetric {
-    Throughput,
-    Goodput,
-    // Pin the snake_case spelling on the CLI so docs and `--help` agree.
-    // Clap's default `ValueEnum` derive emits kebab-case (`drift-compliance`);
-    // this attribute forces `drift_compliance` to match the spec example.
-    #[value(name = "drift_compliance")]
-    DriftCompliance,
 }
 
 const fn default_search_budget() -> usize {
