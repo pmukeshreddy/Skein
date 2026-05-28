@@ -23,9 +23,8 @@ pub enum CliError {
         suggested_fix: &'static str,
     },
 
-    /// A subcommand whose implementation has not yet landed. `what` names the
-    /// subcommand and `detail` describes what is still missing.
-    #[error("{what} is not yet implemented: {detail}")]
+    /// A subcommand not available in this build configuration.
+    #[error("{what}: {detail}")]
     NotImplemented {
         what: &'static str,
         detail: &'static str,

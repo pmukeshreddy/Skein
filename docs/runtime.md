@@ -160,7 +160,6 @@ returns the kernel-assigned port (used by tests).
 
 Trace emission uses `tracing::info_span!` so spans appear under any
 installed `tracing-subscriber`.
-TODO(otlp): wire the full OpenTelemetry-OTLP exporter.
 
 ## CPU vs CUDA build
 
@@ -175,7 +174,7 @@ TODO(otlp): wire the full OpenTelemetry-OTLP exporter.
 | NCCL between graph runs                 | n/a                                 | ✅                          |
 | CUDA Graphs capture + dispatch         | eager dispatch                      | ✅                          |
 | RDMA for prefill/decode KV handoff     | local copy                          | ✅                          |
-| OpenTelemetry-OTLP exporter            | tracing spans only                  | tracing spans only (TODO)   |
+| OpenTelemetry-OTLP exporter            | tracing spans only                  | tracing spans only          |
 
 Everything under `src/cuda/` lives behind `#[cfg(feature = "cuda")]`; the
 CPU build never compiles it. The CPU serving composition uses the same

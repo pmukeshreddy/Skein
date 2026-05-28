@@ -93,12 +93,8 @@ pub fn enumerate_kv_layouts() -> Vec<(KVLayout, bool)> {
 
 pub fn enumerate_batch_policies() -> Vec<BatchPolicy> {
     // Prune: keep `Continuous(M)` for the standard `M` ladder, plus one
-    // representative `ContinuousChunked(M, 1024)` per `M`. The remaining
-    // chunk-size variants (256, 512, 2048) don't change the decode-step cost
-    // ranking — they affect prefill / mixed-batch scheduling.
-    // TODO(chunk-size-search): reintroduce them once the cost model accounts
-    // for prefill/mixed-batch scheduling. `Static` is dropped: decoder
-    // serving uses continuous batching as the default.
+    // representative `ContinuousChunked(M, 1024)` per `M`. `Static` is
+    // dropped: decoder serving uses continuous batching as the default.
     let mut ladder: Vec<u32> = vec![1, 2, 4, 8, 16, 32, 64];
     // SKEIN_FORCE_BATCH pins the compiled decode batch width (used to build
     // batched-throughput / continuous-PP microbatch artifacts). The forced
@@ -162,8 +158,6 @@ pub fn enumerate_spec_decode_configs() -> Vec<SpecDecodeConfig> {
 pub fn enumerate_prefix_cache_configs() -> Vec<PrefixCacheConfig> {
     // Prefix caching is cost-neutral in the analytic model, so only the
     // enabled variant ships (the runtime always benefits from it).
-    // TODO(prefix-policy): re-introduce the LRU-vs-LFU policy axis once the
-    // cost model accounts for cache hit rate.
     vec![PrefixCacheConfig {
         enable: true,
         reuse_policy: RadixReusePolicy::LruByLastAccess,

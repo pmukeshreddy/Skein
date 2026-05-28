@@ -13,6 +13,12 @@ flowchart LR
     D -->|fail| B
 ```
 
+## Results
+
+| Model | Hardware | Plan | Decode throughput |
+|---|---|---|---|
+| Mixtral 8×7B | 2× RTX PRO 6000 Blackwell | PP=2 TP=1 EP=1 | 168 tok/s |
+
 ## Crates
 
 | Crate | Role |

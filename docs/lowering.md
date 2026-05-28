@@ -66,9 +66,6 @@ wired). With `ep == 1`, expert weights fall through to TP rules normally
 | `model.embed_tokens.weight`, `lm_head.weight`          | replicated       |
 | `*_layernorm.weight`, `model.norm.weight`              | replicated       |
 
-TODO(vocab-parallel): shard the embedding + LM head across the vocab axis and
-reconstitute the logits on output.
-
 ## Weight slicing — byte-range arithmetic
 
 Each `WeightSlice` carries a `ShardStrategy` that names the read pattern:
@@ -129,9 +126,7 @@ through the selected `ComputeRuntime`.
 | `IoManifest` / `topology.json`   | ✅ deterministic JSON                  | consumed at load                     |
 
 The op graph implements RoPE, the causal mask, and top-k MoE routing (each
-with a hand-computed test under `skein_emit/tests/`). The remaining
-`TODO(...)` tags in `op_wiring.rs` cover the decode-step position offset and
-expert-parallel token routing.
+with a hand-computed test under `skein_emit/tests/`).
 
 ## Segment-per-collective architecture
 

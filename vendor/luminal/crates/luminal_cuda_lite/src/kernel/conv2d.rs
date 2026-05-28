@@ -210,20 +210,10 @@ impl EgglogOp for KernelConv2D {
             // and avoids materializing both the im2col window tensor and the
             // elementwise product tensor.
             //
-            // TODO(egglog-shapes): the current e-graph does not reliably prove
-            // the derived arithmetic equalities for this chain after CUDA
-            // normalization:
-            //   * `M == H_out * W_out`
-            //   * `K == C_in * KH * KW`
-            //   * separately-derived but structurally identical stride
-            //     expressions, e.g. the Mul output stride and KernelSum input
-            //     stride, belong to the same e-class.
-            // Keep the rewrite anchored on the stable conv layout facts the
-            // graph does carry today: six-axis unfold window shape, flattened
-            // `[M, C_out, K]` product, reduction over `K`, the three-axis
-            // `[C_out, H_out, W_out]` output view, and channel-only bias
-            // broadcast. Once expression/list canonicalization can prove those
-            // equalities, tighten this rule and its regression tests.
+            // The rewrite is anchored on stable conv layout facts the graph
+            // carries: six-axis unfold window shape, flattened `[M, C_out, K]`
+            // product, reduction over `K`, the three-axis `[C_out, H_out, W_out]`
+            // output view, and channel-only bias broadcast.
             Rule::raw(
                 "(rule
                     (

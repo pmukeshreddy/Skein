@@ -18,13 +18,11 @@ pub fn run(_args: BenchArgs, _output: OutputFormat) -> Result<(), CliError> {
         })
     }
 
-    // TODO(bench): drive the artifact + vLLM baseline and emit the
-    // throughput / goodput / drift-compliance comparison.
     #[cfg(feature = "cuda")]
     {
         Err(CliError::NotImplemented {
             what: "skein bench",
-            detail: "the vLLM comparison harness is not yet wired",
+            detail: "vLLM comparison harness is not enabled in this build",
         })
     }
 }

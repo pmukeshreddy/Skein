@@ -385,7 +385,6 @@ impl EgglogOp for KernelScatterNoCopy {
         ));
         // Surviving ConsumedBuffers are valid — union with source and delete.
         // Runs in base_cleanup (after all (run) iterations).
-        // TODO: figure out how to validate this is a valid ConsumedBuffer independantly so we can run it in the cleanup ruleset, rather than base_cleanup
         rules.push(Rule::raw(
             "(rule
                 ((= ?cb (ConsumedBuffer ?a)))

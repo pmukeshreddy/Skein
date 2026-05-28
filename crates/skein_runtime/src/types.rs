@@ -27,9 +27,7 @@ pub struct IncomingRequest {
     pub arrival_ms: u64,
 }
 
-/// One unit of output the runtime streams back to the front door. Currently
-/// just the token id.
-/// TODO(output-metadata): attach top-k scores, finish reason, etc.
+/// One unit of output the runtime streams back to the front door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenOutput {
     pub token: u32,

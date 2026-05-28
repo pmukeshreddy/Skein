@@ -70,3 +70,13 @@ and native Luminal execution.
 The CPU build is for pipeline correctness and CI; the GPU build is the
 production target for calibrated cost constants and final numeric
 validation.
+
+## Runtime
+
+**Paged KV cache.** Each rank owns a local page pool managed by a free-list + LRU allocator. A radix prefix trie enables cross-request KV reuse: pages survive request completion and are matched against the next request's prompt prefix so shared tokens skip K/V recomputation. TP head-sharding and PP layer-slicing mean KV is already partitioned — no cross-rank KV synchronisation during decode.
+
+**Prefill / decode bifurcation.** Two compiled graphs at different sequence lengths share the same resident weight device pointers (no second weight copy). The prefill graph (gated by `SKEIN_BATCHED_PREFILL=N`) runs once over N tokens, collecting K/V outputs as `[N, kv_dim]` tensors rather than writing them slot-by-slot. Those tensors are written into the decode runner's paged cache and decode continues from position N.
+
+**Comm-compute overlap.** Host-staged collective round trips are removed by a device-resident bf16 RingAllReduce path: the producer segment's output buffer is all-reduced in place by device pointer, collapsing D2H traffic and host tensor materializations. The NCCL receive buffer is cached across steps and per-call synchronisation is removed so the collective issues without a host flush on the critical path. Under `SKEIN_SHM_ALLREDUCE`, a kernel-only alternative runs per-layer all-reduces over a cross-process `cuMemHostRegister` shared-memory window with no NCCL collective and no proxy thread. Under `SKEIN_CAPTURE`, the full forward — all layer compute segments and their all-reduces — is captured into one CUDA Graph and replayed with a single `cuGraphLaunch` per token.
+
+**Kernel fusion.** Elementwise ops are fused automatically by egglog rewrite rules that bracket consecutive fusible ops into a single NVRTC kernel. GLUMoE runs gate + up + SwiGLU + down in two hand-written kernels using float4 vectorised loads and `__shfl_down_sync` warp-shuffle reduction. Decode attention fuses Q·Kᵀ, scaling, softmax, and ·V into one kernel with an early exit at the actual context length.

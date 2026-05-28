@@ -14,12 +14,8 @@ use crate::report::{FailingLayerReport, ParityReport, PerPromptReport};
 use crate::skein_forward::SkeinForward;
 use crate::tolerance::{ToleranceTable, dominant_dtype_at_layer, tolerance_for_layer};
 
-/// Tokenize text for the Skein-native runtime path. The serving runtime
-/// uses this same byte-mod-vocab tokenizer because artifacts do not yet
-/// carry tokenizer assets.
-///
-/// TODO(tokenizer): bundle the model's real tokenizer in the artifact and
-/// switch both this path and the server to it.
+/// Tokenize text for the Skein-native runtime path using a byte-mod-vocab
+/// tokenizer. Used by both the parity verifier and the serving runtime.
 pub fn tokenize_prompt_bytes(prompt: &str, vocab: u32) -> Vec<u32> {
     let modulo = vocab.max(1);
     let mut tokens = prompt

@@ -1,14 +1,7 @@
 //! Custom 2-rank all-reduce over cross-process shared host memory, bypassing
 //! NCCL for the small device-bf16 all-reduces in the decode hot loop.
 //!
-//! Why: on this no-NVLink / P2P-disabled box NCCL's all-reduce transport is only
-//! ~12us in a tight loop, but in-context (one all-reduce per layer, spaced by a
-//! compute segment) it costs ~105us per call — symmetric on both ranks, the GPUs
-//! idling together before each barrier (nsys: ~5ms/token, ~half the decode wall).
-//! That cost is intrinsic to issuing NCCL's collective once its machinery has
-//! gone cold between barriers; a kernel-only all-reduce has no such cold path.
-//!
-//! How: both rank processes mmap the same /dev/shm file (name derived from the
+//! Both rank processes mmap the same /dev/shm file (name derived from the
 //! shared NCCL id), `cuMemHostRegister(... DEVICEMAP)` it to get a device pointer
 //! to the same physical pages, and a one-shot kernel does: write my partial ->
 //! `__threadfence_system` -> set my seq flag -> spin on peer flag -> fp32-

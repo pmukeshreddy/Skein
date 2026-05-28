@@ -43,7 +43,6 @@ impl PagedKVAllocator {
             KVLayout::Paged { page_size } => page_size,
             // Contiguous = one giant page per request. We model it as
             // page_size=1 so the arithmetic stays uniform.
-            // TODO(contiguous-kv): a dedicated contiguous allocation path.
             KVLayout::Contiguous => 1,
         };
         if bytes_per_token == 0 || page_size == 0 {

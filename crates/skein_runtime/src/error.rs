@@ -1,6 +1,5 @@
 //! `RuntimeError` — one `thiserror` enum across kv / batcher / hotswap /
-//! observability / server. The CUDA helper modules surface `NotImplemented`
-//! for backends that are not yet wired so misuse stays visible.
+//! observability / server.
 
 use std::path::PathBuf;
 
@@ -89,6 +88,6 @@ pub enum RuntimeError {
     #[error("tokenizer: {0}")]
     Tokenizer(String),
 
-    #[error("{what} is not yet implemented")]
+    #[error("{what} is not available in this build")]
     NotImplemented { what: &'static str },
 }

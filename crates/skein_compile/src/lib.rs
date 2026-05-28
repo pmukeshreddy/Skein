@@ -318,8 +318,6 @@ pub trait ComputeRuntime: Sized {
 /// `Vec<Segment>`'s underlying graphs.
 ///
 /// Sequential compilation: segments are compiled one after another.
-/// TODO(parallel-compile): compile segments concurrently if compile
-/// wall-time on the GPU host becomes a bottleneck.
 pub fn compile_with_luminal<R: ComputeRuntime>(
     segments: &mut [Graph],
     search_budget: usize,

@@ -2230,9 +2230,9 @@ pub fn run_speculative_generation(
     // Forwards: running sequence -> next-token logits. Cached decode needs a
     // position per token and a per-request cache; the speculative loop probes
     // arbitrary candidate sequences, so each call recomputes from scratch
-    // (`forward_full` resets the cache and prefills the whole seq). Correct but
-    // O(n) per call — a cache-rollback fast path is a follow-up. Errors degrade
-    // to an empty distribution (logged) so the loop's signature stays infallible.
+    // (`forward_full` resets the cache and prefills the whole seq). Errors
+    // degrade to an empty distribution (logged) so the loop's signature stays
+    // infallible.
     let mut target_fwd = |seq: &[u32]| match target.forward_full(seq) {
         Ok(l) => l,
         Err(e) => {

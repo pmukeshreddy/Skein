@@ -14,7 +14,7 @@
 //!
 //! `write_weight_shard` materializes the shard to a destination
 //! safetensors file from a single-file source checkpoint; multi-shard
-//! checkpoints return an explicit error (see TODO(multi-shard) there).
+//! checkpoints return an explicit error.
 
 use std::collections::HashMap;
 use std::ops::Range;

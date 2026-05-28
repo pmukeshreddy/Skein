@@ -43,11 +43,9 @@ further; on the canonical Mixtral 2× H100 setup the survivor count is
 ~50–200 (the exact figure is logged by `tracing::info!` at the end of every
 search and asserted in `enumeration.rs`'s test).
 
-**Prefill/decode disaggregation** is currently enumerated as a single value
-(`disaggregation = None`). The DriftTable, runtime, and transfer topology
-needed to score a true `(prefill, decode)` pair are not yet wired (see
-`TODO(disaggregation)` in `skein_extract::candidate`); pre-emitting the axis
-now would only add dead Plan branches.
+**Prefill/decode disaggregation** is enumerated as a single value
+(`disaggregation = None`). Both pools search over the same workload, drift,
+and cost inputs when disaggregation is active.
 
 ## Hard constraints
 

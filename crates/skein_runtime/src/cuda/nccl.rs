@@ -20,11 +20,7 @@
 //! [`crate::distributed::BarrierCollective`] reference, so the rank-parallel
 //! execution logic is backend-agnostic: the CPU build validates it with
 //! threads, the GPU build runs it over NCCL. The operations take host buffers
-//! and stage them through device memory (H2D → NCCL → D2H). That matches the
-//! current executor's host-`Vec<f32>` handoff path; keeping the buffers
-//! resident on the device (zero-copy via Luminal's `set_device_ptr` /
-//! `copy_output_to_device_ptr`) is a follow-up throughput optimization, not a
-//! correctness change.
+//! and stage them through device memory (H2D → NCCL → D2H).
 //!
 //! ## Validation status
 //!
@@ -55,9 +51,8 @@ pub struct NcclCollective {
     /// steady-state path does no per-call `alloc_zeros`. Interior-mutable because
     /// the collective is borrowed `&self` per step (single rank thread).
     recv_cache: std::cell::RefCell<Option<cudarc::driver::CudaSlice<half::bf16>>>,
-    /// Custom mapped-shared-memory all-reduce (SKEIN_SHM_ALLREDUCE): bypasses
-    /// NCCL for small device bf16 all-reduces (decode hot path), eliminating
-    /// NCCL's ~105us-per-call cold-issue cost. `None` => always use NCCL.
+    /// Custom mapped-shared-memory all-reduce (SKEIN_SHM_ALLREDUCE): kernel-only
+    /// path for small device bf16 all-reduces on the decode hot path. `None` => use NCCL.
     shm: Option<super::shm_allreduce::ShmAllReduce>,
     /// SKEIN_DEVICE_LOGITS: device-resident logits all-gather destination
     /// (`world_size * vocab_local` bf16) + the on-device argmax kernel, both
@@ -452,18 +447,9 @@ impl RankCollective for NcclCollective {
 
 impl NcclCollective {
     /// Microbenchmark: in-isolation latency of the device bf16 all-reduce. Both
-    /// ranks run a tight all-reduce loop on `elems` bf16 — the loop self-syncs
-    /// every iteration, so rank drift cannot accumulate. This isolates NCCL
-    /// transport+protocol cost from the in-context per-barrier drift wait (the
-    /// ~105us gaps nsys saw before each all-reduce). Gated by the caller
+    /// ranks run a tight all-reduce loop on `elems` bf16. Gated by the caller
     /// (SKEIN_ALLREDUCE_BENCH). Both ranks MUST call it (it is collective).
     pub fn bench_all_reduce(&self, elems: usize, iters: usize) {
-        // gap_us: busy-spin the host this long BETWEEN all-reduces (each rank,
-        // synchronizing after each so the gap is a real spacing). This replicates
-        // the in-context situation where ~250us of segment work sits between
-        // barriers and NCCL's SHM proxy thread goes idle. If latency jumps with a
-        // gap, the in-context cost is proxy-wakeup/overhead (a custom kernel-only
-        // all-reduce avoids it); if it stays flat, it's genuine GPU rank drift.
         for gap_us in [0u64, 100, 300] {
             self.bench_one(elems, iters.min(if gap_us == 0 { iters } else { 400 }), gap_us);
         }
@@ -514,9 +500,7 @@ fn cuda_err(e: cudarc::driver::DriverError) -> CollectiveError {
 /// it computed for a request to the decode rank that will continue it, so
 /// decode skips recomputing the prompt. Built on the same `cudarc::nccl`
 /// primitives as [`NcclCollective`]; blocks are staged through host memory
-/// (H2D → ncclSend / ncclRecv → D2H), matching the collective buffer model.
-/// (Keeping the KV resident on-device — zero-copy via Luminal's device-pointer
-/// API — is the same follow-up optimization noted for the collectives.)
+/// (H2D → ncclSend / ncclRecv → D2H).
 pub struct NcclKvTransport {
     comm: Comm,
     stream: Arc<CudaStream>,

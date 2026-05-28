@@ -47,8 +47,6 @@ pub trait ComputeRuntime: Sized {
 ```
 
 The `f32` data path is what every Skein test uses.
-TODO(weight-bytes): production weight loading should go through a
-`set_data_bytes` entry point (not yet on the trait).
 
 ## Op-availability cheat sheet (pinned rev)
 
@@ -108,17 +106,6 @@ hand-computed unit test under `skein_emit/tests/`:
 | KV cache             | `attention_with_kv_cache` (compile-time `past`) + `decode_attention_with_cache` (runtime position, fixed-capacity). | `tests/kv_cache.rs` |
 | EP capacity routing  | `moe_dispatch_combine`: GShard scatter/gather (`cumsum` slots + matmul). | `tests/ep_routing.rs` |
 | Byte-level weights   | `decode_weight_bytes` (bf16/f16/f32) + multi-shard index resolution. | `skein_compile/tests/weight_bytes.rs`, `tests/weight_slicing.rs` |
-
-## Deferred integration (TODO)
-
-The per-op math above is implemented and unit-tested on `NativeRuntime`. The
-remaining work is runtime *integration*, tracked by `TODO(...)` tags (grep
-`TODO(` across `skein_emit`/`skein_runtime`):
-
-| Gap              | What's left                                                        | Tag                  |
-|------------------|-------------------------------------------------------------------|----------------------|
-| EP token routing | Wire `moe_dispatch_combine` into the multi-segment AllToAll schedule (lay out `[ep, …]`, run local expert shard, gather back). | `TODO(ep-routing)` |
-| KV runtime loop  | Drive `decode_attention_with_cache` from the serving loop: paged page I/O + per-step runtime `position` input. | `TODO(kv-runtime)` |
 
 ## How to add a new backend
 

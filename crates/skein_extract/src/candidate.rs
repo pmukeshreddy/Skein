@@ -21,10 +21,6 @@ pub struct GlobalConfig {
 }
 
 /// Assemble a `Plan` from a `(GlobalConfig, DtypeMap, ModelMeta)` triple.
-///
-/// `disaggregation` is currently always `None`.
-/// TODO(disaggregation): emit prefill/decode split plans once the runtime
-/// can transfer KV between pools.
 pub fn compose_plan(global: GlobalConfig, dtype_map: DtypeMap, model_meta: ModelMeta) -> Plan {
     Plan {
         parallelism: global.parallelism,

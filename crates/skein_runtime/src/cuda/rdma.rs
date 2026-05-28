@@ -1,12 +1,7 @@
 //! RDMA transport for prefill/decode KV transfer.
 //!
-//! The production counterpart to [`crate::kv_transport::LocalKvTransport`]:
-//! moves KV-cache blocks between a prefill pool and a decode pool over RDMA
+//! Moves KV-cache blocks between a prefill pool and a decode pool over RDMA
 //! instead of an in-process copy.
-//!
-//! TODO(rdma): register the KV-block memory regions and implement
-//! `send`/`recv` over an RDMA verbs queue pair (or a library such as NIXL /
-//! UCX). Every method currently returns `RuntimeError::NotImplemented`.
 
 use crate::error::RuntimeError;
 

@@ -1,9 +1,8 @@
 //! HF `config.json` → typed IR importer.
 //!
-//! Dispatches on the `architectures` field. Only `MixtralForCausalLM` is
-//! currently wired. Architectures Skein knows about but has not yet
-//! implemented return `ImportError::ArchitectureNotYetImplemented` — no
-//! stubs, no zero-filled fallbacks.
+//! Dispatches on the `architectures` field. `MixtralForCausalLM` is
+//! supported. Unrecognised architectures return
+//! `ImportError::ArchitectureNotYetImplemented`.
 
 use serde::Deserialize;
 use std::path::Path;

@@ -94,9 +94,7 @@ pub fn extract_disaggregated_plan(
     let decode_cluster = Cluster::from_spec(sub_cluster_spec(spec, &decode_set));
     let prefill_cluster = Cluster::from_spec(sub_cluster_spec(spec, &prefill_set));
 
-    // Each pool searches independently. (Both use the same workload + drift +
-    // cost inputs; specializing the prefill workload toward throughput and the
-    // decode workload toward latency is a follow-up refinement.)
+    // Each pool searches independently over the same workload + drift + cost inputs.
     let decode_plan = extract_plan(ir, &decode_cluster, workload, drift_table, cost_model)?;
     let prefill_plan = extract_plan(ir, &prefill_cluster, workload, drift_table, cost_model)?;
 
