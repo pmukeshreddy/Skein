@@ -1,6 +1,6 @@
 # Skein
 
-Skein runs LLMs across multiple GPUs. Give it a model and a cluster — it figures out how to split the work (tensor, pipeline, and expert parallelism), shards the weights, wires up the collectives, and compiles per-device kernels with paged KV cache, CUDA Graphs, and continuous batching. No manual parallelism configuration.
+Skein runs LLMs across multiple GPUs. Give it a model and a cluster — it figures out how to split the work (tensor, pipeline, and expert parallelism), shards the weights, wires up the collectives, and compiles per-device kernels with paged KV cache, CUDA Graphs, and continuous batching. Per-layer quantization (bf16 · fp8 · int8 · int4) is selected automatically under a KL-drift SLO. No manual parallelism configuration.
 
 ## Pipeline
 
