@@ -1,6 +1,6 @@
 # Skein
 
-A compiler for distributed LLM inference. Skein finds the optimal placement across your cluster — TP/PP/EP, KV layout, per-layer quantization, CUDA Graphs, prefix cache, continuous batching — and compiles it down to per-device kernels.
+A compiler for multi-GPU LLM inference. Given a model, a cluster, and a workload trace, Skein searches the joint (tensor · pipeline · expert) parallelism space, selects per-layer dtypes under a KL-drift SLO, and compiles the winning plan down to per-device kernels — sharded weights, paged KV cache, CUDA Graphs, and continuous batching included.
 
 ## Pipeline
 
