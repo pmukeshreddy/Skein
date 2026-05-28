@@ -173,7 +173,7 @@ installed `tracing-subscriber`.
 | `Server::serve` forward-pass driver    | ✅ axum + in-process worker         | ✅ CUDA/NCCL composition    |
 | NCCL between graph runs                 | n/a                                 | ✅                          |
 | CUDA Graphs capture + dispatch         | eager dispatch                      | ✅                          |
-| RDMA for prefill/decode KV handoff     | local copy                          | ✅                          |
+| RDMA for prefill/decode KV handoff     | local copy                          | local copy                  |
 | OpenTelemetry-OTLP exporter            | tracing spans only                  | tracing spans only          |
 
 Everything under `src/cuda/` lives behind `#[cfg(feature = "cuda")]`; the
@@ -189,7 +189,7 @@ Three runtime-facing abstractions decouple the serving loop from the backend:
 |---|---|---|
 | `CollectiveBackend` | In-process collective math over runtime tensors | NCCL-backed collectives |
 | `KernelDispatcher` | Eager segment execution | CUDA Graph capture/dispatch |
-| `KvTransport` | Local in-process page copy | RDMA transfer for prefill/decode disaggregation |
+| `KvTransport` | Local in-process page copy | Local in-process page copy |
 
 `InProcessCollective` is not a skip or a fake success path. It reads the
 named tensor from every participant, performs the collective math in Rust,

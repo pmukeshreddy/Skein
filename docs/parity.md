@@ -128,7 +128,7 @@ The TOML serializer (`DriftTable::save_to_toml_file`) sorts per-layer keys
 by `(layer_idx, component, dtype)` and uses `{v:?}` for floats so the
 on-disk file is byte-stable across runs.
 
-## Re-search trigger flow
+## Parity failure flow
 
 ```
 compile artifact A
@@ -140,17 +140,13 @@ compile artifact A
        │
        └── passed: false
              ├── update_drift_table_on_failure (monotonic up)
-             ├── re-invoke extract_plan
-             │     └── now Plan_A is predicted as drift-violating
-             │       → search picks Plan_B
-             ├── compile artifact B
-             └── verify_plan loop continues until pass
+             └── --enforce-parity → error
+                 otherwise      → proceed with warning + updated drift table
 ```
 
-The re-search is bounded by the cost model: there are only finitely many
-outer × DP combinations. In the worst case the loop terminates when all
-non-bf16 combos have been measured and rejected, leaving the all-bf16
-fallback (zero drift by definition).
+On failure the drift table is updated so the next `skein compile` run will
+pick a more conservative plan. The compile command does not loop or
+re-invoke `extract_plan` within a single invocation.
 
 ## KL divergence — log-softmax with the max-shift trick
 
